@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ischedule-app",
+      "runtimeExecutable": "C:\\Users\\netav\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+      "runtimeArgs": ["-m", "streamlit", "run", "streamlit_app.py", "--server.port", "8501"],
+      "port": 8501
+    },
+    {
+      "name": "ischedule-app-gantt",
+      "runtimeExecutable": "C:\\Users\\netav\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+      "runtimeArgs": ["-m", "streamlit", "run", "streamlit_app_gantt.py", "--server.port", "8502"],
+      "port": 8502
+    },
+    {
+      "name": "ischedule-app-test",
+      "runtimeExecutable": "C:\\Users\\netav\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+      "runtimeArgs": ["-m", "streamlit", "run", "streamlit_app.py", "--server.port", "8503"],
+      "port": 8503
+    }
+  ]
+}
