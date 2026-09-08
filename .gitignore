@@ -21,6 +21,7 @@ users.json.bak-before-reset
 arrivals.json
 !demo_data/*.xlsx
 !demo_data/*.html
+!electricity-split-app/*.html
 !docs/
 !docs/*.png
 !docs/*.jpg

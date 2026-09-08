@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>מחשבון חלוקת חשבון חשמל</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <h1>⚡ מחשבון חלוקת חשבון חשמל</h1>
+    <p class="subtitle">מצלמים את המונה של כל דירה, מזינים את סכום החשבון הכולל, והאתר מחשב כמה כל אחד צריך לשלם.</p>
+
+    <section class="card">
+      <label for="totalAmount">סכום החשבון הכולל (₪)</label>
+      <input type="number" id="totalAmount" placeholder="לדוגמה: 850" min="0" step="0.01">
+    </section>
+
+    <section class="card">
+      <div class="section-header">
+        <h2>דירות ומונים</h2>
+        <button id="addMeterBtn" class="btn secondary">+ הוספת דירה</button>
+      </div>
+      <div id="metersList"></div>
+    </section>
+
+    <button id="calcBtn" class="btn primary">חשב חלוקה</button>
+
+    <section id="resultsSection" class="card results" hidden>
+      <h2>תוצאות החלוקה</h2>
+      <table id="resultsTable">
+        <thead>
+          <tr><th>דירה</th><th>קריאת מונה</th><th>אחוז</th><th>לתשלום (₪)</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p id="resultsNote" class="note"></p>
+    </section>
+  </div>
+
+  <template id="meterRowTemplate">
+    <div class="meter-row card">
+      <button class="btn danger remove-btn" title="הסרת דירה">✕</button>
+      <div class="field">
+        <label>שם הדירה</label>
+        <input type="text" class="meter-name" placeholder="לדוגמה: דירה 2">
+      </div>
+      <div class="field">
+        <label>תמונת המונה (אופציונלי - לזיהוי אוטומטי)</label>
+        <input type="file" accept="image/*" capture="environment" class="meter-photo">
+        <img class="preview" hidden>
+        <p class="ocr-status"></p>
+      </div>
+      <div class="field">
+        <label>קריאת המונה</label>
+        <input type="number" class="meter-reading" placeholder="לדוגמה: 12345" min="0" step="0.01">
+      </div>
+    </div>
+  </template>
+
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
