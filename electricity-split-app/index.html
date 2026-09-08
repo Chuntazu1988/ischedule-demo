@@ -20,6 +20,7 @@
     </header>
 
     <p class="example-banner">להלן נתוני דוגמה כדי שתראו איך זה עובד - מחקו והזינו את הנתונים שלכם.</p>
+    <p class="hint">המונים סופרים באופן מצטבר, אז החלוקה מחושבת לפי ההפרש בין הקריאה הקודמת לנוכחית - בדיוק כמו בחשבון החשמל עצמו. במונה מכני עם גלגלים: אם הספרה האחרונה בצבע שונה (בד"כ אדום) - היא לא נכללת בקריאה הרשמית.</p>
 
     <section class="card">
       <label for="totalAmount">סכום החשבון הכולל</label>
@@ -47,7 +48,7 @@
       <div class="results-table" role="table">
         <div class="results-row results-head" role="row">
           <span role="columnheader">דירה</span>
-          <span role="columnheader">קריאה (קוט"ש)</span>
+          <span role="columnheader">צריכה (קוט"ש)</span>
           <span role="columnheader">חלק יחסי</span>
           <span role="columnheader">לתשלום</span>
         </div>
@@ -70,15 +71,22 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
           </button>
         </div>
+        <div class="field-row readings-row">
+          <div class="reading-field">
+            <label class="reading-label">קריאה קודמת</label>
+            <input type="number" class="meter-prev" placeholder="0" min="0" step="0.01">
+          </div>
+          <div class="reading-field">
+            <label class="reading-label">קריאה נוכחית</label>
+            <input type="number" class="meter-curr" placeholder="0" min="0" step="0.01">
+          </div>
+        </div>
         <div class="field-row">
           <label class="file-btn">
             <input type="file" accept="image/*" capture="environment" class="meter-photo">
-            <span>צילום המונה</span>
+            <span>צילום הקריאה הנוכחית</span>
           </label>
-          <div class="reading-field">
-            <input type="number" class="meter-reading" placeholder="קריאת מונה" min="0" step="0.01">
-            <span class="unit">קוט"ש</span>
-          </div>
+          <p class="consumption-display">צריכה: <strong class="consumption-value">0</strong> קוט"ש</p>
         </div>
         <img class="preview" hidden alt="תצוגת תמונת המונה">
         <p class="ocr-status"></p>

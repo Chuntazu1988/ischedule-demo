@@ -1,4 +1,5 @@
 const HEBREW_LETTERS = ['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ז', 'ח', 'ט', 'י', 'כ', 'ל', 'מ', 'נ', 'ס', 'ע', 'פ', 'צ', 'ק', 'ר', 'ש', 'ת'];
+const STORAGE_KEY = 'electricitySplitApp.previousReadings';
 
 const metersList = document.getElementById('metersList');
 const rowTemplate = document.getElementById('meterRowTemplate');
@@ -9,6 +10,22 @@ const resultsSection = document.getElementById('resultsSection');
 const resultsBody = document.getElementById('resultsBody');
 const resultsTotal = document.getElementById('resultsTotal');
 
+function loadSavedReadings() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+  } catch (err) {
+    return {};
+  }
+}
+
+function saveReadings(map) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
+  } catch (err) {
+    // ignore - persistence is a convenience, not a requirement
+  }
+}
+
 function renumberBadges() {
   const rows = metersList.querySelectorAll('.meter-row');
   rows.forEach((row, i) => {
@@ -16,11 +33,52 @@ function renumberBadges() {
   });
 }
 
-function addMeterRow(name = '', reading = '') {
+function updateConsumptionDisplay(row) {
+  const prev = parseFloat(row.querySelector('.meter-prev').value);
+  const curr = parseFloat(row.querySelector('.meter-curr').value);
+  const display = row.querySelector('.consumption-display');
+  const valueEl = display.querySelector('.consumption-value');
+
+  if (isNaN(prev) || isNaN(curr)) {
+    valueEl.textContent = '0';
+    display.classList.remove('invalid');
+    return;
+  }
+
+  const consumption = curr - prev;
+  if (consumption < 0) {
+    valueEl.textContent = 'שגיאה - בדקו קריאות';
+    display.classList.add('invalid');
+  } else {
+    valueEl.textContent = consumption.toFixed(2).replace(/\.00$/, '');
+    display.classList.remove('invalid');
+  }
+}
+
+function addMeterRow(name = '', prev = '', curr = '') {
   const row = rowTemplate.content.firstElementChild.cloneNode(true);
 
-  row.querySelector('.meter-name').value = name;
-  row.querySelector('.meter-reading').value = reading;
+  const nameInput = row.querySelector('.meter-name');
+  const prevInput = row.querySelector('.meter-prev');
+  const currInput = row.querySelector('.meter-curr');
+
+  nameInput.value = name;
+  prevInput.value = prev;
+  currInput.value = curr;
+
+  nameInput.addEventListener('change', () => {
+    if (prevInput.value) return;
+    const saved = loadSavedReadings();
+    const key = nameInput.value.trim();
+    if (key && saved[key] !== undefined) {
+      prevInput.value = saved[key];
+      updateConsumptionDisplay(row);
+    }
+  });
+
+  [prevInput, currInput].forEach(input => {
+    input.addEventListener('input', () => updateConsumptionDisplay(row));
+  });
 
   row.querySelector('.remove-btn').addEventListener('click', () => {
     row.remove();
@@ -30,7 +88,6 @@ function addMeterRow(name = '', reading = '') {
   const photoInput = row.querySelector('.meter-photo');
   const preview = row.querySelector('.preview');
   const status = row.querySelector('.ocr-status');
-  const readingInput = row.querySelector('.meter-reading');
 
   photoInput.addEventListener('change', async () => {
     const file = photoInput.files[0];
@@ -43,7 +100,8 @@ function addMeterRow(name = '', reading = '') {
     try {
       const digits = await recognizeReading(file);
       if (digits) {
-        readingInput.value = digits;
+        currInput.value = digits;
+        updateConsumptionDisplay(row);
         status.textContent = `זוהה: ${digits} - בדקו ותקנו אם צריך`;
       } else {
         status.textContent = 'לא הצלחתי לזהות מספר - נא להקליד ידנית.';
@@ -55,6 +113,7 @@ function addMeterRow(name = '', reading = '') {
 
   metersList.appendChild(row);
   renumberBadges();
+  updateConsumptionDisplay(row);
 }
 
 async function recognizeReading(file) {
@@ -76,18 +135,19 @@ function calculateSplit() {
 
   const meters = rows.map((row, i) => {
     const name = row.querySelector('.meter-name').value.trim() || `דירה ${i + 1}`;
-    const reading = parseFloat(row.querySelector('.meter-reading').value);
-    return { name, reading };
-  }).filter(m => !isNaN(m.reading) && m.reading >= 0);
+    const prev = parseFloat(row.querySelector('.meter-prev').value);
+    const curr = parseFloat(row.querySelector('.meter-curr').value);
+    return { name, prev, curr, consumption: curr - prev };
+  }).filter(m => !isNaN(m.prev) && !isNaN(m.curr) && m.consumption >= 0);
 
   if (meters.length === 0) {
-    alert('נא להוסיף לפחות דירה אחת עם קריאת מונה.');
+    alert('נא להוסיף לפחות דירה אחת עם קריאה קודמת ונוכחית תקינות (נוכחית >= קודמת).');
     return;
   }
 
-  const sumReadings = meters.reduce((sum, m) => sum + m.reading, 0);
-  if (sumReadings === 0) {
-    alert('סכום קריאות המונים הוא 0 - לא ניתן לחשב חלוקה.');
+  const sumConsumption = meters.reduce((sum, m) => sum + m.consumption, 0);
+  if (sumConsumption === 0) {
+    alert('סך הצריכה של כל הדירות הוא 0 - לא ניתן לחשב חלוקה.');
     return;
   }
 
@@ -95,7 +155,7 @@ function calculateSplit() {
   let paidSoFar = 0;
 
   meters.forEach((m, i) => {
-    const share = m.reading / sumReadings;
+    const share = m.consumption / sumConsumption;
     const isLast = i === meters.length - 1;
     const amount = isLast ? totalAmount - paidSoFar : Math.round(share * totalAmount * 100) / 100;
     paidSoFar += amount;
@@ -105,7 +165,7 @@ function calculateSplit() {
     row.setAttribute('role', 'row');
     row.innerHTML = `
       <span role="cell">${m.name}</span>
-      <span role="cell" class="num">${m.reading}</span>
+      <span role="cell" class="num">${m.consumption.toFixed(2).replace(/\.00$/, '')}</span>
       <span role="cell" class="num">${(share * 100).toFixed(1)}%</span>
       <span role="cell" class="pay">${amount.toFixed(2)} ₪</span>
     `;
@@ -114,11 +174,15 @@ function calculateSplit() {
 
   resultsTotal.textContent = `${paidSoFar.toFixed(2)} ₪`;
   resultsSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  const saved = loadSavedReadings();
+  meters.forEach(m => { saved[m.name] = m.curr; });
+  saveReadings(saved);
 }
 
 addMeterBtn.addEventListener('click', () => addMeterRow());
 calcBtn.addEventListener('click', calculateSplit);
 
-addMeterRow('דירה 1 (לדוגמה)', 300);
-addMeterRow('דירה 2 (לדוגמה)', 600);
+addMeterRow('דירה 1 (לדוגמה)', 27583.14, 27700.00);
+addMeterRow('דירה 2 (לדוגמה)', 38509.30, 38564.16);
 calculateSplit();
