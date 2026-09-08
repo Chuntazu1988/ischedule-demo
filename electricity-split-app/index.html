@@ -4,61 +4,89 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>מחשבון חלוקת חשבון חשמל</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;600;700&family=Assistant:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div class="container">
-    <h1>⚡ מחשבון חלוקת חשבון חשמל</h1>
-    <p class="subtitle">מצלמים את המונה של כל דירה, מזינים את סכום החשבון הכולל, והאתר מחשב כמה כל אחד צריך לשלם.</p>
+    <header class="masthead">
+      <svg class="bolt" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h6l-1 8 10-13h-6l1-7z"/></svg>
+      <div>
+        <h1>מחשבון חלוקת חשבון חשמל</h1>
+        <p class="subtitle">מצלמים את המונה של כל דירה, מזינים את סכום החשבון - והחלוקה לפי צריכה בפועל מוכנה.</p>
+      </div>
+    </header>
+
+    <p class="example-banner">להלן נתוני דוגמה כדי שתראו איך זה עובד - מחקו והזינו את הנתונים שלכם.</p>
 
     <section class="card">
-      <label for="totalAmount">סכום החשבון הכולל (₪)</label>
-      <input type="number" id="totalAmount" placeholder="לדוגמה: 850" min="0" step="0.01">
+      <label for="totalAmount">סכום החשבון הכולל</label>
+      <div class="amount-field">
+        <input type="number" id="totalAmount" value="900" min="0" step="0.01">
+        <span class="unit">₪</span>
+      </div>
     </section>
 
     <section class="card">
       <div class="section-header">
         <h2>דירות ומונים</h2>
-        <button id="addMeterBtn" class="btn secondary">+ הוספת דירה</button>
+        <button id="addMeterBtn" class="btn secondary">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          הוספת דירה
+        </button>
       </div>
       <div id="metersList"></div>
     </section>
 
     <button id="calcBtn" class="btn primary">חשב חלוקה</button>
 
-    <section id="resultsSection" class="card results" hidden>
+    <section id="resultsSection" class="card results">
       <h2>תוצאות החלוקה</h2>
-      <table id="resultsTable">
-        <thead>
-          <tr><th>דירה</th><th>קריאת מונה</th><th>אחוז</th><th>לתשלום (₪)</th></tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <p id="resultsNote" class="note"></p>
+      <div class="results-table" role="table">
+        <div class="results-row results-head" role="row">
+          <span role="columnheader">דירה</span>
+          <span role="columnheader">קריאה (קוט"ש)</span>
+          <span role="columnheader">חלק יחסי</span>
+          <span role="columnheader">לתשלום</span>
+        </div>
+        <div id="resultsBody"></div>
+      </div>
+      <div class="results-total">
+        <span>סה"כ חולק</span>
+        <strong id="resultsTotal"></strong>
+      </div>
     </section>
   </div>
 
   <template id="meterRowTemplate">
-    <div class="meter-row card">
-      <button class="btn danger remove-btn" title="הסרת דירה">✕</button>
-      <div class="field">
-        <label>שם הדירה</label>
-        <input type="text" class="meter-name" placeholder="לדוגמה: דירה 2">
-      </div>
-      <div class="field">
-        <label>תמונת המונה (אופציונלי - לזיהוי אוטומטי)</label>
-        <input type="file" accept="image/*" capture="environment" class="meter-photo">
-        <img class="preview" hidden>
+    <div class="meter-row">
+      <div class="meter-badge"></div>
+      <div class="meter-fields">
+        <div class="field-row">
+          <input type="text" class="meter-name" placeholder="שם הדירה, למשל דירה 2">
+          <button class="btn danger remove-btn" title="הסרת דירה" aria-label="הסרת דירה">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+          </button>
+        </div>
+        <div class="field-row">
+          <label class="file-btn">
+            <input type="file" accept="image/*" capture="environment" class="meter-photo">
+            <span>צילום המונה</span>
+          </label>
+          <div class="reading-field">
+            <input type="number" class="meter-reading" placeholder="קריאת מונה" min="0" step="0.01">
+            <span class="unit">קוט"ש</span>
+          </div>
+        </div>
+        <img class="preview" hidden alt="תצוגת תמונת המונה">
         <p class="ocr-status"></p>
-      </div>
-      <div class="field">
-        <label>קריאת המונה</label>
-        <input type="number" class="meter-reading" placeholder="לדוגמה: 12345" min="0" step="0.01">
       </div>
     </div>
   </template>
 
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
