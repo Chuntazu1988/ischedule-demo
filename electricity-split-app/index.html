@@ -88,7 +88,23 @@
           </label>
           <p class="consumption-display">צריכה: <strong class="consumption-value">0</strong> קוט"ש</p>
         </div>
-        <img class="preview" hidden alt="תצוגת תמונת המונה">
+        <div class="cropper" hidden>
+          <p class="crop-instructions">גררו את המסגרת כך שתקיף רק את ספרות המונה, ואז לחצו "זהה מהחיתוך".</p>
+          <div class="cropper-frame">
+            <img class="crop-img" alt="גררו מלבן סביב הספרות">
+            <div class="crop-box">
+              <div class="crop-handle tl" data-handle="tl"></div>
+              <div class="crop-handle tr" data-handle="tr"></div>
+              <div class="crop-handle bl" data-handle="bl"></div>
+              <div class="crop-handle br" data-handle="br"></div>
+            </div>
+          </div>
+          <div class="crop-actions">
+            <button type="button" class="btn secondary crop-confirm">זהה מהחיתוך</button>
+            <button type="button" class="btn ghost crop-cancel">ביטול</button>
+          </div>
+        </div>
+        <canvas class="crop-canvas" hidden></canvas>
         <p class="ocr-status"></p>
       </div>
     </div>
