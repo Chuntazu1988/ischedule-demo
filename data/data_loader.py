@@ -419,6 +419,17 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
             if len(_title_rows) >= 2:
                 _upcoming_night_threshold = _title_rows[-1]
 
+        # A cell only counts as a genuine section-HEADER for zone-detection
+        # purposes when its time range sits at (or right at) the start of
+        # the cell — a NAME+NOTE cell whose note happens to carry its own
+        # embedded time range (e.g. a worker's own name followed by a
+        # free-text note that itself includes an "HH:MM-HH:MM" range) must
+        # never count, or it silently drags the detected day-core/night-band
+        # boundaries across the whole sheet and breaks page1/upcoming-night
+        # classification for every shift in that sheet.
+        def _is_bare_header_match(_ct, _m):
+            return not _ct[:_m.start()].strip()
+
         if _upcoming_night_threshold == float('inf'):
             # Strategy B: scan every row for time-range headers with night starts.
             _night_hdr_rows = []
@@ -427,7 +438,7 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
                 for _cj in raw.columns:
                     _ct = clean_text(str(raw.at[_ri, _cj]))
                     _m = TIME_RANGE_RE.search(_ct)
-                    if _m:
+                    if _m and _is_bare_header_match(_ct, _m):
                         try:
                             _hh = int(normalize_time_text(_m.group(1)).split(':')[0])
                             if _hh >= 17:
@@ -461,7 +472,7 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
             for _cj in raw.columns:
                 _ct = clean_text(str(raw.at[_ri, _cj]))
                 _m = TIME_RANGE_RE.search(_ct)
-                if _m:
+                if _m and _is_bare_header_match(_ct, _m):
                     try:
                         _hh = int(normalize_time_text(_m.group(1)).split(':')[0])
                         if 5 <= _hh < 17:

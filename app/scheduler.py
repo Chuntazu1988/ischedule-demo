@@ -3800,6 +3800,13 @@ def fix_wasteful_gaps(assignments_df, employees_df):
                 _te_n += 1440
             if not (_ts_n >= _cs_m and _te_n <= _ce_m):
                 continue
+            # _ts_n/_te_n are anchored to the CANDIDATE's own shift day (may
+            # already be pushed +1440 for a midnight-starting task on a
+            # late-evening-start shift). The candidate's OTHER tasks below
+            # are raw clock times with no such anchor, so a naive same-day
+            # compare can miss a genuine overlap whenever the two end up
+            # anchored to different "days". Compare at all three day offsets
+            # instead so a same-clock-time midnight task is never missed.
             _busy = False
             for _ot in by_name.get(_cand_name, []):
                 _o_s = _tmin(_ot.get("התחלה", ""))
@@ -3807,7 +3814,10 @@ def fix_wasteful_gaps(assignments_df, employees_df):
                 if _o_s is None or _o_e is None:
                     continue
                 _o_e2 = _o_e if _o_e > _o_s else _o_e + 1440
-                if not (_te_n <= _o_s or _ts_n >= _o_e2):
+                if any(
+                    _ts_n < _o_e2 + _phase and _o_s + _phase < _te_n
+                    for _phase in (-1440, 0, 1440)
+                ):
                     _busy = True
                     break
             if _busy:
