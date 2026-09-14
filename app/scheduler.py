@@ -3177,6 +3177,22 @@ def build_schedule(flights_df, employees_df, pre_assignments=None):
                             _rb = required_break(_rt_erow_cand) or 45
                             return (_gap - _rb) >= 60
 
+                        # Don't fragment a gap that could host a real break into two
+                        # pieces neither of which can: this applies even to a
+                        # genuinely OPEN slot (no eviction), which the residual-gap
+                        # guard below doesn't cover since it only fires once
+                        # _slots_taken >= _req_n. User rule 2026-09-14, found via real
+                        # data: TL#5 (ר"צ, shift 03:30-11:00) had a
+                        # 07:05-08:45 (100 min) gap after LY541 — plenty for her own
+                        # 45-min required break — but gap-fill placed her on LY2369's
+                        # (07:35-08:35) plain, never-requested-for-her דייל slot,
+                        # leaving only a 30-min lead and 10-min trail residual, neither
+                        # long enough for a real break; her break was then pushed all
+                        # the way to the end of her shift instead of landing mid-shift.
+                        _rb_for_gf = required_break(_gf_row) or 45
+                        if (_ge - _gs) >= _rb_for_gf and (_fs - _gs) < _rb_for_gf and (_ge - _fe) < _rb_for_gf:
+                            continue
+
                         # When filling a role that is already at req_n and the employee
                         # is a ראש צוות, try to swap a non-TL so they return to counters.
                         # If no swap is possible, block adding a pure extra.
