@@ -1,0 +1,49 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.streamlit/secrets.toml
+users.json
+users.json.bak-before-reset
+*credentials*
+*.env
+*.xlsx
+*.xls
+*.csv
+*.htm
+*.html
+*.docx
+*.pptx
+*.pdf
+*.zip
+*.png
+*.jpg
+arrivals.json
+!demo_data/*.xlsx
+!demo_data/*.html
+!docs/
+!docs/*.png
+!docs/*.jpg
+*.lnk
+.vscode/
+Thumbs.db
+sync_user_names_report.txt
+*_report.txt
+
+schedule_archive/
+session_checkpoint.sqlite3
+employees.sqlite3
+
+tmp_*.txt
+debug_*.txt
+test.txt
+_build_profile.txt
+New Text Document*
+
+# Office lock files
+~$*
+
+# Private name->tag map used only when publishing an anonymised snapshot
+.public_sync/
+# Real roster-spelling aliases (copy data/name_aliases.example.json to start)
+data/name_aliases.json
