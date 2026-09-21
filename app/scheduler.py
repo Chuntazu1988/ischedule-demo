@@ -2778,7 +2778,7 @@ def build_schedule(flights_df, employees_df, pre_assignments=None):
                     # also qualifies as a perfectly normal ר"צ candidate via
                     # the regular shift-based filtering UNLESS this is
                     # applied here too — found via real 12.07.2026 data:
-                    # TL#45 (role-window 03:30-06:30) was scheduled
+                    # TL#46 (role-window 03:30-06:30) was scheduled
                     # ר"צ on LY5115 at 12:45, hours after her window closed.
                     # No note on a worker → no effect (existing behavior).
                     def _role_window_ok(_row):
@@ -3148,7 +3148,7 @@ def build_schedule(flights_df, employees_df, pre_assignments=None):
                 # shift manager who is ר"צ-certified ONLY is not, and was
                 # being gap-filled into plain דייל/מתאם slots she has no
                 # certification for at all (found via real 12.07.2026 data:
-                # TL#45, ר"צ-only, gap-filled as a plain דייל on
+                # TL#46, ר"צ-only, gap-filled as a plain דייל on
                 # LY5155 once she became visible to the scheduler for the
                 # first time via her role-window note).
                 _gf_roles_try = ["ראש צוות"]
@@ -3373,7 +3373,7 @@ def build_schedule(flights_df, employees_df, pre_assignments=None):
                         # genuinely OPEN slot (no eviction), which the residual-gap
                         # guard below doesn't cover since it only fires once
                         # _slots_taken >= _req_n. User rule 2026-09-14, found via real
-                        # data: TL#5 (ר"צ, shift 03:30-11:00) had a
+                        # 04.09.2026 data: TL#27 (ר"צ, shift 03:30-11:00) had a
                         # 07:05-08:45 (100 min) gap after LY541 — plenty for her own
                         # 45-min required break — but gap-fill placed her on LY2369's
                         # (07:35-08:35) plain, never-requested-for-her דייל slot,
@@ -4051,12 +4051,16 @@ def fix_wasteful_gaps(assignments_df, employees_df):
             if not (_ts_n >= _cs_m and _te_n <= _ce_m):
                 continue
             # _ts_n/_te_n are anchored to the CANDIDATE's own shift day (may
-            # already be pushed +1440 for a midnight-starting task on a
-            # late-evening-start shift). The candidate's OTHER tasks below
-            # are raw clock times with no such anchor, so a naive same-day
-            # compare can miss a genuine overlap whenever the two end up
-            # anchored to different "days". Compare at all three day offsets
-            # instead so a same-clock-time midnight task is never missed.
+            # already be pushed +1440 for a midnight-starting task like
+            # 00:00-01:05 on a 21:30-start shift). The candidate's OTHER
+            # tasks below are raw clock times with no such anchor, so a naive
+            # same-day compare silently misses a genuine overlap whenever the
+            # two ended up anchored to different "days" — found via real
+            # 30.07.2026 data: agent#77 held LY017 (00:00-01:05) and this
+            # check still called her free for LY005 (also 00:00-01:05),
+            # producing a real double-booking. Compare at all three day
+            # offsets instead, same technique as reserve_dual_certified_for_
+            # tsa's midnight-safe _ov() helper.
             _busy = False
             for _ot in by_name.get(_cand_name, []):
                 _o_s = _tmin(_ot.get("התחלה", ""))
@@ -5839,7 +5843,7 @@ def pair_trainee_attendants(schedule_df, employees_df):
                     # shift for this flight (or is busy elsewhere) was never a
                     # candidate — vacating the mentor would just split an
                     # unrelated pair for nothing (found immediately in testing:
-                    # trainee-agent#2, shift 10:00-11:00, is trainee-agent#1's own
+                    # trainee-agent#2, shift 10:00-11:00, is worker#7 סיום's own
                     # trainee — his unseatable 05:10 "mentor flight" pulled שמחה
                     # off LY353, breaking HER pairing with agent#47).
                     if _tr_row is None:
@@ -7888,7 +7892,7 @@ def boost_runner_floor_time(schedule_df, employees_df):
     """ר"צים get priority over plain attendants for floor work.
 
     User rule 2026-09-20 ("לרצים צריך להיות עדיפות על שיבוץ על פני דיילים"),
-    found on the real 20.09 schedule: TL#7 / TL#47 / TL#52
+    found on the real 20.09 schedule: TL#7 / TL#48 / TL#52
     (ר"צ, 03:30-12:30) held ONE flight each across a nine-hour shift while
     plain attendants worked full chains. Two mechanisms produced that:
       * the main pass ranks every ר"צ-qualified worker AFTER all ordinary

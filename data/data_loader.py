@@ -174,7 +174,7 @@ TERMINAL_SUFFIX_RE = re.compile(
 # TIME-FIRST variant: "[name] החל מHH:MM טרמינל X" — the start time appears
 # BEFORE the terminal word instead of after (user rule 2026-09-04: "זה מופיע
 # ככה בעיקר בסיירת" — mostly seen in the סיירת/patrol sheet). Real data
-# 16.08: "restricted-agent#3 החל מ02:00 טרמינל 1", "worker#12 החל מ02:00 טרמינל
+# 16.08: "restricted-agent#3 החל מ02:00 טרמינל 1", "worker#11 החל מ02:00 טרמינל
 # 1". TERMINAL_NOTE_RE's own time-lookup only searches AFTER the terminal
 # digit, so this order needs its own pattern — group order is (time,
 # terminal), opposite of TERMINAL_NOTE_RE's (terminal, time).
@@ -201,8 +201,8 @@ TRAINEE_PREFIX_RE = re.compile(r"^\s*" + TRAINEE_WORD_RE + r"\s*[-–]\s*", re.U
 # them, see TRAINEE_PREFIX_RE handling) is absent/sick and they're paired
 # with someone else for the day; the roster spells this out explicitly
 # instead of relying on row position (user rule 2026-09-04, real data
-# 21.07.2026: "agent#61 טרייני עם agent#70", "trainee-agent#13 טרייני עם
-# agent#80", "agent#86 טרייני עם TL#18"). Distinct from both the
+# 21.07.2026: "agent#65 טרייני עם agent#72", "trainee-agent#13 טרייני עם
+# agent#80", "agent#85 טרייני עם TL#18"). Distinct from both the
 # TRAINEE_PREFIX_RE case (mentor is unnamed, taken from the row above) and
 # plain "עם" note-stripping (NAME_NOTE_LEADIN_WORDS) — here "עם" introduces
 # a real name that must be KEPT (as the mentor), not discarded as noise.
@@ -223,13 +223,30 @@ FLIGHT_BLOCK_NOTE_RE = re.compile(r"לא\s+ל(?:רדת|הוריד)\s+לטיסו�
 # FLIGHT_BLOCK_NOTE_RE above); their usual mentor is NOT restricted by this
 # and is scheduled normally/independently — the pairing is intentionally
 # severed for the shift (real data 20.07.2026: trainee-agent#7, agent#6,
-# agent#67, all "טרייני - X תצפית!!").
+# agent#69, all "טרייני - X תצפית!!").
 OBSERVATION_NOTE_RE = re.compile(r"תצפית!*", re.UNICODE)
 
 # Words that introduce a free-text scheduling note typed directly into a name
 # cell ("agent#6 שיחה עם טל 1:30", "worker#4 שעת הדרכה
-# 10:00-11:00"). Used both to strip the note off the name (clean_roster_name)
-# and to tell such a cell apart from a genuine time-range SECTION HEADER.
+# 10:00-11:00", "agent#6 טקס סיום קורס 09:30-11:00", "agent#83
+# טיסות חסידים מגזר G 01:45-04:45" — a check-in-separation duty note for
+# the Rosh Hashana pilgrimage flights to Uman/RMO, see SPECIAL_FLIGHTS in
+# the company's own peak-report tool). Used both to strip the note off the
+# name (clean_roster_name) and to tell such a cell apart from a genuine
+# time-range SECTION HEADER — without "טקס"/"קורס"/"חסידים"/"מגזר" here,
+# "[NAME] טקס סיום קורס 09:30-11:00" got misread as a section header,
+# which both dropped that worker's own row and re-pointed current_start/end
+# to 09:30-11:00 for every name below them in the column (found via real
+# 08.09.2026 data: agent#6/agent#5's ceremony notes wiped out
+# their own shifts and gave agent#74/trainee-agent#12 a bogus 09:30-11:00
+# instead of the section's real 03:30-11:00). "טיסות" itself must be listed
+# too, not just "חסידים"/"מגזר" — the generic stripper below cuts the name
+# at the FIRST recognized leadin word it finds, so without "טיסות" here
+# "agent#79 טיסות חסידים..." only got cut from "חסידים" onward,
+# leaving "טיסות" glued to her name and breaking her shift_map key entirely
+# (found via the same real 08.09.2026 data — she vanished from the
+# schedule completely; agent#83, same note, kept a stray "טיסות"
+# suffix that still matched a DIFFERENT, wrong section's header time).
 NAME_NOTE_LEADIN_WORDS = {"שיחה", "הערה", "לתאם", "לבדוק", "עם", "לגבי",
                           "בנוגע", "סיכום", "להתקשר", "לחזור",
                           "שעת", "הדרכה", "תדריך", "פיקוח", "טקס", "קורס",
@@ -242,7 +259,7 @@ NAME_NOTE_LEADIN_WORDS = {"שיחה", "הערה", "לתאם", "לבדוק", "ע�
 # this contains a genuine TIME_RANGE match too, so without this check it was
 # misread as a SECTION HEADER instead of a worker row — silently dropping the
 # worker AND re-pointing current_start/end for every name below them in the
-# column (found via real 12.07.2026 data: TL#45, "אלינה מש'
+# column (found via real 12.07.2026 data: TL#46, "אלינה מש'
 # 03:30-13:30 (ר"צ בשעות 03:30-06:30)" — a shift manager who comes in early
 # to cover a 4th ר"צ slot; she never made it into the shift map at all).
 NAME_NOTE_MASH_RE = re.compile(r"מש(?:מרת|['\"״׳’]|\b)", re.UNICODE)
@@ -277,7 +294,7 @@ TAGBOR_ROLE_NOTE_RE = re.compile(
     re.UNICODE,
 )
 # Role-FIRST order: "תגבור רצ" then a single time (start only — no end
-# given at all), e.g. "TL#46-תגבור רצ החל מ03:30" or "שני-חניכה-תגבור
+# given at all), e.g. "TL#47-תגבור רצ החל מ03:30" or "שני-חניכה-תגבור
 # רצ מ03:30" (user rule 2026-09-04, real 04.09 data). Explicit role ("רצ")
 # still means roster-truth, no certification needed — same tier as
 # TAGBOR_ROLE_NOTE_RE, just a different word order/less info given.
@@ -418,7 +435,7 @@ def clean_roster_name(value):
 
     # Strip a "תגבור רצ" note whose only time is a single START (no range —
     # so the generic digit-RANGE stripper below never catches it), e.g.
-    # "TL#46-תגבור רצ החל מ03:30" → "TL#46". Detected/tagged
+    # "TL#47-תגבור רצ החל מ03:30" → "TL#47". Detected/tagged
     # separately in build_shift_map_from_excel.
     for _tgbre in (TAGBOR_ROLE_FIRST_RE, TAGBOR_TIME_THEN_ROLE_RE):
         _tgb_sm = _tgbre.search(text)
@@ -490,7 +507,7 @@ def clean_roster_name(value):
         text = _stripped
 
     # Strip a trailing "עד HH:MM" (until HH:MM) partial-shift note, e.g.
-    # "worker#9 עד 00:30" → "worker#9". Without this, such a worker's
+    # "worker#10 עד 00:30" → "worker#10". Without this, such a worker's
     # second (genuinely real, separate) shift entry gets a different name_key
     # than their primary entry and is silently dropped instead of merged as
     # an extra_shifts window.
@@ -532,7 +549,7 @@ def clean_roster_name(value):
     # >=1 word (not >=2 like every other strip here): this roster's
     # מנהלי-משמרות column already rosters some people by FIRST NAME ONLY
     # ("אתי"), so a single-word result here is a legitimate name, not an
-    # over-reduction — found via real 12.07.2026 data: TL#45,
+    # over-reduction — found via real 12.07.2026 data: TL#46,
     # a shift manager who comes in early specifically to cover a 4th ר"צ
     # slot during a flight peak, 03:30-06:30, before her own 06:40 shift.
     _SHIFT_NOTE_RE2 = re.compile(
@@ -759,11 +776,17 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
         # A cell only counts as a genuine section-HEADER for zone-detection
         # purposes when its time range sits at (or right at) the start of
         # the cell — a NAME+NOTE cell whose note happens to carry its own
-        # embedded time range (e.g. a worker's own name followed by a
-        # free-text note that itself includes an "HH:MM-HH:MM" range) must
-        # never count, or it silently drags the detected day-core/night-band
-        # boundaries across the whole sheet and breaks page1/upcoming-night
-        # classification for every shift in that sheet.
+        # embedded time range ("agent#65 טקס סיום קורס 09:30-11:00",
+        # "agent#85  טקס סיום קורס 09:30-11:00") must never count, or it
+        # silently drags the detected day-core/night-band boundaries across
+        # the whole sheet (found via real 08.09.2026 data, sheet
+        # "דלפקי ש\"ש": 3 such notes pulled the day-core range from its real
+        # rows 12/16 out to rows 3-27 — nearly the entire sheet — so NO
+        # night shift there was recognized as page-1/upcoming-night at all;
+        # TL-trainee#5's genuine two SEPARATE shifts — the night of 07.09→08.09
+        # ending this morning, and a new one starting the evening of
+        # 08.09→09.09 — got merged into one shift's "extra window" instead
+        # of being kept apart).
         def _is_bare_header_match(_ct, _m):
             return not _ct[:_m.start()].strip()
 
@@ -849,7 +872,7 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
             # roster-truth principle as the per-name TAGBOR_ROLE_NOTE_RE
             # case, propagated the same way as current_tsa_designated below
             # (user rule 2026-09-04, real 04.09 data: 3 names — TL#9,
-            # TL#53, TL#46 — listed together under one such header).
+            # TL#53, TL#47 — listed together under one such header).
             current_tagbor_rc = False
             current_duty_block = ""
             _duty_headers_seen = 0
@@ -1851,7 +1874,7 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
 
     # First-name -> how many employees share it. Feeds the single-word
     # roster-name fallback below (a shift manager referenced by first name
-    # only, e.g. "אלינה" for "TL#45", "אתי" for whoever that is) —
+    # only, e.g. "אלינה" for "TL#46", "אתי" for whoever that is) —
     # the main fuzzy match below requires 2+ shared words specifically to
     # avoid same-surname collisions, which a single-word roster entry can
     # never satisfy, so it silently never matched at all. Only ever used
@@ -1870,8 +1893,8 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
     # match it via the plain exact-key tier above), so a different employee
     # with a similarly-spelled name must never steal it via the near-miss
     # tier (found via real data 2026-08-31: employees_clean.xlsx has BOTH
-    # "agent#13" and "agent#71" as two distinct real people — only
-    # "agent#71" is on today's roster; without this guard the near-miss
+    # "agent#13" and "agent#73" as two distinct real people — only
+    # "agent#73" is on today's roster; without this guard the near-miss
     # tier would also fuzzy-attach her shift to "agent#13", who isn't
     # actually working today).
     _all_emp_name_keys = {name_key(n) for n in df["שם"].astype(str)}
@@ -2305,7 +2328,7 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
         # same "0" (primary/page-1) shift as the restricted night tail below,
         # and a mid-shift terminal-transfer chip meant for only the second
         # shift was misattributed to BOTH of the worker's shifts (found via
-        # real 12.07.2026 data: agent#68 — 22:00-07:00 night tail, T3, no
+        # real 12.07.2026 data: agent#70 — 22:00-07:00 night tail, T3, no
         # transfer, PLUS a separate 18:00-01:30 shift starting T1 with a
         # color-linked transfer to T3 at 21:30; the transfer chip rendered on
         # her night shift too).
@@ -2320,7 +2343,7 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
         # actually found — the note sits physically close to the occurrence it
         # belongs to. None when there isn't enough row bookkeeping to compare
         # (older/partial entries, T1-merged windows that carry no row).
-        # Found via real 12.07.2026 data: agent#65 — a page-1 night
+        # Found via real 12.07.2026 data: agent#68 — a page-1 night
         # 22:00-07:00 (T3→T1 transfer at 01:00) AND a separate, untouched
         # page-2 night ALSO starting 22:00-08:30 (all T3, no transfer). Both
         # produce the same "(22:00, 01:30)" capped tuple, so the transfer
@@ -2494,7 +2517,15 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
             #     "22:00-07:00") — merge_t1_shift_map's own dedup then adds no
             #     extra window at all, even though the explicit transfer note
             #     is perfectly valid and there is nothing else it could refer
-            #     to (found via real data: TL#6, 12.07.2026 file).
+            #     to (found via real data: TL#6, 12.07.2026 file); or
+            # (d) row bookkeeping says the note sits physically closer to the
+            #     primary occurrence than to any other shift window — needed
+            #     when the other shift starts at the SAME clock time as the
+            #     primary (so (b) can never see a distinguishing time to match
+            #     against): found via real data: agent#68,
+            #     12.07.2026 — page-1 22:00-07:00 (T3→T1 transfer at 01:00)
+            #     AND a separate page-2 22:00-08:30 (all T3, no transfer),
+            #     both starting 22:00.
             _tr_p1 = entry.get("transfer")
             _wt_p1 = entry.get("window_terminals", {}) or {}
             _p1_extra = entry.get("extra_shifts", [])
@@ -2610,7 +2641,7 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
                         # same bug class as the transfer-split-loop fix
                         # above, just via this branch's own tail-tracking
                         # instead. Found via real 08.09.2026 data: agent#82/
-                        # agent#85 — both a page-1 21:00-07:00 (T3->T1
+                        # agent#84 — both a page-1 21:00-07:00 (T3->T1
                         # transfer at 01:00) AND a same-time page-2 listing
                         # (a genuine second night, tomorrow) — their T1 merge
                         # window ("01:00-07:00") was tagged "1", stripping
@@ -2670,7 +2701,7 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
             _to = _tr["to"]
             _at = _tr.get("at") or ""
             if not _at:
-                # e.g. "worker#10 -טרמינל 1": the whole shift is at the other terminal
+                # e.g. "worker#5 -טרמינל 1": the whole shift is at the other terminal
                 avail_terms = [_to] * len(avail)
                 _full_ranges = list(avail)
             else:
@@ -2705,7 +2736,7 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
                 # the transfer and the later window's own start, and the
                 # displayed "מעבר טרמינל" time silently snaps to the later
                 # window's start instead of the real transfer time (found via
-                # real 12.07.2026 data: agent#65, transfer at
+                # real 12.07.2026 data: agent#68, transfer at
                 # 01:00 but the retagged tail starts 01:30. Also fixed the same
                 # latent bug for agent#76 on the same file's data — her
                 # page-1 tail's BASE terminal happened to equal her transfer's
@@ -2824,7 +2855,7 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
             # the note on the PRIMARY (page-1) occurrence instead — the one
             # case window-content can't distinguish: two shifts starting at
             # the IDENTICAL clock time (found via real 12.07.2026 data:
-            # agent#65 — page-1 22:00-07:00 with a T3→T1
+            # agent#68 — page-1 22:00-07:00 with a T3→T1
             # transfer at 01:00, plus a separate page-2 22:00-08:30, all T3,
             # no transfer; both produce the same "(22:00, 01:30)" capped
             # tuple). display.py's transfer-chip scoping reads this to know

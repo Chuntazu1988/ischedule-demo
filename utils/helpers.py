@@ -449,7 +449,7 @@ def return_text_by_shift(emp_row, task_end_dt):
     # A reinforcement worker (see data_loader.apply_shift_manager_home_labels)
     # has a real home desk from the "מנהלי משמרות" sheet — name it instead
     # of the generic counters phrase (user rule 2026-09-13, real 04.09.2026
-    # data: several first-name-only entries, all "X-תגבור..." reinforcements, belong at "77").
+    # data: נטע/רוני/שני, all "X-תגבור..." reinforcements, belong at "77").
     _home = clean_text(emp_row.get("בית תגבור", "")) if emp_row is not None else ""
     if _home:
         return f"חזרה ל־{_home}"

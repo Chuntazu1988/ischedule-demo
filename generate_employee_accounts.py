@@ -43,7 +43,7 @@ CREDENTIALS_CSV = "initial_employee_credentials.csv"
 def canonical_name_key(name: str) -> str:
     """Order-invariant identity for a person's name — this employee data has
     a known recurring issue where the SAME person appears more than once
-    with their name's word order swapped (given-name first vs surname first),
+    with their name's word order swapped (e.g. "agent#66" / "agent#66"),
     which is exactly why name_key/name_key_reversed matching already exists
     throughout the scheduler. A plain per-row name_key() doesn't catch this
     (order still matters), so this sorts the individually-normalized words

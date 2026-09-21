@@ -482,11 +482,14 @@ with st.sidebar:
     sidebar_confirm = st.button(
         "✅ אשר וטען קבצים", use_container_width=True, key="sidebar_confirm"
     )
-    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-    st.caption("🧪 נתוני דמו — סידור לדוגמה מנתונים מומצאים, לא נתוני עובדים אמיתיים.")
-    sidebar_demo = st.button(
-        "🧪 טען נתוני דמו", use_container_width=True, key="sidebar_demo",
-    )
+    # The demo-data loader only exists where demo_data/ ships (the public demo snapshot).
+    sidebar_demo = False
+    if os.path.isdir(os.path.join(os.path.dirname(__file__), "demo_data")):
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        st.caption("🧪 נתוני דמו — סידור לדוגמה מנתונים מומצאים, לא נתוני עובדים אמיתיים.")
+        sidebar_demo = st.button(
+            "🧪 טען נתוני דמו", use_container_width=True, key="sidebar_demo",
+        )
 
 def _load_demo_data_into_session():
     """
@@ -912,14 +915,12 @@ if not daily_file or not _has_fids:
                 st.session_state.pop("fids_applied", None)
                 st.session_state.pop("_fids_combined_raw", None)
 
-            st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
-            st.caption("🧪 נתוני דמו — סידור לדוגמה מנתונים מומצאים, לא נתוני עובדים אמיתיים.")
-            main_demo = st.button(
-                "🧪 טען נתוני דמו", use_container_width=True, key="main_demo"
-            )
-            if main_demo:
-                _load_demo_data_into_session()
-                st.rerun()
+            if os.path.isdir(os.path.join(os.path.dirname(__file__), "demo_data")):
+                st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
+                st.caption("🧪 נתוני דמו — סידור לדוגמה מנתונים מומצאים, לא נתוני עובדים אמיתיים.")
+                if st.button("🧪 טען נתוני דמו", use_container_width=True, key="main_demo"):
+                    _load_demo_data_into_session()
+                    st.rerun()
     st.stop()
 
 # Restore app chrome for the main app
@@ -1301,7 +1302,7 @@ def _render_who_works_today():
     # Filter: only employees in today's schedule — use UNFILTERED list so removed employees stay visible.
     # A literal "_name_key in shift_map" check misses anyone whose roster
     # spelling and employees-file spelling differ (e.g. a middle name present
-    # on the roster only — real 22.07.2026 data: "worker#6" on the
+    # on the roster only — real 22.07.2026 data: "worker#9" on the
     # roster vs. employees_clean's "TL#15" — or any of the other
     # spelling-variant cases apply_shift_map_to_employees' own get_entry()
     # already tolerates via fuzzy/subset name matching). That fuzzy match
@@ -3042,7 +3043,7 @@ def _run_build_schedule(flights_df, emps_df, locked_df=None):
     # checking whether doing so strands THEM with a purposeless gap). The
     # first fix_wasteful_gaps call above only sees the schedule as it stood
     # right after optimize_tl_continuity — found via real 12.07.2026 data:
-    # agent#63 (03:30-11:00) had a clean day until enforce_trainee_pairing
+    # agent#67 (03:30-11:00) had a clean day until enforce_trainee_pairing
     # backfilled LY323 (08:25-09:30) onto her at the very end, isolated by a
     # ~2h25m gap after her break with nothing to bridge it — she'd have gone
     # back to the counters and back down again for one flight ("טרטור").
@@ -6154,7 +6155,7 @@ if "schedule_df" in st.session_state:
                         # for — _wf_scheduled_names is a plain clean_text set and
                         # stayed order-SENSITIVE, so a mentor whose roster name is
                         # word-order-reversed from their schedule name (e.g. "TL#13" vs "בן TL#13") was still wrongly reported as
-                        # off-shift (found via real data 2026-08-02: worker#14
+                        # off-shift (found via real data 2026-08-02: worker#7
                         # סיום's mentor showed "טרייני ללא חונך" despite being
                         # genuinely scheduled that day).
                         if _wf_partner and name_key(clean_text(_wf_partner)) not in _wf_scheduled_name_keys:
