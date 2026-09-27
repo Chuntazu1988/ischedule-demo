@@ -58,6 +58,20 @@ def get_body_type(flight):
     return "רחב גוף"
 
 
+def get_flight_body_category(flight):
+    """Body category for the special-instructions picker (user 2026-09-22):
+    narrow-body, wide-body, or the ultra-long-haul wide-body destinations
+    (North America / Bangkok — the same route list as USA_TSA_DESTS plus BKK,
+    not HKT, which the user did not name)."""
+    body = get_body_type(flight)
+    if body != "רחב גוף":
+        return body
+    dest = clean_text(flight.get("יעד", "")).upper()
+    if dest in USA_TSA_DESTS or dest == "BKK":
+        return "רחב גוף צפון אמריקה/בנגקוק"
+    return body
+
+
 def get_aircraft_model(flight):
     """Specific aircraft model (e.g. "737-8") by registration prefix — for
     the "דוח שיבוץ טיסות" export's "מטוס" column. Distinct from
@@ -160,6 +174,42 @@ def role_end_time(flight):
 # =========================
 # SHIFT / AVAILABILITY
 # =========================
+
+
+# A roster window separated from every other window by this much is a separate
+# shift of the same person (same threshold the loader uses to keep a genuine
+# second shift instead of dropping it as a post-transfer leftover).
+_SECOND_SHIFT_GAP_MIN = 6 * 60
+
+
+def shift_start_minutes_for(emp, start_m):
+    """Minute-of-day at which the shift that contains `start_m` began.
+
+    Normally תחילת משמרת. But a worker with two shifts in one roster day has
+    one row and two זמינות windows — TL#49 (real 23.08): 21:00-07:00
+    night, then back at 18:00: "01:30-07:00,18:00-01:30". A task at 18:30 is 30
+    minutes into her evening shift, yet measured from 21:00 it looked 21.5 hours
+    in, so the 45-min fresh-start rule never fired. When the window holding the
+    task starts at least _SECOND_SHIFT_GAP_MIN after every other window ends,
+    that window's start is the shift start; a transfer split (a ~1h gap) is not.
+    Returns None when the shift start is unknown."""
+    _ss = clean_text(str(emp.get("תחילת משמרת", "")))
+    base = time_to_minutes(_ss) if is_time_text(_ss) else None
+    wins = []
+    for _w in clean_text(str(emp.get("זמינות", ""))).split(","):
+        if "-" not in _w:
+            continue
+        _a, _b = (x.strip() for x in _w.split("-", 1))
+        if is_time_text(_a) and is_time_text(_b):
+            wins.append((time_to_minutes(_a), time_to_minutes(_b)))
+    if len(wins) < 2:
+        return base
+    for _k, (_ws, _we) in enumerate(wins):
+        _len = (_we - _ws) % 1440 or 1440
+        if (start_m - _ws) % 1440 < _len:
+            _gap = min((_ws - _oe) % 1440 for _j, (_os, _oe) in enumerate(wins) if _j != _k)
+            return _ws if _gap >= _SECOND_SHIFT_GAP_MIN else base
+    return base
 
 
 def is_within_shift(emp, task_start, task_end, task_terminal=None):
@@ -838,7 +888,11 @@ def _drop_blocked_managers(df, role, start, end):
         return df
     keep = ~mgr
     idx = np.flatnonzero(mgr)
-    for i, r in zip(idx, df.iloc[idx].to_dict("records")):
+    # _manager_may_take reads only these fields — converting the whole ~70-column
+    # row per manager, per slot, was a measurable share of the build time.
+    _cols = [c for c in ("שם", CREW_CHIEF_MANAGER_COL, "_is_manager_backup", "תפקיד מוגבל בזמן",
+                         "תחילת חלון תפקיד", "סוף חלון תפקיד") if c in df.columns]
+    for i, r in zip(idx, df.iloc[idx][_cols].to_dict("records")):
         keep[i] = _manager_may_take(r, role, start, end)
     return df[keep].copy()
 
@@ -1570,9 +1624,30 @@ def sort_candidates(candidates, assignments, role, task_start=None, task_end=Non
     if task_start:
         _ts_m_buf = task_start.hour * 60 + task_start.minute
         first_task_buffer = np.empty(n, dtype=np.float32)
+        _avail_buf = candidates["זמינות"].tolist() if "זמינות" in candidates.columns else [""] * n
         for i, nm in enumerate(names):
             if by_name.get(nm, []):
-                first_task_buffer[i] = 0.0  # already has tasks — buffer irrelevant
+                # Already has tasks — buffer irrelevant, unless this task opens a
+                # SECOND shift of the same person (see shift_start_minutes_for)
+                # and none of their tasks falls inside that shift yet. Only a
+                # worker with two זמינות windows can have one, so everyone else
+                # skips the lookup (this runs once per candidate per slot).
+                first_task_buffer[i] = 0.0
+                if "," not in str(_avail_buf[i]):
+                    continue
+                _anc = shift_start_minutes_for({"תחילת משמרת": ss_col[i], "זמינות": _avail_buf[i]}, _ts_m_buf)
+                _ss_raw_buf = clean_text(ss_col[i])
+                if (_anc is not None and is_time_text(_ss_raw_buf)
+                        and _anc != time_to_minutes(_ss_raw_buf)):
+                    _into = (_ts_m_buf - _anc) % 1440
+                    _any_in = False
+                    for _t in by_name.get(nm, []):
+                        _tt = to_datetime_time(_t.get("התחלה", ""))
+                        if _tt is not None and ((_tt.hour * 60 + _tt.minute) - _anc) % 1440 < _into:
+                            _any_in = True
+                            break
+                    if not _any_in and _into < 45:
+                        first_task_buffer[i] = 1.0
             else:
                 _ss_raw_buf = clean_text(ss_col[i])
                 if not is_time_text(_ss_raw_buf):
@@ -2382,30 +2457,64 @@ def compute_segment_boundaries(flights_df, employees_df):
             flights_df, employees_df, rows[night_to + 1:after_from]
         )
         night["extension_roles"] = list(_EXTENDED_SEGMENT_ROLES)
+    day = _seg(night_to + 1, after_from)
+    if day:
+        # Same idea across midnight, inspectors only: an אפטר flight whose מפקח
+        # window opens before midnight (LY017 departs 00:15, inspector from
+        # 22:15) is staffed by the evening inspector the דיי team already has.
+        # Without it the דיי build could not see that demand and parked the only
+        # in-shift inspector on a דייל slot next to it — real 23.08: TSA-inspector#3 on
+        # LY081 21:15-22:20, LY017's inspector ❌ (user 2026-09-27).
+        day["extension"] = _extension_flights(
+            flights_df, employees_df, rows[after_from:],
+            pool=_day_pool(employees_df), roles=_DAY_EXTENDED_ROLES,
+            starts_before_midnight=True,
+        )
+        day["extension_roles"] = list(_DAY_EXTENDED_ROLES)
     return {
         "night": night,
-        "day": _seg(night_to + 1, after_from),
+        "day": day,
         "after": _seg(after_from, len(rows)),
     }
 
 
-def _extension_flights(flights_df, employees_df, later_rows):
+_DAY_EXTENDED_ROLES = ("מפקח TSA",)
+_DAY_POOL_START_BAND = (6 * 60, 20 * 60)     # shift starts 06:00-19:59
+
+
+def _day_pool(employees_df):
+    """Terminal-3 employees whose shift starts during the day (06:00-20:00)."""
+    lo, hi = _DAY_POOL_START_BAND
+    pool = []
+    for rec in employees_df.to_dict("records"):
+        start = clean_text(rec.get("תחילת משמרת", ""))
+        if not is_time_text(start) or clean_text(rec.get("טרמינל", "")) == "1":
+            continue
+        if lo <= time_to_minutes(start) < hi:
+            pool.append(rec)
+    return pool
+
+
+def _extension_flights(flights_df, employees_df, later_rows, pool=None,
+                       roles=_EXTENDED_SEGMENT_ROLES, starts_before_midnight=False):
     """
     Post-boundary flights whose ר"צ / מפקח TSA slots the נייט team still fills.
 
     A flight qualifies when a morning-shift worker certified for one of those
     roles is on shift for the whole of it — i.e. the flight departs, and its
     role window starts, inside that worker's shift.
+    pool / roles: the worker pool and roles (the דיי segment uses the day pool
+    and inspectors only). starts_before_midnight: the role window must open
+    before 00:00 — the דיי→אפטר boundary is midnight.
     """
     if not later_rows:
         return []
 
-    candidates = []          # (shift start, shift end) of morning ר"צ/מפקח
-    for rec in _morning_pool(employees_df):
+    candidates = []          # (shift start, shift end) of certified pool workers
+    for rec in (_morning_pool(employees_df) if pool is None else pool):
         if not any(
-            clean_text(rec.get(col, "")) == "כן"
-            for col in _EXTENDED_ROLE_COLUMNS.values()
-            if col in rec
+            clean_text(rec.get(_EXTENDED_ROLE_COLUMNS.get(r, r), "")) == "כן"
+            for r in roles
         ):
             continue
         _ss, _se = clean_text(rec.get("תחילת משמרת", "")), clean_text(rec.get("סוף משמרת", ""))
@@ -2424,12 +2533,14 @@ def _extension_flights(flights_df, employees_df, later_rows):
         if flight is None:
             continue
         req = get_requirements(flight)
-        roles = [r for r in _EXTENDED_SEGMENT_ROLES if req.get(r, 0) > 0]
-        if not roles:
+        _need = [r for r in roles if req.get(r, 0) > 0]
+        if not _need:
             continue
-        start = min(role_start_time(flight, r) for r in roles)
+        start = min(role_start_time(flight, r) for r in _need)
         start_m = start.hour * 60 + start.minute
         end_m = role_end_time(flight).hour * 60 + role_end_time(flight).minute
+        if starts_before_midnight and not (12 * 60 <= start_m < 24 * 60):
+            continue
         for _s, _e in candidates:
             _len = (_e - _s) % 1440 or 1440
             if 0 <= (start_m - _s) % 1440 <= _len and 0 <= (end_m - _s) % 1440 <= _len:
@@ -3723,6 +3834,13 @@ def upgrade_teamleads(assignments_df, employees_df):
             if _is_blocked_by_window(emp, _pr_sm, _pr_em, role="ראש צוות"):
                 continue
 
+            # The ר"צ window starts earlier than the דייל window she holds now,
+            # so her shift must cover the SLOT being filled, not only her current
+            # task (real 11.09: a 09:30-14:30 worker was promoted onto a
+            # 13:45-14:45 ר"צ slot — 15 min past her shift end).
+            if not is_within_shift(emp, start, end, task_terminal=_miss_term):
+                continue
+
             promoted_task = task
             promoted_name = worker
             break
@@ -4050,6 +4168,13 @@ def fix_wasteful_gaps(assignments_df, employees_df):
                 _te_n += 1440
             if not (_ts_n >= _cs_m and _te_n <= _ce_m):
                 continue
+            # The raw shift span above knows nothing about terminals: a T3
+            # attendant was handed a T1 flight (and a T1 worker a T3 one) —
+            # found via real 11.09 / 22.07 builds (Terminal 1 validation
+            # 2026-09-25). Gate on the worker's own per-window terminal.
+            if not is_within_shift(_cand_row, _t_s, _t_e,
+                                   task_terminal=get_terminal(clean_text(str(task.get("_gate", ""))))):
+                continue
             # _ts_n/_te_n are anchored to the CANDIDATE's own shift day (may
             # already be pushed +1440 for a midnight-starting task like
             # 00:00-01:05 on a 21:30-start shift). The candidate's OTHER
@@ -4222,6 +4347,13 @@ def optimize_tl_continuity(assignments_df, employees_df):
         t for t in assignments
         if t.get("תפקיד בסיס") == "ראש צוות" and not is_missing_worker(t.get("עובד", ""))
     ]
+    # A flight carrying a ר"צ trainee may only be led by a חונך/מסמיך: this pass
+    # handed LY387's ראש צוות slot to a non-mentor while TL-trainee#8 was its
+    # trainee (real 23.08 day build, 2026-09-26).
+    _trainee_flight_nums = {
+        clean_text(str(t.get("טיסה", ""))) for t in assignments
+        if t.get("תפקיד בסיס") == "טרייני רצ" and not is_missing_worker(t.get("עובד", ""))
+    }
 
     by_worker: dict = {}
     for t in tl_tasks:
@@ -4291,6 +4423,8 @@ def optimize_tl_continuity(assignments_df, employees_df):
                 if cs_m < prev_end_m + 5 or ce_m > next_start_m - 5:
                     continue
                 if get_terminal(clean_text(str(cand.get("_gate", "")))) != a_term:
+                    continue
+                if clean_text(str(cand.get("טיסה", ""))) in _trainee_flight_nums and not _mentor_cert(a_row):
                     continue
 
                 b_row = emp_map.get(b_name)
@@ -4740,7 +4874,7 @@ def reserve_dual_certified_for_tsa(assignments_df, employees_df):
     empty slot can be back-filled by upgrade_teamleads which runs afterwards).
     """
     df = assignments_df.copy() if hasattr(assignments_df, "copy") else assignments_df
-    if not hasattr(df, "iterrows"):
+    if not hasattr(df, "iterrows") or df.empty or "תפקיד בסיס" not in df.columns:
         return df
 
     emp_map = {clean_text(str(r.get("שם", ""))): r for _, r in employees_df.iterrows()}
@@ -4908,6 +5042,27 @@ def reserve_dual_certified_for_tsa(assignments_df, employees_df):
 # SWAP HELPERS
 # =========================
 
+_EMP_REC_CACHE = {"df": None, "n": -1, "recs": None}
+
+
+def _emp_records_by_index(employees_df):
+    """{index label: row as a plain dict} for the whole roster, built ONCE per
+    employees frame. get_qualified_candidates_for_swap is called hundreds of times
+    per build by the post-passes, and each call used to convert the entire roster
+    (to_dict) and build a Series per certified worker (iterrows) — most of the
+    post-pass time. Returns None when the index is not unique (callers then fall
+    back to iterrows). The cached frame is held by reference, so its id cannot be
+    recycled while cached; roster frames are never edited in place mid-build."""
+    c = _EMP_REC_CACHE
+    if c["df"] is employees_df and c["n"] == len(employees_df):
+        return c["recs"]
+    recs = None
+    if employees_df.index.is_unique:
+        recs = dict(zip(employees_df.index, employees_df.to_dict("records")))
+    c["df"], c["n"], c["recs"] = employees_df, len(employees_df), recs
+    return recs
+
+
 def get_qualified_candidates_for_swap(schedule_df, employees_df, flight_num, role_base, task_idx):
     task_row = schedule_df.loc[task_idx]
     start_str = str(task_row.get("התחלה", ""))
@@ -4959,11 +5114,28 @@ def get_qualified_candidates_for_swap(schedule_df, employees_df, flight_num, rol
     )
     certified = certified[~certified["שם"].astype(str).str.strip().isin(already_on_flight)]
 
+    # A ר"צ trainee shadows the flight's ר"צ, who must be a חונך or מסמיך —
+    # never offer anyone else for that slot. fill_idle_gaps / protect_early_shift_
+    # preflight_breaks handed such a slot to a non-mentor (real 08.09 / 20.07 /
+    # 22.07 builds, 2026-09-26) because this shared helper ignored the pairing.
+    if col == "ראש צוות" and (
+        (flight_tasks["תפקיד בסיס"].astype(str).str.strip() == "טרייני רצ")
+        & ~flight_tasks["עובד"].astype(str).str.contains("❌", na=False)
+    ).any():
+        _is_mentor = pd.Series(False, index=certified.index)
+        for _mc in ("חונך רצים", "מסמיך רצים"):
+            if _mc in certified.columns:
+                _is_mentor |= certified[_mc].astype(str).str.strip() == "כן"
+        certified = certified[_is_mentor]
+
     # Crew-chief managers: ר"צ / מפקח TSA only, only inside their marked
     # תגבור hours, and always listed LAST (see _manager_may_take).
     _sw_s, _sw_e = to_datetime_time(start_str), to_datetime_time(end_str)
     certified = _drop_blocked_managers(certified, role_base, _sw_s, _sw_e)
-    _mgr_names = {clean_text(str(r.get("שם", ""))) for r in certified.to_dict("records")
+    _recs = _emp_records_by_index(employees_df)
+    _cert_recs = ([_recs[_ix] for _ix in certified.index if _ix in _recs]
+                  if _recs is not None and len(certified) else certified.to_dict("records"))
+    _mgr_names = {clean_text(str(r.get("שם", ""))) for r in _cert_recs
                   if _is_crew_manager(r)}
 
     def _managers_last(names):
@@ -5006,7 +5178,7 @@ def get_qualified_candidates_for_swap(schedule_df, employees_df, flight_num, rol
     results = []
     _swap_term = get_terminal(clean_text(str(task_row.get("_gate", ""))))
     _slot_is_tsa = normalize_role_label(role_base) == "מפקח TSA"
-    for _, emp_row in certified.iterrows():
+    for emp_row in _cert_recs:
         name = emp_row["שם"]
         if name == current_worker:
             continue
@@ -5019,6 +5191,21 @@ def get_qualified_candidates_for_swap(schedule_df, employees_df, flight_num, rol
         # tasks — once already at 4, the parallel-coverage exemption below
         # is withdrawn and a 5th overlapping task is a real conflict again
         # (user rule 2026-09-05).
+        # Midnight-safe overlap: ts_m/te_m are anchored to the SLOT's own day (te_m
+        # already pushed +1440 when the slot itself crosses midnight), while an
+        # existing task's ps_m/pe_m are only pushed +1440 when THAT task alone
+        # crosses midnight — so a slot on one side of midnight (e.g. 22:30-00:30,
+        # te_m=1470) compared against a same-candidate task that starts exactly at
+        # 00:00 (ps_m=0, pe_m=65, never adjusted) missed the overlap entirely: real
+        # 23.08, agent#73 got LY027 (22:30-00:30) on top of an already-held LY005
+        # (00:00-01:05) — a genuine double-booking (user review 2026-09-27). Same
+        # three-phase-offset technique as _find_substitute / reserve_dual_certified_
+        # for_tsa's midnight-safe helper.
+        def _mn_overlap(ps_m, pe_m, buf):
+            pe_n = pe_m if pe_m > ps_m else pe_m + 1440
+            return any(ts_m < pe_n + _ph + buf and ps_m + _ph < te_m + buf
+                       for _ph in (-1440, 0, 1440))
+
         _concurrent_same_pier_tsa = 0
         if _slot_is_tsa and _swap_term:
             for (_ps0, _pe0, _role0, _gate0) in _my_tasks:
@@ -5026,9 +5213,7 @@ def get_qualified_candidates_for_swap(schedule_df, employees_df, flight_num, rol
                     continue
                 try:
                     ps_m0 = time_to_minutes(_ps0); pe_m0 = time_to_minutes(_pe0)
-                    if pe_m0 < ps_m0:
-                        pe_m0 += 1440
-                    if not (ts_m >= pe_m0 + 5 or te_m <= ps_m0 - 5):
+                    if _mn_overlap(ps_m0, pe_m0, 5):
                         _concurrent_same_pier_tsa += 1
                 except Exception:
                     pass
@@ -5038,10 +5223,7 @@ def get_qualified_candidates_for_swap(schedule_df, employees_df, flight_num, rol
             try:
                 ps_m = time_to_minutes(_ps)
                 pe_m = time_to_minutes(_pe)
-                if pe_m < ps_m:
-                    pe_m += 1440  # existing task crosses midnight
-                buf = 5
-                if not (ts_m >= pe_m + buf or te_m <= ps_m - buf):
+                if _mn_overlap(ps_m, pe_m, 5):
                     # A מפקח TSA may legitimately hold several overlapping
                     # tasks — concurrent coverage of nearby gates in the SAME
                     # PIER (שלוחה, e.g. B/C/D/E — not the same terminal
@@ -5169,9 +5351,14 @@ def get_extendable_candidates_for_swap(schedule_df, employees_df, flight_num, ro
             try:
                 ps_m = time_to_minutes(str(pt["התחלה"]))
                 pe_m = time_to_minutes(str(pt["סיום"]))
-                if pe_m < ps_m:
-                    pe_m += 1440
-                if not (ts_m >= pe_m + 5 or te_m <= ps_m - 5):
+                # Midnight-safe: ts_m/te_m are anchored to the SLOT's own day; a task
+                # that doesn't itself cross midnight (e.g. 00:00-01:05) is never
+                # pushed +1440, so comparing it directly against a slot on the other
+                # side of midnight misses the overlap (same bug fixed in
+                # get_qualified_candidates_for_swap, user review 2026-09-27).
+                pe_n = pe_m if pe_m > ps_m else pe_m + 1440
+                if any(ts_m < pe_n + _ph + 5 and ps_m + _ph < te_m + 5
+                      for _ph in (-1440, 0, 1440)):
                     # overlap — for TSA roles, a same-role TSA task in the SAME
                     # pier is parallel coverage (not a conflict). When THIS
                     # slot's gate isn't assigned yet (_this_pier == "" — common
@@ -6949,8 +7136,20 @@ def balance_workload(schedule_df, employees_df, terminal="1"):
     return df
 
 
+def _mentor_cert(emp_row):
+    """Holds חונך or מסמיך רצים — may lead a flight that carries a ר"צ trainee."""
+    return (clean_text(str(emp_row.get("חונך רצים", ""))) == "כן"
+            or clean_text(str(emp_row.get("מסמיך רצים", ""))) == "כן")
+
+
 def avoid_fresh_start_assignments(schedule_df, employees_df, terminal="1"):
-    """Keep a Terminal-1 flight off a worker who has only just clocked in.
+    """Keep a flight off a worker who has only just clocked in.
+
+    terminal="1" (the original scope) limits this to Terminal-1 flights;
+    terminal=None applies it to every flight — used as the LAST pass of the
+    build because later passes (runner floor-time, gap compaction) reshuffle
+    people after the T1-only run and re-created 03:30-shift workers with a
+    first task 25-30 min into the shift (user 2026-09-25).
 
     User rule 2026-08-06: "אין לשים שיבוצים לטיסות בטרמינל 1 שמאוד קרובים
     לתחילת המשמרת... יש לנסות לשבץ עובדים ממשמרת הבוקר, ולהשתמש בעובדים של
@@ -6977,7 +7176,7 @@ def avoid_fresh_start_assignments(schedule_df, employees_df, terminal="1"):
     except Exception:
         pass
 
-    _FRESH = 45          # "only just started" — same threshold as first_task_buffer
+    _FRESH = _FRESH_START_MIN   # "only just started" — same threshold as first_task_buffer
 
     def _tm(t):
         v = to_datetime_time(t)
@@ -6990,18 +7189,49 @@ def avoid_fresh_start_assignments(schedule_df, employees_df, terminal="1"):
         _r = emp_map.get(name)
         if _r is None:
             return None
-        _ss = clean_text(str(_r.get("תחילת משמרת", "")))
-        if not is_time_text(_ss):
+        _anc = shift_start_minutes_for(_r, role_start)
+        if _anc is None:
             return None
-        return (role_start - time_to_minutes(_ss)) % 1440
+        return (role_start - _anc) % 1440
+
+    def _edge_ok(name, task_end):
+        """True when `name` still has >= 15 min of shift left after the task —
+        the replacement must not just trade a fresh start for a task that ends
+        exactly at the shift end (23.08 אפטר: LY027's guard went from a 22:00
+        starter to a 12:30-00:30 worker whose shift ends 00:30, the task's end)."""
+        _r = emp_map.get(name)
+        _e = _tm(task_end)
+        if _r is None or _e is None:
+            return True
+        _ss = clean_text(str(_r.get("תחילת משמרת", "")))
+        _se = clean_text(str(_r.get("סוף משמרת", "")))
+        if not (is_time_text(_ss) and is_time_text(_se)):
+            return True
+        _a = time_to_minutes(_ss)
+        _len = (time_to_minutes(_se) - _a) % 1440 or 1440
+        _rel_end = (_e - _a) % 1440 or 1440
+        return _len - _rel_end >= 15 or _len - _rel_end < 0
 
     _by_flight = {}
     for _i in df.index:
         _by_flight.setdefault(str(df.at[_i, "טיסה"]).strip(), []).append(_i)
+    # A flight that carries a ר"צ trainee keeps a mentor as its ראש צוות — this pass
+    # runs LAST now (terminal=None) and may not undo the pairing invariant.
+    _trainee_flights = {f for f, ids in _by_flight.items()
+                        if any(str(df.at[j, "תפקיד בסיס"]).strip() == "טרייני רצ"
+                               and "❌" not in str(df.at[j, "עובד"]) for j in ids)}
+
+    def _mentor_gate(name, flight, role):
+        if role != "ראש צוות" or flight not in _trainee_flights:
+            return True
+        _r = emp_map.get(clean_text(name))
+        return _r is not None and _mentor_cert(_r)
 
     for _i in list(df.index):
         try:
-            if "_gate" not in df.columns or get_terminal(clean_text(str(df.at[_i, "_gate"]))) != terminal:
+            if terminal is not None and (
+                    "_gate" not in df.columns
+                    or get_terminal(clean_text(str(df.at[_i, "_gate"]))) != terminal):
                 continue
         except Exception:
             continue
@@ -7022,11 +7252,11 @@ def avoid_fresh_start_assignments(schedule_df, employees_df, terminal="1"):
         df.at[_i, "עובד"] = f"❌ חסר {_role}"
         _cands = [clean_text(_c) for _c in get_qualified_candidates_for_swap(
             df, employees_df, _flt, _role, _i)]
-        _better = [(_elapsed(_c, _rs) or 0, _c) for _c in _cands
-                   if (_elapsed(_c, _rs) or 0) >= _FRESH]
+        _better = [(_edge_ok(_c, df.at[_i, "סיום"]), _elapsed(_c, _rs) or 0, _c) for _c in _cands
+                   if (_elapsed(_c, _rs) or 0) >= _FRESH and _mentor_gate(_c, _flt, _role)]
         if _better:
             _better.sort(reverse=True)
-            df.at[_i, "עובד"] = _better[0][1]
+            df.at[_i, "עובד"] = _better[0][2]
             if "סיבה" in df.columns:
                 df.at[_i, "סיבה"] = "הוחלף — לא לשבץ עובד/ת בתחילת משמרת לטיסת טרמינל 1"
             continue
@@ -7042,6 +7272,8 @@ def avoid_fresh_start_assignments(schedule_df, employees_df, terminal="1"):
             _other_el = _elapsed(_other, _rs)
             if _other_el is None or _other_el < _FRESH or _other_el <= _el:
                 continue
+            if not _mentor_gate(_other, _flt, _role):
+                continue
             _kj, _ki = df.at[_j, "עובד"], df.at[_i, "עובד"]
             df.at[_i, "עובד"] = f"❌ חסר {_role}"
             df.at[_j, "עובד"] = f"❌ חסר {str(df.at[_j, 'תפקיד בסיס']).strip()}"
@@ -7053,11 +7285,11 @@ def avoid_fresh_start_assignments(schedule_df, employees_df, terminal="1"):
             df.at[_i, "עובד"] = _other
             _fill = [clean_text(_c) for _c in get_qualified_candidates_for_swap(
                 df, employees_df, _flt, str(df.at[_j, "תפקיד בסיס"]).strip(), _j)]
-            _fill_better = [(_elapsed(_c, _rs) or 0, _c) for _c in _fill
+            _fill_better = [(_edge_ok(_c, df.at[_j, "סיום"]), _elapsed(_c, _rs) or 0, _c) for _c in _fill
                             if (_elapsed(_c, _rs) or 0) >= _FRESH]
             if _fill_better:
                 _fill_better.sort(reverse=True)
-                df.at[_j, "עובד"] = _fill_better[0][1]
+                df.at[_j, "עובד"] = _fill_better[0][2]
             elif any(clean_text(_c) == _who for _c in _fill):
                 df.at[_j, "עובד"] = _who      # the fresh worker keeps a lesser role
             else:
@@ -7869,6 +8101,11 @@ def analyze_tl_peaks(schedule_df):
 # hall unless it is the one break / רענון the worker owes.
 _GAP_OK = 30
 
+# A worker's FIRST task of the shift must start at least this many minutes after
+# the shift starts (they still have to walk down to the hall) — matches the
+# threshold of build_schedule's first_task_buffer and avoid_fresh_start_assignments.
+_FRESH_START_MIN = 45
+
 
 def _idle_gap_waste(emp_row, gaps):
     """Idle minutes among a worker's between-task `gaps` that are NOT owed.
@@ -7888,7 +8125,28 @@ def _idle_gap_waste(emp_row, gaps):
     return sum(mid[free:])
 
 
-def boost_runner_floor_time(schedule_df, employees_df):
+def _dead_gap_waste(emp_row, gaps):
+    """Dead minutes among a ר"צ's between-task `gaps`, long gaps included.
+
+    `_idle_gap_waste` calls a 120+ min gap "a real return to the counters" and
+    charges nothing for it. A ר"צ, though, is not sent back to the counters —
+    she stays airside and is shown "עזרה באולם" for the stretch (user rule
+    2026-08-06) — so for her every minute between two flights beyond the
+    transition allowance is dead time, except the break (and, on a 10h+ shift,
+    the רענון) she owes: only the EXCESS of that gap over the owed minutes
+    counts (user 2026-09-22, TL#52: 04:45→07:35 held one break and two
+    hours of "עזרה באולם")."""
+    rb = required_break(emp_row) or 0
+    rr = required_refresh(emp_row) or 20
+    long_shift = shift_length(emp_row) >= 10 * 60
+    owed = [rb] + ([rr] if long_shift else []) if rb else []
+    dead = 0
+    for k, g in enumerate(sorted((g for g in gaps if g > _GAP_OK), reverse=True)):
+        dead += (g - owed[k]) if k < len(owed) and g >= owed[k] else g
+    return dead
+
+
+def boost_runner_floor_time(schedule_df, employees_df, balance=False):
     """ר"צים get priority over plain attendants for floor work.
 
     User rule 2026-09-20 ("לרצים צריך להיות עדיפות על שיבוץ על פני דיילים"),
@@ -7914,7 +8172,16 @@ def boost_runner_floor_time(schedule_df, employees_df):
         must stay with their mentor);
       * the displaced worker is a plain attendant (not ר"צ / runner / trainee)
         and the row is not locked from an earlier segment.
-    Never touches ר"צ, מפקח, שומר or ❌ rows, so it cannot open a shortage."""
+    Never touches ר"צ, מפקח, שומר or ❌ rows, so it cannot open a shortage.
+
+    balance=True is the SECOND phase (user 2026-09-22, TL#52: two flights
+    across a nine-hour shift while TL#13 held five back-to-back). Once
+    no plain attendant is left to displace, the holder may be another ר"צ —
+    an attendant slot moves from a more loaded ר"צ to a less loaded one when
+    that strictly narrows the load gap (so it can never ping-pong), passes
+    every check above for the receiver, and adds no idle time overall
+    (receiver + giver, by `_idle_gap_waste`). TL slots never move, and flights carrying a
+    ר"צ trainee are left alone (the pairing pass owns those)."""
     df = schedule_df.copy()
     try:
         df = df.astype(object)
@@ -7930,7 +8197,10 @@ def boost_runner_floor_time(schedule_df, employees_df):
         return clean_text(str(row.get(col, ""))) == "כן"
 
     def _m(t):
-        v = to_datetime_time(t)
+        try:
+            v = to_datetime_time(t)
+        except ValueError:
+            return None          # blank / unparsable time (flight not in the frame)
         return None if v is None else v.hour * 60 + v.minute
 
     runners = []
@@ -7972,6 +8242,10 @@ def boost_runner_floor_time(schedule_df, employees_df):
                 by_name.setdefault(r["עובד"], []).append(r)
     trainee_flights = {f for f, ws in flight_workers.items()
                        if any(w in emp_map and _yn(emp_map[w], "דייל בטרייני") for w in ws)}
+    if balance:
+        trainee_flights |= {f for f, ws in flight_workers.items()
+                            if any(w in emp_map and _yn(emp_map[w], "טרייני רצ") for w in ws)}
+    runner_set = set(runners)
 
     _plain_cache = {}
 
@@ -8002,6 +8276,28 @@ def boost_runner_floor_time(schedule_df, employees_df):
         rel = sorted(((s - anchor) % 1440, ((s - anchor) % 1440) + (e - s)) for s, e in items)
         return _idle_gap_waste(row, [b[0] - a[1] for a, b in zip(rel, rel[1:])])
 
+    def _dead(name, extra=None, without=None):
+        row = emp_map[name]
+        _ss = clean_text(str(row.get("תחילת משמרת", "")))
+        if not is_time_text(_ss):
+            return 0
+        anchor = time_to_minutes(_ss)
+        items = [(t["_s"], t["_e"]) for t in by_name.get(name, []) if t is not without]
+        if extra:
+            items.append(extra)
+        rel = sorted(((s - anchor) % 1440, ((s - anchor) % 1440) + (e - s)) for s, e in items)
+        return _dead_gap_waste(row, [b[0] - a[1] for a, b in zip(rel, rel[1:])])
+
+    def _waste_without(name, task):
+        row = emp_map[name]
+        _ss = clean_text(str(row.get("תחילת משמרת", "")))
+        if not is_time_text(_ss):
+            return 0
+        anchor = time_to_minutes(_ss)
+        items = [(t["_s"], t["_e"]) for t in by_name.get(name, []) if t is not task]
+        rel = sorted(((s - anchor) % 1440, ((s - anchor) % 1440) + (e - s)) for s, e in items)
+        return _idle_gap_waste(row, [b[0] - a[1] for a, b in zip(rel, rel[1:])])
+
     def _break_ok(name, extra_task):
         row = emp_map[name]
         if (required_break(row) or 0) <= 0 or is_night_shift_for_return_rule(row):
@@ -8023,7 +8319,16 @@ def boost_runner_floor_time(schedule_df, employees_df):
         for r in slots:
             holder = r["עובד"]
             role = r["תפקיד בסיס"]
-            if holder == rn or not _plain(holder) or r["טיסה"] in my_flights:
+            if holder == rn or r["טיסה"] in my_flights:
+                continue
+            if balance:
+                # ר"צ -> ר"צ: only from a clearly more loaded holder, and only
+                # while the giver stays at least as loaded afterwards.
+                if holder not in runner_set:
+                    continue
+                if _load(holder) - _load(rn) <= r["_e"] - r["_s"]:
+                    continue
+            elif not _plain(holder):
                 continue
             if not _yn(rrow, role):
                 continue
@@ -8038,8 +8343,27 @@ def boost_runner_floor_time(schedule_df, employees_df):
                 continue
             if term == "1" and 0 <= (r["_s"] - ss) % 1440 < 45:      # fresh-start rule (T1)
                 continue
+            # Fresh-start rule for EVERY terminal (user 2026-09-25, real 23.08
+            # night build): this pass handed 03:30-shift ר"צים the pre-dawn
+            # wave (ג'ולי / TL#25 on LY311 at 04:00, אוהד / קטרינה on LY279
+            # at 04:00, ירדן on LY321 at 03:55) by replacing night / 02:00
+            # workers — a first task 25-30 min into the shift, when they still
+            # have to go down to the hall. Same 45-min threshold the build's own
+            # first_task_buffer uses; only bites when the slot would become the
+            # worker's FIRST task.
+            if (0 <= (r["_s"] - ss) % 1440 < _FRESH_START_MIN
+                    and not any(t["_s"] < r["_s"] for t in my_tasks)):
+                continue
             after = _waste(rn, (r["_s"], r["_e"]))
-            if after > before:
+            # Accepted when it adds no idle time by EITHER measure: the usual one
+            # (a 120+ min gap is a counters return) or dead time (a ר"צ stays
+            # airside, so splitting a 170-min gap into a break gap plus a
+            # shorter one is a gain — user 2026-09-22, TL#52).
+            if balance:
+                # Levelling may never add idle time overall (receiver + giver).
+                if (after - before) + (_waste_without(holder, r) - _waste(holder)) > 0:
+                    continue
+            elif after > before and _dead(rn, (r["_s"], r["_e"])) > _dead(rn):
                 continue
             if not _break_ok(rn, r):
                 continue
@@ -8063,13 +8387,419 @@ def boost_runner_floor_time(schedule_df, employees_df):
             by_name.setdefault(rn, []).append(r)
             flight_workers[r["טיסה"]].add(rn)
             df.at[r["_i"], "עובד"] = rn
-            df.at[r["_i"], "סיבה"] = ("שובץ/ה לפי עדיפות ראש צוות על דייל — מקסום שהות באולם "
-                                      "(במקום " + holder + ")")
+            df.at[r["_i"], "סיבה"] = (
+                "שובץ/ה לאיזון עומס בין ר\"צים — פחות זמן מת (במקום " + holder + ")" if balance else
+                "שובץ/ה לפי עדיפות ראש צוות על דייל — מקסום שהות באולם (במקום " + holder + ")")
             progressed = True
             changed += 1
         if not progressed:
             break
     return df if changed else schedule_df
+
+
+def maximize_tl_trainee_coverage(schedule_df, employees_df, flights_df):
+    """During a ר"צ course, finish certifying the new TLs as fast as possible
+    (user rule 2026-09-22): give a flight's ראש צוות slot to a ר"צ certified
+    as חונך/מסמיך רצים over a non-mentor ר"צ whenever that unlocks a shadow
+    slot for a free טרייני ר"צ — even at some cost to load balance between
+    ר"צים, but ONLY for that purpose (a plain mentor-vs-non-mentor swap with
+    no trainee available to benefit does nothing).
+
+    Per flight, in departure-time order:
+      1. Catch-up — the assigned ר"צ already qualifies as mentor for the
+         flight's סוג הכשרה (see [[project-tl-trainee-mentor]]: מסמיך רצים
+         only for "הסמכה", חונך or מסמיך otherwise) but no טרייני ר"צ shadow
+         task exists yet (a trainee only became free after the main build,
+         e.g. through a later pass) — add the missing shadow task.
+      2. Swap-in — the assigned ר"צ does NOT qualify. If a genuinely free,
+         available (is_within_shift/is_available, same checks as everywhere
+         else) trainee exists for the shadow window AND a genuinely free,
+         available mentor-qualified ר"צ exists for the ר"צ slot itself, swap
+         the mentor into that slot — the displaced ר"צ simply keeps every
+         OTHER task they have — then add the shadow task.
+    Never touches a ❌ row, a locked row, or a crew-chief manager as the
+    mentor brought in (a manager already holding the slot may still be
+    displaced — see [[project-crew-chief-managers]]). A flight with 2
+    ר"צ slots (BKK/HKT) only needs ONE of them to qualify."""
+    if not has_trainee_available(employees_df):
+        return schedule_df
+    df = schedule_df.copy()
+    try:
+        df = df.astype(object)
+    except Exception:
+        pass
+    try:
+        emps = employees_df.astype(object)
+    except Exception:
+        emps = employees_df.copy()
+    emp_map = {clean_text(str(r.get("שם", ""))): r for r in emps.to_dict("records")}
+
+    def _yn(row, col):
+        return clean_text(str(row.get(col, ""))) == "כן"
+
+    def _on_roster(row):
+        return clean_text(str(row.get("in_daily_excel", ""))) in ("1", "1.0")
+
+    def _m(t):
+        try:
+            v = to_datetime_time(t)
+        except ValueError:
+            return None          # blank / unparsable time (flight not in the frame)
+        return None if v is None else v.hour * 60 + v.minute
+
+    trainee_pool = [n for n, row in emp_map.items()
+                    if n and _yn(row, "טרייני רצ") and _on_roster(row) and row.get("חולה") is not True]
+    if not trainee_pool:
+        return schedule_df
+    mentor_pool = [n for n, row in emp_map.items()
+                   if n and _yn(row, "ראש צוות") and (_yn(row, "חונך רצים") or _yn(row, "מסמיך רצים"))
+                   and not _is_crew_manager(row) and _on_roster(row) and row.get("חולה") is not True]
+    if not mentor_pool:
+        return schedule_df
+
+    def _mentor_ok(name, training_type):
+        row = emp_map.get(name)
+        if row is None:
+            return False
+        if training_type == "הסמכה":
+            return _yn(row, "מסמיך רצים")
+        return _yn(row, "חונך רצים") or _yn(row, "מסמיך רצים")
+
+    flights_by_num = {clean_text(str(r.get("טיסה", ""))): r for _, r in flights_df.iterrows()}
+    locked_col = "_נעול" if "_נעול" in df.columns else None
+
+    recs = df.to_dict("records")
+    for i, r in zip(df.index, recs):
+        r["_i"] = i
+        r["עובד"] = clean_text(str(r["עובד"]))
+        r["טיסה"] = clean_text(str(r["טיסה"]))
+        r["תפקיד בסיס"] = clean_text(str(r.get("תפקיד בסיס", "")))
+        s, e = _m(r["התחלה"]), _m(r["סיום"])
+        r["_s"], r["_e"] = s, (None if s is None or e is None else (e if e > s else e + 1440))
+
+    by_name, by_flight = {}, {}
+    for r in recs:
+        by_flight.setdefault(r["טיסה"], []).append(r)
+        if "❌" not in r["עובד"] and r["_s"] is not None and r["_e"] is not None:
+            by_name.setdefault(r["עובד"], []).append(r)
+
+    def _load(name):
+        return sum(t["_e"] - t["_s"] for t in by_name.get(name, []))
+
+    new_rows = []
+    changed = 0
+    for _round in range(6):
+        progressed = False
+        order = sorted(by_flight, key=lambda fn: _m(flights_by_num.get(fn, {}).get("המראה", "")) or 0)
+        for flight_num in order:
+            flight = flights_by_num.get(flight_num)
+            if flight is None:
+                continue
+            tasks = by_flight[flight_num]
+            tl_tasks = [t for t in tasks if t["תפקיד בסיס"] == "ראש צוות" and "❌" not in t["עובד"]]
+            if not tl_tasks:
+                continue
+            training_type = clean_text(flight.get("סוג הכשרה", "")) or "חניכה"
+            used_on_flight = {t["עובד"] for t in tasks if "❌" not in t["עובד"]}
+
+            if not any(_mentor_ok(t["עובד"], training_type) for t in tl_tasks):
+                swap_task = next((t for t in tl_tasks if not _mentor_ok(t["עובד"], training_type)
+                                  and not (locked_col and t.get(locked_col) is True)), None)
+                if swap_task is None:
+                    continue
+                ts_t, te_t = to_datetime_time(swap_task["התחלה"]), to_datetime_time(swap_task["סיום"])
+                gate = clean_text(str(swap_task.get("_gate", "")))
+                term = get_terminal(gate)
+                mentor_choice = None
+                for cand in sorted(mentor_pool, key=_load):
+                    if cand in used_on_flight or not _mentor_ok(cand, training_type):
+                        continue
+                    crow = emp_map[cand]
+                    if not is_within_shift(crow, ts_t, te_t, task_terminal=term):
+                        continue
+                    if not is_available(None, cand, ts_t, te_t, crow, "ראש צוות", gate,
+                                        emp_tasks=by_name.get(cand, [])):
+                        continue
+                    mentor_choice = cand
+                    break
+                if mentor_choice is None:
+                    continue
+                old = swap_task["עובד"]
+                if swap_task in by_name.get(old, []):
+                    by_name[old].remove(swap_task)
+                swap_task["עובד"] = mentor_choice
+                by_name.setdefault(mentor_choice, []).append(swap_task)
+                df.at[swap_task["_i"], "עובד"] = mentor_choice
+                df.at[swap_task["_i"], "סיבה"] = (
+                    'שובץ/ה כראש צוות כדי לאפשר חניכת טרייני ר"צ (במקום ' + old + ")")
+                used_on_flight.discard(old)
+                used_on_flight.add(mentor_choice)
+                progressed = True
+                changed += 1
+
+            if any(t["תפקיד בסיס"] == "טרייני רצ" and "❌" not in t["עובד"] for t in tasks):
+                continue
+
+            ts_t = role_start_time(flight, "טרייני רצ")
+            te_t = role_end_time(flight)
+            gate = clean_text(flight.get("גייט", "")) or clean_text(str(flight.get("שלוחה", "")))
+            term = get_terminal(gate)
+            trainee_choice = None
+            for cand in sorted(trainee_pool, key=_load):
+                if cand in used_on_flight:
+                    continue
+                crow = emp_map[cand]
+                if not is_within_shift(crow, ts_t, te_t, task_terminal=term):
+                    continue
+                if not is_available(None, cand, ts_t, te_t, crow, "טרייני רצ", gate,
+                                    emp_tasks=by_name.get(cand, [])):
+                    continue
+                trainee_choice = cand
+                break
+            if trainee_choice is None:
+                continue
+            new_task = {
+                "טיסה": flight["טיסה"], "יעד": flight["יעד"], "תפקיד": 'טרייני ר"צ',
+                "תפקיד בסיס": "טרייני רצ", "עובד": trainee_choice,
+                "התחלה": ts_t.strftime("%H:%M"), "סיום": te_t.strftime("%H:%M"),
+                "_gate": gate, "סיבה": 'שובץ/ה לחניכה — מקסום שיבוץ טרייני ר"צ',
+                "_s": ts_t.hour * 60 + ts_t.minute,
+                "_e": te_t.hour * 60 + te_t.minute if te_t.hour * 60 + te_t.minute > ts_t.hour * 60 + ts_t.minute
+                      else te_t.hour * 60 + te_t.minute + 1440,
+            }
+            tasks.append(new_task)
+            by_name.setdefault(trainee_choice, []).append(new_task)
+            used_on_flight.add(trainee_choice)
+            new_rows.append({k: v for k, v in new_task.items() if k not in ("_s", "_e")})
+            progressed = True
+            changed += 1
+        if not progressed:
+            break
+
+    if not changed:
+        return schedule_df
+    if new_rows:
+        df = pd.concat([df.drop(columns=["_i", "_s", "_e"], errors="ignore"), pd.DataFrame(new_rows)],
+                       ignore_index=True)
+    else:
+        df = df.drop(columns=["_i", "_s", "_e"], errors="ignore")
+    return df
+
+
+# Column headers of the "הנחיות מיוחדות" (special instructions) table, and the
+# fixed option lists for its two rightmost dropdowns.
+SPECIAL_INSTRUCTION_COLS = ("שם הטרייני", "שם החונך", "סוג הטיסה", "סוג מטוס")
+SPECIAL_INSTRUCTION_TYPES = ("טרייני", "הסמכה", "הסמכת קונקורס")
+SPECIAL_INSTRUCTION_BODY_CATS = ("צר גוף", "רחב גוף", "רחב גוף צפון אמריקה/בנגקוק")
+
+
+def _mentor_cert_ok_for_type(mentor_row, itype):
+    """Whether `mentor_row` holds the certification a special instruction's
+    סוג הטיסה requires (user 2026-09-22): טרייני needs חונך OR מסמיך רצים;
+    הסמכה needs מסמיך רצים specifically; הסמכת קונקורס needs none at all — a
+    separate קונקורס manager joins that flight and isn't tracked here, so any
+    ר"צ may fill the paired slot."""
+    if itype == "הסמכת קונקורס":
+        return True
+    yn = lambda c: clean_text(str(mentor_row.get(c, ""))) == "כן"
+    if itype == "הסמכה":
+        return yn("מסמיך רצים")
+    return yn("חונך רצים") or yn("מסמיך רצים")
+
+
+def apply_special_tl_trainee_instructions(schedule_df, employees_df, flights_df, instructions):
+    """Force each "הנחיות מיוחדות" row (Yogev's day-specific TL-trainee
+    requests, entered before the build — user 2026-09-22) onto a real flight:
+    pick the requested body category's earliest flight today where BOTH the
+    named trainee and mentor are genuinely free, and put the mentor in the
+    ראש צוות slot and the trainee in the shadow slot, displacing whoever
+    already held either (they simply keep every OTHER task they have — same
+    policy as [[project-scheduling-rules]]'s ר"צ passes). Runs LAST in the
+    build pipeline, after everything else that can still move a ר"צ, so
+    nothing downstream can silently undo an explicit request.
+
+    instructions: list of dicts / DataFrame rows with the SPECIAL_INSTRUCTION_
+    COLS keys; blank/partial rows are ignored. A row whose mentor lacks the
+    certification the type requires, or for which no flight of the requested
+    body category has both people free, is reported back unmet — this is a
+    best-effort placement (the user confirmed these requests are only sent
+    after checking both people share a shift), never a build-blocking error.
+
+    Returns (schedule_df, unmet) where unmet is a list of
+    {"שם הטרייני", "שם החונך", "סוג הטיסה", "סוג מטוס", "סיבה"}.
+    """
+    rows = instructions.to_dict("records") if hasattr(instructions, "to_dict") else list(instructions or [])
+    rows = [r for r in rows if clean_text(str(r.get("שם הטרייני", ""))) and clean_text(str(r.get("שם החונך", "")))]
+    if not rows:
+        return schedule_df, []
+
+    df = schedule_df.copy()
+    try:
+        df = df.astype(object)
+    except Exception:
+        pass
+    try:
+        emps = employees_df.astype(object)
+    except Exception:
+        emps = employees_df.copy()
+    emp_map = {clean_text(str(r.get("שם", ""))): r for r in emps.to_dict("records")}
+
+    def _m(t):
+        try:
+            v = to_datetime_time(t)
+        except ValueError:
+            return None          # blank / unparsable time (flight not in the frame)
+        return None if v is None else v.hour * 60 + v.minute
+
+    def _is_real_flight(flight):
+        num = clean_text(str(flight.get("טיסה", ""))).replace(" ", "").lstrip("LYly")
+        if len(num) >= 3 and num.startswith("8") and num[:3].isdigit():
+            return False
+        if is_cancelled_flight(num) or is_ferry_flight(flight):
+            return False
+        return clean_text(flight.get("המראה", "")) != ""
+
+    real_flights = [f for _, f in flights_df.iterrows() if _is_real_flight(f)]
+    real_flights.sort(key=lambda f: _m(f.get("המראה", "")) or 0)
+
+    recs = df.to_dict("records")
+    for i, r in zip(df.index, recs):
+        r["_i"] = i
+        r["עובד"] = clean_text(str(r["עובד"]))
+        r["טיסה"] = clean_text(str(r["טיסה"]))
+        r["תפקיד בסיס"] = clean_text(str(r.get("תפקיד בסיס", "")))
+        s, e = _m(r["התחלה"]), _m(r["סיום"])
+        r["_s"], r["_e"] = s, (None if s is None or e is None else (e if e > s else e + 1440))
+
+    by_name, by_flight = {}, {}
+    for r in recs:
+        by_flight.setdefault(r["טיסה"], []).append(r)
+        if "❌" not in r["עובד"] and r["_s"] is not None and r["_e"] is not None:
+            by_name.setdefault(r["עובד"], []).append(r)
+
+    used_flights = set()
+    new_rows, unmet = [], []
+    for row in rows:
+        trainee = clean_text(str(row.get("שם הטרייני", "")))
+        mentor = clean_text(str(row.get("שם החונך", "")))
+        itype = clean_text(str(row.get("סוג הטיסה", ""))) or "טרייני"
+        body_cat = clean_text(str(row.get("סוג מטוס", "")))
+        out_row = {"שם הטרייני": trainee, "שם החונך": mentor, "סוג הטיסה": itype, "סוג מטוס": body_cat}
+        trow, mrow = emp_map.get(trainee), emp_map.get(mentor)
+        if trow is None or mrow is None:
+            unmet.append({**out_row, "סיבה": "עובד לא נמצא במאגר"})
+            continue
+        if not _mentor_cert_ok_for_type(mrow, itype):
+            unmet.append({**out_row, "סיבה": f'{mentor} אינו מוסמך {"מסמיך" if itype == "הסמכה" else "חונך/מסמיך"} רצים'})
+            continue
+
+        placed = False
+        for flight in real_flights:
+            fnum = clean_text(str(flight.get("טיסה", "")))
+            if fnum in used_flights or get_flight_body_category(flight) != body_cat:
+                continue
+            ts_t, te_t = role_start_time(flight, "ראש צוות"), role_end_time(flight)
+            gate = clean_text(flight.get("גייט", "")) or clean_text(str(flight.get("שלוחה", "")))
+            term = get_terminal(gate)
+
+            # Already correctly placed on THIS flight (e.g. by an earlier
+            # pass) — don't run the availability check against their own
+            # existing task, which would trivially "conflict" with itself.
+            tl_candidates = [t for t in by_flight.get(fnum, []) if t["תפקיד בסיס"] == "ראש צוות"]
+            swap_task = next((t for t in tl_candidates if "❌" not in t["עובד"]), None)
+            # A shortage row for the role (never displaced by anyone else in
+            # this codebase) is converted in place rather than left dangling
+            # alongside a brand-new duplicate ראש צוות row.
+            shortage_task = None if swap_task is not None else next(
+                (t for t in tl_candidates if "❌" in t["עובד"]), None)
+            mentor_in_place = swap_task is not None and swap_task["עובד"] == mentor
+            trainee_task = next((t for t in by_flight.get(fnum, [])
+                                 if t["תפקיד בסיס"] == "טרייני רצ" and "❌" not in t["עובד"]), None)
+            trainee_in_place = trainee_task is not None and trainee_task["עובד"] == trainee
+
+            used_on_flight = {t["עובד"] for t in by_flight.get(fnum, []) if "❌" not in t["עובד"]
+                              and t is not (swap_task if mentor_in_place else None)
+                              and t is not (trainee_task if trainee_in_place else None)}
+
+            def _free(name, role, row_e):
+                if name in used_on_flight:
+                    return False
+                return (is_within_shift(row_e, ts_t, te_t, task_terminal=term)
+                        and is_available(None, name, ts_t, te_t, row_e, role, gate,
+                                         emp_tasks=by_name.get(name, [])))
+
+            if not (mentor_in_place or _free(mentor, "ראש צוות", mrow)):
+                continue
+            if not (trainee_in_place or _free(trainee, "טרייני רצ", trow)):
+                continue
+
+            reason = f'שיבוץ לפי הנחיה מיוחדת ({itype}: {trainee} עם {mentor})'
+            if mentor_in_place:
+                df.at[swap_task["_i"], "סיבה"] = reason
+            elif swap_task is not None:
+                old = swap_task["עובד"]
+                if swap_task in by_name.get(old, []):
+                    by_name[old].remove(swap_task)
+                swap_task["עובד"] = mentor
+                by_name.setdefault(mentor, []).append(swap_task)
+                df.at[swap_task["_i"], "עובד"] = mentor
+                df.at[swap_task["_i"], "סיבה"] = reason
+            elif shortage_task is not None:
+                shortage_task["עובד"] = mentor
+                by_name.setdefault(mentor, []).append(shortage_task)
+                df.at[shortage_task["_i"], "עובד"] = mentor
+                df.at[shortage_task["_i"], "סיבה"] = reason
+            else:
+                new_tl = {
+                    "טיסה": flight["טיסה"], "יעד": flight["יעד"], "תפקיד": "ראש צוות",
+                    "תפקיד בסיס": "ראש צוות", "עובד": mentor,
+                    "התחלה": ts_t.strftime("%H:%M"), "סיום": te_t.strftime("%H:%M"),
+                    "_gate": gate, "סיבה": reason,
+                    "_s": ts_t.hour * 60 + ts_t.minute,
+                    "_e": te_t.hour * 60 + te_t.minute if te_t.hour * 60 + te_t.minute > ts_t.hour * 60 + ts_t.minute
+                          else te_t.hour * 60 + te_t.minute + 1440,
+                }
+                by_flight.setdefault(fnum, []).append(new_tl)
+                by_name.setdefault(mentor, []).append(new_tl)
+                new_rows.append({k: v for k, v in new_tl.items() if k not in ("_s", "_e")})
+
+            if trainee_in_place:
+                df.at[trainee_task["_i"], "סיבה"] = reason
+            elif trainee_task is not None:
+                old_t = trainee_task["עובד"]
+                if trainee_task in by_name.get(old_t, []):
+                    by_name[old_t].remove(trainee_task)
+                trainee_task["עובד"] = trainee
+                by_name.setdefault(trainee, []).append(trainee_task)
+                df.at[trainee_task["_i"], "עובד"] = trainee
+                df.at[trainee_task["_i"], "סיבה"] = reason
+            else:
+                new_tr = {
+                    "טיסה": flight["טיסה"], "יעד": flight["יעד"], "תפקיד": 'טרייני ר"צ',
+                    "תפקיד בסיס": "טרייני רצ", "עובד": trainee,
+                    "התחלה": ts_t.strftime("%H:%M"), "סיום": te_t.strftime("%H:%M"),
+                    "_gate": gate, "סיבה": reason,
+                    "_s": ts_t.hour * 60 + ts_t.minute,
+                    "_e": te_t.hour * 60 + te_t.minute if te_t.hour * 60 + te_t.minute > ts_t.hour * 60 + ts_t.minute
+                          else te_t.hour * 60 + te_t.minute + 1440,
+                }
+                by_flight.setdefault(fnum, []).append(new_tr)
+                by_name.setdefault(trainee, []).append(new_tr)
+                new_rows.append({k: v for k, v in new_tr.items() if k not in ("_s", "_e")})
+
+            used_flights.add(fnum)
+            placed = True
+            break
+
+        if not placed:
+            unmet.append({**out_row, "סיבה": "לא נמצאה טיסה מהסוג המבוקש שבה שני העובדים פנויים יחד"})
+
+    if new_rows:
+        df = pd.concat([df.drop(columns=["_i", "_s", "_e"], errors="ignore"), pd.DataFrame(new_rows)],
+                       ignore_index=True)
+    else:
+        df = df.drop(columns=["_i", "_s", "_e"], errors="ignore")
+    return df, unmet
 
 
 def compact_idle_gaps(schedule_df, employees_df):
@@ -8111,7 +8841,10 @@ def compact_idle_gaps(schedule_df, employees_df):
         return clean_text(str(row.get(col, ""))) == "כן"
 
     def _m(t):
-        v = to_datetime_time(t)
+        try:
+            v = to_datetime_time(t)
+        except ValueError:
+            return None          # blank / unparsable time (flight not in the frame)
         return None if v is None else v.hour * 60 + v.minute
 
     _ATT_ROLES = ("דייל", "מתאם תורים")

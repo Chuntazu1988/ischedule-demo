@@ -1,0 +1,20 @@
+[theme]
+# Grey + pastel themes (user choice 2026-09-26). The app's own CSS
+# (app/styles.py THEMES / theme_vars_css) has THREE palettes — "light" and
+# "mid" run on Streamlit's LIGHT base, "charcoal" on its DARK base — so the
+# two sections below give native widgets and the canvas-drawn data tables
+# (which CSS can't restyle) the matching colours. Viewers switch light/dark
+# once via ⋮ → Settings; the browser remembers it.
+font = "sans serif"
+
+[theme.light]
+primaryColor = "#5b5bd6"
+backgroundColor = "#e4e6ea"
+secondaryBackgroundColor = "#f5f6f8"
+textColor = "#262c36"
+
+[theme.dark]
+primaryColor = "#e6c878"
+backgroundColor = "#393c43"
+secondaryBackgroundColor = "#454951"
+textColor = "#f3f4f6"

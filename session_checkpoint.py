@@ -38,7 +38,7 @@ _DB_PATH = "session_checkpoint.sqlite3"
 CHECKPOINT_KEYS = [
     "schedule_df", "flights_snap", "employees_snap", "labeled_df",
     "workload_df", "continuity_df", "output_df", "build_seconds",
-    "schedule_hours_label", "_build_id", "saved_flight_edits",
+    "schedule_hours_label", "schedule_terminal_label", "_build_id", "saved_flight_edits",
     "fids_applied", "fids_file1_bytes", "fids_file1_name",
     "fids_file2_bytes", "fids_file2_name",
     "_daily_file_name", "_t1_file_name", "_emp_file_name",
@@ -47,6 +47,7 @@ CHECKPOINT_KEYS = [
     "_segments_built", "_segment_built_until", "show_segment_form",
     "_segment_snapshots", "_segment_current", "_view_segment",
     "_shift_editor_sticky", "_manual_emp_edits",
+    "special_tl_instructions", "_unmet_tl_instructions",
 ]
 
 # The three uploaded files, stored as plain (name, bytes) tuples under their

@@ -141,6 +141,17 @@ def _full_shift_span_text(emp_row, task_start=None):
 # before departure, plus the 15-minute walk down to the gate.
 _MIN_ROOM_FOR_NEXT_TASK = 65
 
+# "המשך יבוא" is only shown when the worker's last built task ends within this
+# many minutes of the segment boundary — see build_next_task_labels.
+_MAX_GAP_TO_CONTINUE = 180
+
+# Early-morning (03:00-04:30 start) shifts: no break before this time unless the
+# gap it would use is at least _EARLY_PEAK_MIN_GAP minutes. Was 06:30 / 90 min;
+# eased 2026-09-25 after the real 23.08 review — several 02:00/03:30 workers got
+# their break only at the very end of the shift although a usable gap existed.
+_EARLY_PEAK_HOLD_M = 6 * 60
+_EARLY_PEAK_MIN_GAP = 60
+
 
 def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
     """
@@ -351,7 +362,7 @@ def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
         if _b_shift_type == "early_morning":
             _b_end_m = time_to_minutes(clean_text(str(_ber.get("סוף משמרת", "")))) if is_time_text(clean_text(str(_ber.get("סוף משמרת", "")))) else 0
             _b_short_0200 = _bss_m is not None and _bss_m < 3 * 60 and _b_end_m <= 10 * 60
-            _b_hold_m = 4 * 60 if _b_short_0200 else 6 * 60 + 30
+            _b_hold_m = 4 * 60 if _b_short_0200 else _EARLY_PEAK_HOLD_M
         else:
             _b_hold_m = None
         _bps, _bpe = preferred_break_window_by_shift(_ber)
@@ -369,7 +380,7 @@ def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
                 continue
             _bend_m = _bend.hour * 60 + _bend.minute
             # early-morning peak hold
-            if _b_hold_m is not None and _bend_m < _b_hold_m and _bgap < 90:
+            if _b_hold_m is not None and _bend_m < _b_hold_m and _bgap < _EARLY_PEAK_MIN_GAP:
                 continue
             # long shifts: PREFER a break ≥ 4h from shift start, but when the only
             # adequate gap is earlier (e.g. a 2h gap at 13:30 in an 11:30-21:00
@@ -404,7 +415,7 @@ def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
                 _bse_m = time_to_minutes(_bse_str)
                 _tail_gap = (_bse_m - _tail_bend_m) % 1440
                 if _tail_gap >= _bdur and not (
-                    _b_hold_m is not None and _tail_bend_m < _b_hold_m and _tail_gap < 90
+                    _b_hold_m is not None and _tail_bend_m < _b_hold_m and _tail_gap < _EARLY_PEAK_MIN_GAP
                 ):
                     if _b_long and _bss_m is not None and ((_tail_bend_m - _bss_m) % 1440) < MIN_BETWEEN_BREAKS:
                         _early_cands.append((_tail_bidx, _tail_bend_m, _tail_gap, True))
@@ -869,7 +880,12 @@ def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
                     # rule is genuinely shift-type-wide, not role-scoped. The earlier
                     # ג'ולי locked pattern is SUPERSEDED by this broader rule; see
                     # optimal_schedule_patterns memory update.
-                    _fp_placement_windows = {("10:00", "12:00"), ("11:30", "13:30"), ("13:00", "15:00"), ("18:00", "19:00"), ("16:00", "17:30"), ("03:00", "05:00")}
+                    # ("06:30","08:00") added 2026-09-25: the long 02:00-12:30 / 03:30-11:00-12:30
+                    # early shifts. A worker whose first flight only starts after
+                    # ~08:45 (real 23.08: agent#46 08:55, agent#75 09:05) took the
+                    # break wedged between two late flights (10:10) — user: "הפסקה
+                    # מאוד מאוחרת"; she is idle since 03:30, so it belongs before.
+                    _fp_placement_windows = {("10:00", "12:00"), ("11:30", "13:30"), ("13:00", "15:00"), ("18:00", "19:00"), ("16:00", "17:30"), ("03:00", "05:00"), ("06:30", "08:00")}
                     _existing_slot_idx = _break_slot.get(emp)
                     _existing_too_late = False
                     if _existing_slot_idx is not None and _fp_e_m is not None and (_fp_s, _fp_e) in _fp_placement_windows:
@@ -978,7 +994,7 @@ def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
                                 # 18:00-19:00 added 2026-07-14: 14:00-01:30-style shift
                                 # (only flight ~23:40-00:55, break was landing jammed
                                 # right before it — agent#20, לוי לילי לוטם, agent#63, agent#26).
-                                _fp_proactive_windows = {("10:00", "12:00"), ("11:30", "13:30"), ("13:00", "15:00"), ("18:00", "19:00"), ("03:00", "05:00")}
+                                _fp_proactive_windows = {("10:00", "12:00"), ("11:30", "13:30"), ("13:00", "15:00"), ("18:00", "19:00"), ("03:00", "05:00"), ("06:30", "08:00")}
                                 if (_fp_s, _fp_e) in _fp_proactive_windows:
                                     _fp_note_prefix = "הפסקה יזומה"
                                 else:
@@ -1056,11 +1072,13 @@ def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
             _se_m_local_disp = time_to_minutes(_se_local_disp) if is_time_text(_se_local_disp) else 0
             # SHORT 02:xx shifts (end ≤10:00): allow break from 04:00 onward.
             # A long 02:00-11:00 shift follows the 03:30-11:00 rules (hold 06:30).
-            _hold_until_m = 4 * 60 if (_ss_m_local_disp < 3 * 60 and _se_m_local_disp <= 10 * 60) else 6 * 60 + 30
+            _hold_until_m = 4 * 60 if (_ss_m_local_disp < 3 * 60 and _se_m_local_disp <= 10 * 60) else _EARLY_PEAK_HOLD_M
             if task_end_m < _hold_until_m:
-                # Require ≥ 90 min gap to allow break before peak ends.
-                # 60 min is borderline and lands exactly during peak — not practical.
-                _gap_fits_break = gap_to_next is not None and gap_to_next >= 90
+                # A gap that fits the break (45 min + the walk) is enough — user
+                # 2026-09-25 (real 23.08 night build, TL-trainee#7): a 70-min gap
+                # right after the first flight went unused and her break landed
+                # at 10:15, minutes before her 11:00 shift end.
+                _gap_fits_break = gap_to_next is not None and gap_to_next >= _EARLY_PEAK_MIN_GAP
                 if not _gap_fits_break:
                     can_break_now = False
 
@@ -1383,8 +1401,10 @@ def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
                     continuation = f"המשך ל־{_pre_next}"
                 elif _hall_help_after_break:
                     # ר"צ — stays airside helping in the hall, not sent back
-                    # to the counters (see the flag's comment above).
-                    continuation = "עזרה באולם"
+                    # to the counters (see the flag's comment above). Name the
+                    # task that follows the break + hall help so the row reads
+                    # as a sequence (user 2026-09-22: "הפסקה עזרה ו־323").
+                    continuation = f"עזרה באולם ו־{_pre_next}" if _pre_next else "עזרה באולם"
                 else:
                     continuation = "חזרה לדלפקים"
             else:
@@ -1472,7 +1492,15 @@ def build_next_task_labels(result_df, employees_df, built_until_minutes=None):
                 # 2026-08-09: TL#25 / TL#27 finish LY5467 at 11:50 with
                 # a 12:30 shift end — 40 min, no room for anything).
                 _room = (_se_m_cont - task_end_m) % 1440
-                if _op(_se_m_cont) > _op(built_until_minutes) and _room >= _MIN_ROOM_FOR_NEXT_TASK:
+                # ...and only when the boundary is CLOSE to this worker's last
+                # task. Someone who finished at 05:00 and is 6+ hours short of
+                # the next team's flights simply goes back to the counters and
+                # stays there — a "המשך יבוא" would promise a second trip down
+                # to the hall hours later (user 2026-09-25, agent#86: one flight
+                # at 04:10, shift to 12:30 — should read "חזרה", not "המשך יבוא").
+                _to_boundary = (_op(built_until_minutes) - _op(task_end_m)) % 1440
+                if (_op(_se_m_cont) > _op(built_until_minutes) and _room >= _MIN_ROOM_FOR_NEXT_TASK
+                        and _to_boundary <= _MAX_GAP_TO_CONTINUE):
                     next_text = "המשך יבוא"
                     deadline_suffix = ""
 
@@ -1950,7 +1978,7 @@ def render_peak_analysis(peak):
     )
     l_colors = _peak_colors(
         peak["lounge"],  peak["lounge_peaks"],
-        "rgba(80,180,100,0.9)", "rgba(80,180,100,0.3)"
+        "rgba(232,110,160,0.9)", "rgba(232,110,160,0.3)"
     )
 
     chart_data = json.dumps({
@@ -1961,15 +1989,24 @@ def render_peak_analysis(peak):
         "l_colors":  l_colors,
     })
 
-    st.components.v1.html(
+    st.iframe(
         f"""
         <div dir="rtl" style="font-family:Arial,sans-serif;">
           <canvas id="peakChart" style="width:100%;max-height:260px;"></canvas>
         </div>
         <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
         <script>
+        // The page's light/dark base is set a moment AFTER a theme switch, so the chart
+        // is (re)drawn whenever the base it was drawn for no longer matches.
+        const isDark = () => {{ try {{ return window.parent.document.documentElement.getAttribute('data-ischedule-base') === 'dark'; }} catch (e) {{ return true; }} }};
+        let DARK = isDark(), INK = '', chart = null;
+        const inkA = a => 'rgba(' + INK + ',' + a + ')';
         const d = {chart_data};
-        new Chart(document.getElementById('peakChart'), {{
+        function draw() {{
+        DARK = isDark();
+        INK = DARK ? '243,244,246' : '38,44,54';
+        if (chart) chart.destroy();
+        chart = new Chart(document.getElementById('peakChart'), {{
           type: 'bar',
           data: {{
             labels: d.labels,
@@ -1995,7 +2032,7 @@ def render_peak_analysis(peak):
           options: {{
             responsive: true,
             plugins: {{
-              legend: {{ labels: {{ color: '#ccc', font: {{ size: 12 }} }} }},
+              legend: {{ labels: {{ color: inkA(.85), font: {{ size: 12 }} }} }},
               tooltip: {{
                 callbacks: {{
                   label: ctx => ctx.datasetIndex === 0
@@ -2005,36 +2042,38 @@ def render_peak_analysis(peak):
               }}
             }},
             scales: {{
-              x: {{ ticks: {{ color:'#aaa', maxRotation:45, font:{{size:10}} }}, grid:{{color:'rgba(255,255,255,0.05)'}} }},
+              x: {{ ticks: {{ color: inkA(.65), maxRotation:45, font:{{size:10}} }}, grid:{{color: inkA(.07)}} }},
               yPax: {{
                 type: 'linear', position: 'right',
-                ticks: {{ color:'#5a9fd4' }},
-                grid:  {{ color:'rgba(255,255,255,0.08)' }},
-                title: {{ display:true, text:'נוסעים בדלפקים', color:'#5a9fd4', font:{{size:11}} }},
+                ticks: {{ color: DARK ? '#7db4e8' : '#2f6fb0' }},
+                grid:  {{ color: inkA(.1) }},
+                title: {{ display:true, text:'נוסעים בדלפקים', color: DARK ? '#7db4e8' : '#2f6fb0', font:{{size:11}} }},
                 beginAtZero: true,
               }},
               yFlight: {{
                 type: 'linear', position: 'left',
-                ticks: {{ color:'#50b464', stepSize:1 }},
+                ticks: {{ color: DARK ? '#f7a6c2' : '#b8336a', stepSize:1 }},
                 grid:  {{ drawOnChartArea:false }},
-                title: {{ display:true, text:'טיסות באולם', color:'#50b464', font:{{size:11}} }},
+                title: {{ display:true, text:'טיסות באולם', color: DARK ? '#f7a6c2' : '#b8336a', font:{{size:11}} }},
                 beginAtZero: true,
               }},
             }},
             animation: {{ duration:400 }},
           }}
         }});
+        }}
+        draw();
+        setInterval(() => {{ if (isDark() !== DARK) draw(); }}, 500);
         </script>
         """,
         height=320,
-        scrolling=False,
     )
 
     # ── פיקי דלפקים (כרטיסים) ────────────────────────────────────────────
     st.markdown(
         f"<div style='direction:rtl;text-align:right;margin-top:20px'>"
-        f"<div style='font-weight:700;font-size:1em;color:#5a9fd4;margin-bottom:10px;'>🏢 פיקי דלפקי צ׳ק-אין"
-        f"<span style='font-weight:400;font-size:0.75em;color:rgba(140,180,230,0.7);margin-right:8px;'>מעל 2,000 נוסעים</span></div>",
+        f"<div style='font-weight:700;font-size:1em;color:rgb(var(--r-guard));margin-bottom:10px;'>🏢 פיקי דלפקי צ׳ק-אין"
+        f"<span style='font-weight:400;font-size:0.75em;color:rgba(var(--ink-rgb),.74);margin-right:8px;'>מעל 2,000 נוסעים</span></div>",
         unsafe_allow_html=True,
     )
     def _render_peak_cards(peaks, val_label, val_fmt, accent, bg_alpha, text_color, sub_color):
@@ -2054,7 +2093,7 @@ def render_peak_analysis(peak):
                 badge = " 🔺" if is_max else ""
                 # earliest on the right: invert column index
                 cols[per_row - 1 - col_idx].markdown(
-                    f"""<div style='background:rgba({bg_alpha});border-right:3px solid {accent if is_max else "#3a5f8a"};
+                    f"""<div style='background:rgba({bg_alpha});border-right:3px solid {accent if is_max else "rgba(var(--ink-rgb),.3)"};
                     border-radius:8px;padding:10px 14px;text-align:right;margin-bottom:8px;'>
                     <div style='font-size:0.85em;font-weight:700;color:{accent};'>
                       {fmt(pk["start"])} – {fmt(pk["end"])}{badge}
@@ -2072,26 +2111,26 @@ def render_peak_analysis(peak):
         peak["counter_peaks"],
         val_label="נוסעים",
         val_fmt=lambda v: f"{v:,} נוסעים",
-        accent="#5a9fd4",
-        bg_alpha="60,120,200,0.12",
-        text_color="#ffffff",
-        sub_color="rgba(180,210,255,0.6)",
+        accent="rgb(var(--r-guard))",
+        bg_alpha="var(--ink-rgb),0.06",
+        text_color="var(--ink)",
+        sub_color="rgba(var(--ink-rgb),.62)",
     )
 
     # ── פיקי אולם (כרטיסים) ──────────────────────────────────────────────
     st.markdown(
-        "<div style='direction:rtl;text-align:right;font-weight:700;font-size:1em;color:#50b464;margin:18px 0 10px;'>🚪 פיקי אולם יציאה"
-        "<span style='font-weight:400;font-size:0.75em;color:rgba(120,210,140,0.7);margin-right:8px;'>מעל 6 טיסות</span></div>",
+        "<div style='direction:rtl;text-align:right;font-weight:700;font-size:1em;color:rgb(var(--t1-rgb));margin:18px 0 10px;'>🛂 פיקי אולם יציאה"
+        "<span style='font-weight:400;font-size:0.75em;color:rgba(var(--ink-rgb),.74);margin-right:8px;'>מעל 6 טיסות</span></div>",
         unsafe_allow_html=True,
     )
     _render_peak_cards(
         peak["lounge_peaks"],
         val_label="טיסות",
         val_fmt=lambda v: f"{v} טיסות",
-        accent="#50b464",
-        bg_alpha="80,180,100,0.12",
-        text_color="#ffffff",
-        sub_color="rgba(160,230,170,0.6)",
+        accent="rgb(var(--t1-rgb))",
+        bg_alpha="var(--ink-rgb),0.06",
+        text_color="var(--ink)",
+        sub_color="rgba(var(--ink-rgb),.62)",
     )
 
 
@@ -2337,7 +2376,7 @@ def render_line(line, current_role=""):
         line_str = line_str[:shift_match.start()].rstrip()
 
     badge_html = (
-        f'<span style="float:left;background:#e8f0fe;color:#1a3d7a;'
+        f'<span style="float:left;background:rgba(var(--ink-rgb),.08);color:rgba(var(--ink-rgb),.78);'
         f'font-size:11px;font-weight:900;border-radius:6px;'
         f'padding:2px 7px;margin-right:6px;white-space:nowrap;">🕐 {safe_html(shift_badge)}</span>'
         if shift_badge else ""
@@ -2427,7 +2466,7 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
         aircraft_disp = f":blue[{aircraft_short}]"
     elif _body_type == "רחב גוף":
         body_icon     = "✈️"                    # ג'מבו גדול = רחב גוף
-        aircraft_disp = f":red[{aircraft_short}]"
+        aircraft_disp = f":orange[{aircraft_short}]"   # not red: colour-blind-safe vs blue
     else:
         body_icon     = "🛫"
         aircraft_disp = aircraft_short
@@ -2445,7 +2484,11 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
     # מספר הטיסה והיעד מודגשים (bold) כדי שיבלטו; פירוט התפקידים הדרושים ירד
     # מהתווית המקוצרת ומוצג בתוך ה-expander (רק בלחיצה/פתיחה).
     _gate = str(row.get("גייט", "")).strip()
-    gate_str = f"  🚪 {_gate}" if _gate and _gate.lower() != "nan" else ""
+    # U+200F (RLM) after each Latin/number run keeps it attached to its Hebrew
+    # label in the RTL line — without it the bidi algorithm pushed "D7" etc.
+    # to the far end of the header.
+    _RLM = "‏"
+    gate_str = f"  ·  שער {_gate}{_RLM}" if _gate and _gate.lower() != "nan" else ""
     # Terminal-1 flights get a clear orange badge for at-a-glance separation
     term_str = "  :orange[**T1**]" if str(row.get("טרמינל", "")).strip() == "1" else ""
 
@@ -2464,15 +2507,15 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
         )
     else:
         expander_label = (
-            f"{body_icon} **{fnum} ← {row['יעד']}**{term_str}{gate_str}{missing_icon}{new_icon}"
-            f"   |   🕒 {row['זמנים']}"
-            f"   |   {aircraft_disp}"
+            f"**{fnum} ← {row['יעד']}**{_RLM}{term_str}{_RLM}{gate_str}{missing_icon}{new_icon}"
+            f"  ·  {row['זמנים']}{_RLM}"
+            f"  ·  {aircraft_disp}{_RLM}"
         )
 
     if _is_cancelled:
         with st.expander(expander_label, expanded=False):
             st.markdown(
-                '<div style="direction:rtl;color:#e05252;font-weight:700;padding:6px 2px;">'
+                '<div style="direction:rtl;color:var(--bad-ink);font-weight:700;padding:6px 2px;">'
                 '🚫 הטיסה מבוטלת עד להודעה חדשה — לא נדרש שיבוץ צוות.</div>',
                 unsafe_allow_html=True,
             )
@@ -2481,13 +2524,34 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
     if _is_ferry:
         with st.expander(expander_label, expanded=False):
             st.markdown(
-                '<div style="direction:rtl;color:#8a8f98;font-weight:700;padding:6px 2px;">'
+                '<div style="direction:rtl;color:rgba(var(--ink-rgb),.74);font-weight:700;padding:6px 2px;">'
                 '✈️ טיסת FERRY — יוצאת ללא נוסעים (עמודת Pax ריקה ב-FIDS). לא נדרש צוות.</div>',
                 unsafe_allow_html=True,
             )
         return
 
-    with st.expander(expander_label, expanded=False):
+    # Staffing fill bar (A+C redesign, 2026-09-26): filled / required slots,
+    # drawn at the left end of the card's header row. The card itself is a
+    # keyed container so CSS can colour its edge — red when a slot is
+    # missing, orange for Terminal 1 — without touching the expander.
+    _all_lines = [l for t in (left_text, right_text) if t and t != "nan"
+                  for l in t.split("\n") if l.strip()]
+    _n_req = len(_all_lines)
+    _n_miss = sum("❌" in l for l in _all_lines)
+    _n_ok = _n_req - _n_miss
+    _is_t1 = str(row.get("טרמינל", "")).strip() == "1"
+    _card_state = "miss" if _n_miss else "ok"
+    _card = st.container(key=f"fc_{_card_state}_{'t1' if _is_t1 else 't3'}_{row.name}_{fnum}")
+    with _card:
+        if _n_req:
+            _pct = int(round(100 * _n_ok / _n_req))
+            st.markdown(
+                f'<div id="fl-{"".join(ch for ch in fnum if ch.isalnum())}" class="fc-fill {"fc-fill-miss" if _n_miss else ""}">'
+                f'<span>{_n_ok}/{_n_req}{" ⚠" if _n_miss else ""}</span>'
+                f'<div class="fc-bar"><i style="width:{_pct}%"></i></div></div>',
+                unsafe_allow_html=True,
+            )
+    with _card, st.expander(expander_label, expanded=False):
 
         # Hoisted out of the per-line loop: one schedule scan + one role-label
         # pass PER CARD instead of per line (the per-line scans made every click
@@ -2548,13 +2612,13 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
 
                 if is_transfer_delay:
                     new_badge_html = (
-                        '<span style="float:right;background:#1a5fb4;color:#fff;'
+                        '<span style="float:right;background:rgb(var(--r-guard));color:var(--ink);'
                         'font-size:10px;font-weight:900;border-radius:5px;'
                         'padding:2px 6px;margin-left:6px;white-space:nowrap;">🚦 מעכב מעבר טרמינלים</span>'
                     )
                 elif is_new:
                     new_badge_html = (
-                        '<span style="float:right;background:#f5a623;color:#fff;'
+                        '<span style="float:right;background:rgba(var(--acc-rgb),.22);color:var(--acc-strong);border:1px solid rgba(var(--acc-rgb),.6);'
                         'font-size:10px;font-weight:900;border-radius:5px;'
                         'padding:2px 6px;margin-left:6px;white-space:nowrap;">✨ חדש</span>'
                     )
@@ -2565,14 +2629,14 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                         "הוסרה"
                     )
                     new_badge_html = (
-                        f'<span style="float:right;background:#c0392b;color:#fff;'
+                        f'<span style="float:right;background:rgba(var(--bad-rgb),.18);color:var(--bad-ink);border:1px solid rgba(var(--bad-rgb),.6);'
                         f'font-size:10px;font-weight:900;border-radius:5px;'
                         f'padding:2px 6px;margin-left:6px;white-space:nowrap;">🚫 {safe_html(_rem_reason)}</span>'
                     )
                 else:
                     new_badge_html = ""
                 badge_html = (
-                    f'<span style="float:left;background:#e8f0fe;color:#1a3d7a;'
+                    f'<span style="float:left;background:rgba(var(--ink-rgb),.08);color:rgba(var(--ink-rgb),.78);'
                     f'font-size:11px;font-weight:900;border-radius:6px;'
                     f'padding:2px 7px;margin-right:6px;white-space:nowrap;">🕐 {safe_html(shift_badge)}</span>'
                     if shift_badge else ""
@@ -2586,7 +2650,7 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                         unsafe_allow_html=True,
                     )
                     st.markdown(
-                        '<div style="font-size:11px;color:#aaa;text-align:right;margin:2px 0 6px;">'
+                        '<div style="font-size:11px;color:rgba(var(--ink-rgb),.74);text-align:right;margin:2px 0 6px;">'
                         'לשיבוץ מחדש — השתמש ב״שיבוץ אוטומטי״ במרכז הבקרה</div>',
                         unsafe_allow_html=True,
                     )
@@ -2628,7 +2692,7 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                         # Only extendable options exist — render them directly.
                         _ext_names = [f"{n}  (משמרת עד — פער {g} דק׳)" for (n, g) in _extendable]
                         st.markdown(
-                            '<div class="swap-popup-label" style="color:#b8860b;">'
+                            '<div class="swap-popup-label" style="color:var(--acc);">'
                             '⏱️ אין עובד שמשמרתו מכסה במלואה — ניתן לשבץ בכפוף לאישור '
                             'העובד/ת להארכת משמרת:</div>',
                             unsafe_allow_html=True,
@@ -2638,7 +2702,7 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                             label_visibility="collapsed",
                         )
                         if st.button("שבץ בכפוף לאישור", key=f"ext_only_confirm_{uid}",
-                                     use_container_width=True):
+                                     width="stretch"):
                             _ext_name = _extendable[_ext_names.index(_ext_pick)][0]
                             updated = do_swap(st.session_state["schedule_df"], task_idx,
                                               _ext_name, "unassign")
@@ -2697,9 +2761,9 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                                 st.markdown('<div class="swap-popup-label">בחר טיסה יעד:</div>', unsafe_allow_html=True)
                                 target_flight = st.selectbox("", options=other_flights, key=f"swap_target_{uid}", label_visibility="collapsed")
 
-                        bc1, bc2 = st.columns(2)
+                        bc2, bc1 = st.columns(2)  # confirm on the right (RTL)
                         with bc1:
-                            if st.button("✅ אשר החלפה", key=f"swap_confirm_{uid}", use_container_width=True):
+                            if st.button("✅ אשר החלפה", key=f"swap_confirm_{uid}", width="stretch", type="primary"):
                                 displaced_action = "move" if action == "העבר לחריץ פנוי בטיסה אחרת" else "unassign"
                                 updated = do_swap(st.session_state["schedule_df"], task_idx, selected_new, displaced_action, target_flight)
                                 st.session_state["schedule_df"] = updated
@@ -2708,7 +2772,7 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                                 st.session_state[popup_key] = False
                                 st.rerun()
                         with bc2:
-                            if st.button("✖ ביטול", key=f"swap_cancel_{uid}", use_container_width=True):
+                            if st.button("✖ ביטול", key=f"swap_cancel_{uid}", width="stretch"):
                                 st.session_state[popup_key] = False
                                 st.rerun()
 
@@ -2717,7 +2781,7 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                         if _extendable:
                             _ext_names2 = [f"{n}  (פער {g} דק׳ מעבר לסיום המשמרת)" for (n, g) in _extendable]
                             st.markdown(
-                                '<div class="swap-popup-label" style="color:#b8860b;'
+                                '<div class="swap-popup-label" style="color:var(--acc);'
                                 'margin-top:8px;">⏱️ אופציות נוספות — בכפוף לאישור '
                                 'העובד/ת להארכת משמרת:</div>',
                                 unsafe_allow_html=True,
@@ -2727,7 +2791,7 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                                 label_visibility="collapsed",
                             )
                             if st.button("שבץ בכפוף לאישור", key=f"ext_confirm_{uid}",
-                                         use_container_width=True):
+                                         width="stretch"):
                                 _ext_name2 = _extendable[_ext_names2.index(_ext_pick2)][0]
                                 updated = do_swap(st.session_state["schedule_df"], task_idx,
                                                   _ext_name2, "unassign")
@@ -3041,10 +3105,20 @@ def to_departures_report_excel_bytes(flights_df, schedule_df, employees_df, term
         # registration are shown (user rule 2026-07-28).
         max_rows = max(len(managers), len(agents), 2)
 
+        # Delayed flight: the schedule was built on the ETD (FIDS estimate or a
+        # typed value — see _effective_flights_for_schedule), but the shown
+        # departure is the ORIGINAL one. Without a marker the reader compares
+        # task windows against the wrong time and sees overlaps that do not
+        # exist (user 2026-09-25, LY117: scheduled 07:00, ETD 08:30 — three
+        # "overlapping" workers were all correctly placed against 08:30).
+        _etd_txt = clean_text(flight.get("ETD", ""))
+        _etd_note = f"ETD {_etd_txt}" if (is_time_text(_etd_txt) and _etd_txt != dep_time) else ""
+
         for i in range(max_rows):
             values = [
                 _spaced_flight_num(flight_num) if i == 0 else (gate_pax_text if i == 1 else ""),
-                (f"{boarding_time} ({dep_time})" if boarding_time else dep_time) if i == 0 else "",
+                ((f"{boarding_time} ({dep_time})" if boarding_time else dep_time) if i == 0
+                 else (_etd_note if i == 1 else "")),
                 destination if i == 0 else "",
                 aircraft if i == 0 else (registration if i == 1 else ""),
                 managers[i]["text"] if i < len(managers) else "",

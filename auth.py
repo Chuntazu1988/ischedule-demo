@@ -112,9 +112,9 @@ def is_employee_view() -> bool:
 def _render_change_password_form(username: str) -> None:
     st.markdown(
         '<div dir="rtl" style="max-width:420px;margin:80px auto 0;padding:32px;'
-        'background:#0f172a;border:1px solid #1e293b;border-radius:16px;">'
-        '<h2 style="text-align:center;color:#fff;margin-bottom:8px;">🔑 יש להחליף סיסמה</h2>'
-        '<p style="text-align:center;color:#9ca3af;font-size:14px;">'
+        'background:var(--card);border:1px solid rgba(var(--acc-rgb),.35);border-radius:16px;">'
+        '<h2 style="text-align:center;color:var(--ink);margin-bottom:8px;">🔑 יש להחליף סיסמה</h2>'
+        '<p style="text-align:center;color:rgba(var(--ink-rgb),.74);font-size:14px;">'
         "זו ההתחברות הראשונה שלך — בחר/י סיסמה חדשה כדי להמשיך.</p>"
         "</div>",
         unsafe_allow_html=True,
@@ -124,7 +124,7 @@ def _render_change_password_form(username: str) -> None:
         with st.form("change_pw_form"):
             new_pw = st.text_input("סיסמה חדשה", type="password")
             new_pw2 = st.text_input("אימות סיסמה חדשה", type="password")
-            submitted = st.form_submit_button("שמור סיסמה חדשה", use_container_width=True)
+            submitted = st.form_submit_button("שמור סיסמה חדשה", width="stretch")
         if submitted:
             if not new_pw or len(new_pw) < 6:
                 st.error("הסיסמה חייבת להכיל לפחות 6 תווים.")
@@ -154,33 +154,64 @@ def render_login_gate() -> None:
 
     users = _load_users()
 
-    st.markdown(
-        '<div dir="rtl" style="max-width:420px;margin:80px auto 0;padding:32px;'
-        'background:#0f172a;border:1px solid #1e293b;border-radius:16px;">'
-        '<h2 style="text-align:center;color:#fff;margin-bottom:24px;">🔐 כניסה ל-iSchedule</h2>'
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    _, col, _ = st.columns([1, 2, 1])
-    with col:
-        with st.form("login_form"):
-            username = st.text_input("שם משתמש")
-            password = st.text_input("סיסמה", type="password")
-            submitted = st.form_submit_button("התחבר", use_container_width=True)
+    # Login card in the app's theme (colours are the theme CSS variables that
+    # streamlit_app.py injects before calling this): radar + title + runway
+    # lights on top, the form right under it as ONE card, gold login button.
+    from app.styles import paper_planes_html, emblem_svg
+    st.markdown(paper_planes_html(), unsafe_allow_html=True)
+    with st.container(key="login_root"):
+        if True:
+            st.markdown(
+                """<style>
+                .st-key-login_root { position: fixed; inset: 0; z-index: 2; display: flex; flex-direction: column; align-items: center; justify-content: safe center; gap: 0; overflow-y: auto; padding: 5.5rem 0 1.5rem; box-sizing: border-box; }
+                .st-key-login_root > * { width: min(460px, 92vw) !important; flex: none; }
+                .login-card { direction: rtl; max-width: none; margin: 0; padding: 26px 28px 18px;
+                    background: var(--card); border: 1px solid rgba(var(--acc-rgb),.35); border-bottom: none;
+                    border-radius: 20px 20px 0 0; text-align: center; }
+                .login-radar { width: 54px; height: 54px; margin: 0 auto 10px; border-radius: 50%;
+                    border: 1px solid rgba(var(--acc-rgb),.6); position: relative; overflow: hidden; }
+                .login-radar::before { content: ""; position: absolute; inset: 0;
+                    background: conic-gradient(from 0deg, rgba(var(--acc-rgb),.6), transparent 25%);
+                    animation: loginSweep 6s linear infinite; }
+                @keyframes loginSweep { to { transform: rotate(360deg); } }
+                .login-title { font-family: 'Chakra Petch','Rubik',sans-serif; font-size: 28px; font-weight: 700; color: var(--ink); }
+                .login-sub { font-size: 14px; color: var(--acc-strong); margin-top: 2px; }
+                .login-runway { height: 3px; margin-top: 16px; border-radius: 2px;
+                    background-image: repeating-linear-gradient(90deg, rgba(var(--acc-rgb),.9) 0 22px, transparent 22px 50px);
+                    background-size: 100px 3px; animation: loginLights 2.4s linear infinite; }
+                @keyframes loginLights { to { background-position: -100px 0; } }
+                [data-testid="stForm"]:has(input) { background: var(--card); border: 1px solid rgba(var(--acc-rgb),.35) !important;
+                    border-top: none !important; border-radius: 0 0 20px 20px !important; margin-top: -1px; direction: rtl; }
+                [data-testid="stForm"] [data-testid="stWidgetLabel"] { direction: rtl; width: 100%; justify-content: flex-start; }
+                [data-testid="stForm"] input { text-align: right; direction: rtl; }
+                
+</style>
+<div class="login-card">
+<div class="login-emblem">""" + emblem_svg("lg") + """</div>
+<div class="login-title">iSchedule</div>
+<div class="login-sub">כניסה למערכת</div>
+<div class="login-runway"></div>
+</div>""",
+                unsafe_allow_html=True,
+            )
+            with st.form("login_form"):
+                username = st.text_input("שם משתמש")
+                password = st.text_input("סיסמה", type="password")
+                submitted = st.form_submit_button("התחבר", width="stretch", type="primary")
 
-        if submitted:
-            entry = users.get(username.strip())
-            if not entry or not _verify_password(password, entry.get("password_hash", "")):
-                st.error("שם משתמש או סיסמה שגויים.")
-            else:
-                st.session_state[SESSION_KEY] = {
-                    "username": username.strip(),
-                    "name": entry.get("name", username.strip()),
-                    "role": entry.get("role", "viewer"),
-                    "employee_name": entry.get("employee_name", ""),
-                    "must_change_password": bool(entry.get("must_change_password", False)),
-                }
-                st.rerun()
+            if submitted:
+                entry = users.get(username.strip())
+                if not entry or not _verify_password(password, entry.get("password_hash", "")):
+                    st.error("שם משתמש או סיסמה שגויים.")
+                else:
+                    st.session_state[SESSION_KEY] = {
+                        "username": username.strip(),
+                        "name": entry.get("name", username.strip()),
+                        "role": entry.get("role", "viewer"),
+                        "employee_name": entry.get("employee_name", ""),
+                        "must_change_password": bool(entry.get("must_change_password", False)),
+                    }
+                    st.rerun()
 
     if not users:
         st.warning(
@@ -201,11 +232,11 @@ def render_logout_control() -> None:
     )
     with st.sidebar:
         st.markdown(
-            f'<div dir="rtl" style="font-size:13px;color:#9ca3af;padding:4px 0;">'
+            f'<div dir="rtl" style="font-size:13px;color:rgba(var(--ink-rgb),.74);padding:4px 0;">'
             f'מחובר/ת: <b>{user["name"]}</b> ({_role_label})'
             f"</div>",
             unsafe_allow_html=True,
         )
-        if st.button("🚪 התנתק", use_container_width=True, key="logout_btn"):
+        if st.button("🛂 התנתק", width="stretch", key="logout_btn"):
             st.session_state.pop(SESSION_KEY, None)
             st.rerun()

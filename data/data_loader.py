@@ -373,17 +373,38 @@ START_TERMINAL_PREFIX_RE = re.compile(
 )
 
 
+# The T1<->T3 shuttle only departs on the quarter hour (16:00, 16:15, 16:30,
+# 16:45, ...), every 15 minutes each direction (user rule, [[project-terminal1]]
+# "still open" item, resolved 2026-09-22). ANY transfer arrival time — a time
+# written in the roster note, or one this loader infers from a window's own
+# start — must land on one of those four marks; a note reading "01:05" cannot
+# be a real arrival, because no shuttle leaves then. Round UP (never down: the
+# worker cannot arrive on an earlier shuttle than the one the note/window
+# implies) to the next quarter hour, leaving an already-round time untouched.
+def _round_transfer_time_to_shuttle(hhmm):
+    if not hhmm or ":" not in hhmm:
+        return hhmm
+    try:
+        h, m = (int(p) for p in hhmm.split(":", 1))
+    except (TypeError, ValueError):
+        return hhmm
+    total = ((h * 60 + m + 14) // 15) * 15
+    return f"{(total // 60) % 24:02d}:{total % 60:02d}"
+
+
 def parse_terminal_note(cell_text):
     """Return {"to": "1"/"3", "at": "HH:MM" or ""} if the text carries a
-    terminal-transfer note, else None."""
+    terminal-transfer note, else None. "at" is quantized to the shuttle's
+    quarter-hour cadence — see _round_transfer_time_to_shuttle."""
     text = START_TERMINAL_PREFIX_RE.sub("", clean_text(cell_text))
     m_tf = TERMINAL_NOTE_TIME_FIRST_RE.search(text)
     if m_tf:
-        return {"to": m_tf.group(2), "at": normalize_time_text(m_tf.group(1))}
+        return {"to": m_tf.group(2), "at": _round_transfer_time_to_shuttle(normalize_time_text(m_tf.group(1)))}
     m = TERMINAL_NOTE_RE.search(text)
     if not m:
         return None
-    return {"to": m.group(1), "at": normalize_time_text(m.group(2)) if m.group(2) else ""}
+    _at = _round_transfer_time_to_shuttle(normalize_time_text(m.group(2))) if m.group(2) else ""
+    return {"to": m.group(1), "at": _at}
 
 
 def clean_roster_name(value):
@@ -1121,7 +1142,11 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
                 # generic START/END keyword scans never get a chance to
                 # mis-parse this same bare range.
                 _bnt_m = TIME_RANGE_RE.search(cell_text)
-                if _bnt_m and cell_text[:_bnt_m.start()].strip() and not cell_text[_bnt_m.end():].strip():
+                _bare_range_hit = bool(
+                    _bnt_m and cell_text[:_bnt_m.start()].strip()
+                    and not cell_text[_bnt_m.end():].strip()
+                )
+                if _bare_range_hit:
                     shift_start_ovr = normalize_time_text(_bnt_m.group(1))
                     shift_end_ovr   = normalize_time_text(_bnt_m.group(2))
 
@@ -1225,7 +1250,13 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
                 # trainee off flights for this shift (see OBSERVATION_NOTE_RE).
                 inline_observation = bool(OBSERVATION_NOTE_RE.search(clean_text(cell_text)))
 
-                if not _rw_m and not _tgb_m and not _tgbw_m and not _tgb_m2 and not _tgb_m3:
+                # A bare "NAME מש' HH:MM-HH:MM" range (handled above) must not
+                # ALSO run through the keyword scans: END_SHIFT_KW's bare "מש'"
+                # grabbed the range's FIRST time as an end, so "TL-trainee#4 מש' 20:00-06:00" came out as 20:00-20:00 (user report
+                # 2026-09-25, real 23.08 data — she then showed "המשך יבוא"
+                # after a 06:50 flight although her shift ends 06:00).
+                if (not _rw_m and not _tgb_m and not _tgbw_m and not _tgb_m2
+                        and not _tgb_m3 and not _bare_range_hit):
                     for kw in END_SHIFT_KW:
                         if kw in cell_text:
                             # The bare "מש'"/"מש" keyword must NOT fire on a shift-FROM
@@ -1802,7 +1833,7 @@ def merge_t1_shift_map(shift_map, t1_map):
                         # on one to the other's restricted tail would mis-tag
                         # it). See the page-1 restriction block's use of this
                         # flag in apply_shift_map_to_employees.
-                        main["transfer"] = {"to": "1", "at": _w[0], "_inferred": True}
+                        main["transfer"] = {"to": "1", "at": _round_transfer_time_to_shuttle(_w[0]), "_inferred": True}
                     elif 0 < _f_pos < _w_dur:
                         # Mirror case: the T1 window comes FIRST and main's own
                         # (T3) window starts partway through it — the worker is
@@ -1814,7 +1845,7 @@ def merge_t1_shift_map(shift_map, t1_map):
                         # actually naming it in a form parse_terminal_note
                         # accepts, since "הגעה מ..." is deliberately excluded
                         # as an arrival-FROM marker, not a transfer-to one).
-                        main["transfer"] = {"to": "3", "at": _first[0], "_inferred": True}
+                        main["transfer"] = {"to": "3", "at": _round_transfer_time_to_shuttle(_first[0]), "_inferred": True}
         # the T1 file confirms the worker is NOT an excluded upcoming-night
         # leftover for the T1 portion; keep the main entry's flags otherwise.
         if t1e.get("transfer") and not main.get("transfer") and not _t1e_bogus_transfer:
@@ -3615,6 +3646,26 @@ def parse_fids_combined(fids_file_objects):
 
     combined = pd.concat(all_rows, ignore_index=True)
     return combined
+
+
+def fids_days_of_month(combined):
+    """Days of the month the TODAY FIDS file covers — its departure cells carry
+    the day before the time ("16   00:05"). Empty set when unknown. Used to tell
+    the user their FIDS is from another date than the daily roster."""
+    if combined is None or combined.empty:
+        return set()
+    _dep = fids_find_src(combined.columns, ["scheduleddeparture", "std", "scheduled", "departure", "המראה", "time"])
+    if not _dep:
+        return set()
+    rows = combined
+    if "_fids_src" in combined.columns:
+        rows = combined[combined["_fids_src"] == 0]
+    days = set()
+    for v in rows[_dep].astype(str):
+        m = re.match(r"\s*(\d{1,2})\s+\d{1,2}:\d{2}", v)
+        if m and 1 <= int(m.group(1)) <= 31:
+            days.add(int(m.group(1)))
+    return days
 
 
 def flights_from_fids(combined):

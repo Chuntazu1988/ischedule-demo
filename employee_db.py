@@ -32,6 +32,13 @@ CERT_COLUMNS = [
     "חונך רצים", "מסמיך רצים", "טרייני רצ", "מין", "ילד עובדים",
     "מתדרכת", 'מנהל כר"צ', "דייל בטרייני", "פורשים", "מחלקה מקורית",
     "מנהל משמרת",
+    # A permanent qualification (who MAY serve in the role) — distinct from
+    # the daily roster-note flag of the same near-name ("תגבור שלוחה", set
+    # per shift in streamlit_app.py/app/scheduler.py, meaning "is actually
+    # reinforcing the pier TODAY"). Reserved for experienced ר"צים who stand
+    # in for the pier's #2 manager (user rule 2026-09-22, real example: TL#52 on the 20.09 schedule). No scheduling logic reads this yet — the
+    # user is marking who qualifies first, scheduling behavior is a follow-up.
+    "מתגבר שלוחה",
     # The trainee's PERMANENT/official mentor at hiring — not the same
     # concept as the daily roster's own "חונך דייל" note, which names a
     # one-off stand-in mentor for a single day and always wins for that
@@ -59,6 +66,14 @@ def _connect():
         f'CREATE TABLE IF NOT EXISTS employees ('
         f'"שם" TEXT PRIMARY KEY, {_cols_sql}, active INTEGER NOT NULL DEFAULT 1)'
     )
+    # A CERT_COLUMNS entry added after the table already existed (a brand-new
+    # certification, e.g. "מתגבר שלוחה" 2026-09-22) needs an explicit ALTER
+    # TABLE — CREATE TABLE IF NOT EXISTS above is a no-op once the table is
+    # already there. Cheap (one PRAGMA) and idempotent.
+    _existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(employees)")}
+    for _c in CERT_COLUMNS:
+        if _c not in _existing_cols:
+            conn.execute(f'ALTER TABLE employees ADD COLUMN {_q(_c)} TEXT')
     return conn
 
 

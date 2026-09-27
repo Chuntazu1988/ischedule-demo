@@ -11,17 +11,24 @@ never has anything built in it regardless (user rule 2026-07-30)."""
 
 import streamlit as st
 
+from app.styles import CSS
 from arrivals import record_arrival, get_arrival_today
 from publish_state import get_published_schedule
 from utils.helpers import role_label_for, MALE_VALUES
 
 
 def render_employee_view(employee_name: str, now) -> None:
+    # streamlit_app.py renders this screen and st.stop()s BEFORE its own
+    # st.markdown(CSS, ...) call — a "viewer" account never gets the shared
+    # stylesheet otherwise (found 2026-09-25 chasing the primary-button
+    # contrast fix: this screen's own button was unaffected by that fix
+    # until this line was added).
+    st.markdown(CSS, unsafe_allow_html=True)
     st.markdown(
         f'<div dir="rtl" style="max-width:700px;margin:40px auto 0;padding:28px 32px;'
-        f'background:#0f172a;border:1px solid #1e293b;border-radius:16px;">'
-        f'<h2 style="color:#fff;margin-bottom:4px;">שלום, {employee_name} 👋</h2>'
-        f'<div style="color:#9ca3af;font-size:14px;">{now.strftime("%d/%m/%Y")}</div>'
+        f'background:var(--card);border:1px solid rgba(var(--acc-rgb),.22);border-radius:16px;">'
+        f'<h2 style="color:var(--ink);margin-bottom:4px;">שלום, {employee_name} 👋</h2>'
+        f'<div style="color:rgba(var(--ink-rgb),.74);font-size:14px;">{now.strftime("%d/%m/%Y")}</div>'
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -32,15 +39,15 @@ def render_employee_view(employee_name: str, now) -> None:
         if arrived_at:
             st.success(f"✅ סימנת הגעה למשמרת היום ב-{arrived_at}")
         else:
-            if st.button("✅ סמן/ני הגעה למשמרת", use_container_width=True, type="primary"):
+            if st.button("✅ סמן/ני הגעה למשמרת", width="stretch", type="primary"):
                 t = record_arrival(employee_name, now)
                 st.success(f"✅ הגעה נרשמה — {t}")
                 st.rerun()
 
         st.markdown("---")
         st.markdown(
-            '<div dir="rtl" style="font-size:18px;font-weight:700;color:#fff;margin:12px 0;">'
-            "📋 המשימות שלי היום</div>",
+            '<div dir="rtl" style="font-size:18px;font-weight:700;color:var(--acc-strong);margin:12px 0;">'
+            "📑 המשימות שלי היום</div>",
             unsafe_allow_html=True,
         )
 
@@ -88,8 +95,8 @@ def render_employee_view(employee_name: str, now) -> None:
             _start = str(row.get("התחלה", "")).strip()
             _end = str(row.get("סיום", "")).strip()
             st.markdown(
-                f'<div dir="rtl" style="background:#111827;border:1px solid #1f2937;'
-                f'border-radius:10px;padding:12px 16px;margin:6px 0;color:#e5e7eb;">'
+                f'<div dir="rtl" style="background:var(--card);border:1px solid rgba(var(--ink-rgb),.09);'
+                f'border-radius:10px;padding:12px 16px;margin:6px 0;color:rgba(var(--ink-rgb),.88);">'
                 f"<b>{_start}-{_end}</b> &nbsp;|&nbsp; טיסה {_flight} &nbsp;|&nbsp; {_role}"
                 f"</div>",
                 unsafe_allow_html=True,

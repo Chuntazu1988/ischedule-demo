@@ -21,9 +21,10 @@ import pandas as pd
 # session — the durable fix, not chasing every individual re-creation site.
 pd.set_option("future.infer_string", False)
 import streamlit as st
-import streamlit.components.v1 as _components
 import uuid
 import json as _json
+from app.pipeline import run_build_pipeline, is_empty_schedule
+from app import lookahead
 from app.display import (
     build_next_task_labels,
     build_output_table,
@@ -94,7 +95,7 @@ for _mn in [k for k in list(_sys.modules) if any(k.startswith(p) for p in _LOCAL
         pass
 
 # ── Local modules ─────────────────────────────────────────────────────────────
-from app.styles import CSS, HERO_HTML
+from app.styles import CSS, hero_html, stats_html
 from utils.constants import (
     USA_TSA_DESTS,
     QUEUE_DESTS,
@@ -134,6 +135,7 @@ from data.data_loader import (
     load_daily_schedule,
     normalize_employees,
     parse_fids_combined,
+    fids_days_of_month,
     flights_from_fids,
     fids_flt_key,
     fids_find_src,
@@ -154,6 +156,11 @@ from app.scheduler import (
     protect_early_shift_preflight_breaks,
     enforce_trainee_pairing,
     boost_runner_floor_time,
+    maximize_tl_trainee_coverage,
+    apply_special_tl_trainee_instructions,
+    SPECIAL_INSTRUCTION_COLS,
+    SPECIAL_INSTRUCTION_TYPES,
+    SPECIAL_INSTRUCTION_BODY_CATS,
     compact_idle_gaps,
     fill_idle_gaps,
     improve_night_continuity,
@@ -195,11 +202,94 @@ st.set_page_config(
     page_title="iSchedule",
     page_icon="👩🏼‍🔧",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",   # the dashboard is wide; ☰ opens the file panel
 )
 
 from auth import render_login_gate, render_logout_control, is_admin, is_super_admin, is_employee_view, current_user
 from user_management import render_user_management_panel
+
+# ── Colour theme: three grey + pastel palettes (user choice 2026-09-26) ──────
+# "light"/"mid" follow Streamlit's LIGHT base, "charcoal" its DARK base (see
+# .streamlit/config.toml). The base is whatever the viewer picked in
+# ⋮ → Settings (read back via st.context.theme); within the light base the
+# viewer's own pick (session → ?theme= → ui_prefs.json per user) chooses
+# between light and mid. Injected before the login gate so every screen
+# gets the variables.
+from app.styles import THEMES, theme_vars_css, theme_sync_html, iframe_theme_head
+_UI_PREFS_PATH = "ui_prefs.json"
+
+
+def _load_ui_prefs():
+    try:
+        with open(_UI_PREFS_PATH, encoding="utf-8") as _f:
+            return _json.load(_f)
+    except Exception:
+        return {}
+
+
+def _save_theme_pref(key):
+    _user = (current_user() or {}).get("username", "")
+    if not _user:
+        return
+    _prefs = _load_ui_prefs()
+    _prefs[_user] = key
+    try:
+        with open(_UI_PREFS_PATH, "w", encoding="utf-8") as _f:
+            _json.dump(_prefs, _f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _active_theme_key():
+    """The palette in use: the viewer's pick this session, ?theme=, or the
+    per-user saved pick; default light. (The light/dark BASE of Streamlit's own
+    widgets is set from this too — see the sync script below — instead of
+    trusting st.context.theme, which reports the wrong base on first load.)"""
+    _pref = st.session_state.get("ui_theme") or st.query_params.get("theme")
+    if not _pref:
+        _user = (current_user() or {}).get("username", "")
+        _pref = _load_ui_prefs().get(_user) if _user else None
+    return _pref if _pref in THEMES else "light"
+
+
+_theme_key_now = _active_theme_key()
+
+
+def _render_theme_picker():
+    """Small colour-theme picker (left). Picking a palette also switches Streamlit's own
+    light/dark base (see theme_sync_html). Used on the upload screen and the dashboard."""
+    _cur = _theme_key_now
+    _c, _sp = st.columns([1.7, 5])   # left-to-right: the picker sits at the left
+    with _c:
+        _pick = st.segmented_control(
+            "ערכת צבעים", list(THEMES), default=_cur, required=True,
+            format_func=lambda k: THEMES[k]["label"], key="ui_theme_pick",
+            label_visibility="collapsed",
+        )
+    if _pick and _pick != _cur:
+        st.session_state["ui_theme"] = _pick
+        st.session_state["_theme_announce"] = True
+        _save_theme_pref(_pick)
+        st.rerun()
+    if st.session_state.pop("_theme_announce", False):
+        st.toast(f'ערכת הצבעים "{THEMES[_cur]["label"]}" הופעלה', icon="🎨")
+        # screen readers: say which palette is now active
+        st.markdown(
+            f'<div class="sr-only" role="status" aria-live="polite">'
+            f'ערכת הצבעים "{THEMES[_cur]["label"]}" הופעלה</div>',
+            unsafe_allow_html=True,
+        )
+
+st.markdown(theme_vars_css(_theme_key_now), unsafe_allow_html=True)
+# The whole stylesheet (fonts, living background, glass) already applies to
+# the login screen too — injected here, before the login gate.
+st.markdown(CSS, unsafe_allow_html=True)
+
+# Keep Streamlit's own light/dark base in step with the chosen palette
+# (charcoal → Dark, the other two → Light) by clicking its own ⋮ menu item —
+# live, so nobody is logged out. See app/styles.py theme_sync_html.
+st.iframe(theme_sync_html("Dark" if _theme_key_now == "charcoal" else "Light"), height=1)
+
 render_login_gate()
 render_logout_control()
 
@@ -234,39 +324,50 @@ if not employee_db.is_seeded():
         _os_seed.path.dirname(_os_seed.path.abspath(__file__)), "demo_data",
         "employee_certifications.xlsx"))
 
-st.markdown(CSS, unsafe_allow_html=True)
 
 # =========================
 # LANDING PAGE (shown before files are uploaded)
 # =========================
 
 LANDING_PAGE = """
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&family=Heebo:wght@400;700;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;700;900&family=IBM+Plex+Mono:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
+/* ── "Runway Control" theme — dark charcoal-navy + amber/gold aviation
+   accent (2026-09-23, chosen by the user out of 3 concept directions).
+   Colour is reserved for interactive/status elements only — the ambient
+   grid/orbs stay neutral so amber always means "this is clickable/live",
+   never just decoration (user rule: the UI must stay intuitive/nohutz). ── */
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:"Inter","Heebo",Arial,sans-serif;background:#04080f;overflow-x:hidden;}
+body{font-family:"Heebo",sans-serif;background:var(--bg);overflow-x:hidden;}
 
 #lp{
   min-height:100vh;display:flex;flex-direction:column;
   align-items:center;justify-content:center;
   padding:32px 24px 40px;position:relative;overflow:hidden;
-  background:radial-gradient(ellipse 80% 60% at 50% 0%,#0a2540 0%,#04080f 70%);
+  background:radial-gradient(ellipse 80% 60% at 50% 0%,#141a24 0%,var(--bg) 70%);
+}
+
+/* Runway-lights strip along the very top — the direction's signature motif */
+#lp::after{
+  content:"";position:absolute;top:0;right:0;left:0;height:5px;z-index:3;
+  background:repeating-linear-gradient(90deg,var(--acc) 0 26px,transparent 26px 44px);
+  opacity:.85;
 }
 
 #lp::before{
   content:"";position:absolute;inset:0;
   background-image:
-    linear-gradient(rgba(0,201,190,.055) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(0,201,190,.055) 1px,transparent 1px);
+    linear-gradient(rgba(var(--ink-rgb),.035) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(var(--ink-rgb),.035) 1px,transparent 1px);
   background-size:60px 60px;
   animation:gridDrift 22s linear infinite;pointer-events:none;
 }
 @keyframes gridDrift{0%{background-position:0 0;}100%{background-position:60px 60px;}}
 
 .orb{position:absolute;border-radius:50%;filter:blur(90px);pointer-events:none;animation:orbFloat 12s ease-in-out infinite;}
-.orb1{width:520px;height:520px;background:radial-gradient(circle,rgba(0,201,190,.16),transparent 70%);top:-160px;left:-110px;animation-duration:14s;}
-.orb2{width:400px;height:400px;background:radial-gradient(circle,rgba(5,40,100,.28),transparent 70%);bottom:-90px;right:-90px;animation-duration:10s;animation-delay:-5s;}
-.orb3{width:240px;height:240px;background:radial-gradient(circle,rgba(0,180,170,.14),transparent 70%);top:48%;left:66%;animation-duration:16s;animation-delay:-9s;}
+.orb1{width:520px;height:520px;background:radial-gradient(circle,rgba(var(--acc-rgb),.09),transparent 70%);top:-160px;left:-110px;animation-duration:14s;}
+.orb2{width:400px;height:400px;background:radial-gradient(circle,rgba(30,41,59,.4),transparent 70%);bottom:-90px;right:-90px;animation-duration:10s;animation-delay:-5s;}
+.orb3{width:240px;height:240px;background:radial-gradient(circle,rgba(var(--acc-rgb),.06),transparent 70%);top:48%;left:66%;animation-duration:16s;animation-delay:-9s;}
 @keyframes orbFloat{0%,100%{transform:translate(0,0);}50%{transform:translate(20px,-28px);}}
 
 .lp-logo-wrap{
@@ -277,28 +378,28 @@ body{font-family:"Inter","Heebo",Arial,sans-serif;background:#04080f;overflow-x:
 .lp-logo-wrap::before{
   content:"";
   position:absolute;inset:-12px;border-radius:50%;
-  background:conic-gradient(from 0deg, rgba(0,201,190,0), rgba(0,201,190,.5) 40%, rgba(0,180,255,.4) 60%, rgba(0,201,190,0));
+  background:conic-gradient(from 0deg, rgba(var(--acc-rgb),0), rgba(var(--acc-rgb),.45) 40%, rgba(255,224,130,.3) 60%, rgba(var(--acc-rgb),0));
   animation:ringRotate 4s linear infinite;
-  filter:blur(6px);z-index:-1;
+  filter:blur(5px);z-index:-1;
 }
 .lp-logo-wrap::after{
   content:"";
   position:absolute;inset:-2px;border-radius:50%;
-  background:conic-gradient(from 0deg, rgba(0,201,190,0), rgba(0,201,190,.9) 45%, rgba(0,201,190,0));
+  background:conic-gradient(from 0deg, rgba(var(--acc-rgb),0), rgba(var(--acc-rgb),.85) 45%, rgba(var(--acc-rgb),0));
   animation:ringRotate 4s linear infinite;
   z-index:-1;
 }
 .lp-logo-wrap img{
   width:100%;height:100%;object-fit:contain;border-radius:50%;
-  filter:drop-shadow(0 0 20px rgba(0,201,190,.3));
+  filter:drop-shadow(0 0 16px rgba(var(--acc-rgb),.25));
 }
 @keyframes logoIn{from{opacity:0;transform:translateY(-28px) scale(.9);}to{opacity:1;transform:translateY(0) scale(1);}}
 @keyframes logoFloat{0%,100%{transform:translateY(0);}50%{transform:translateY(-10px);}}
 @keyframes ringRotate{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
 
 .lp-tag{
-  position:relative;z-index:2;font-size:12px;font-weight:700;
-  letter-spacing:3.5px;text-transform:uppercase;color:#00c9be;
+  position:relative;z-index:2;font-family:"IBM Plex Mono",monospace;font-size:11.5px;font-weight:600;
+  letter-spacing:3.5px;text-transform:uppercase;color:var(--acc);
   margin-bottom:30px;animation:fadeUp .7s .25s ease both;
 }
 
@@ -309,54 +410,55 @@ body{font-family:"Inter","Heebo",Arial,sans-serif;background:#04080f;overflow-x:
   animation:fadeUp .7s .38s ease both;
 }
 .lp-card{
-  background:rgba(0,201,190,.04);
-  border:1px solid rgba(0,201,190,.16);
-  border-radius:16px;padding:18px 13px 15px;
+  background:var(--card);
+  border:1px solid rgba(var(--ink-rgb),.09);
+  border-top:3px solid rgba(var(--acc-rgb),.55);
+  border-radius:10px;padding:17px 13px 15px;
   text-align:center;direction:rtl;
-  transition:transform .25s,background .25s,border-color .25s,box-shadow .25s;
+  transition:transform .25s,border-color .25s,box-shadow .25s;
   cursor:default;position:relative;overflow:hidden;
 }
 .lp-card-link{ cursor:pointer !important; }
 .lp-card::after{
   content:"";position:absolute;inset:0;
-  background:radial-gradient(circle at 50% 0%,rgba(0,201,190,.1),transparent 70%);
+  background:radial-gradient(circle at 50% 0%,rgba(var(--acc-rgb),.08),transparent 70%);
   opacity:0;transition:opacity .3s;
 }
-.lp-card:hover{transform:translateY(-7px);border-color:rgba(0,201,190,.42);box-shadow:0 10px 36px rgba(0,201,190,.14);}
+.lp-card:hover{transform:translateY(-5px);border-top-color:var(--acc);box-shadow:0 10px 28px rgba(var(--acc-rgb),.12);}
 .lp-card:hover::after{opacity:1;}
 .lp-card-icon{font-size:24px;display:block;margin-bottom:9px;}
-.lp-card-title{font-size:12.5px;font-weight:700;color:rgba(255,255,255,.9);}
-.lp-card-desc{font-size:11px;color:rgba(255,255,255,.36);margin-top:5px;line-height:1.45;}
+.lp-card-title{font-size:12.5px;font-weight:700;color:rgba(var(--ink-rgb),.92);}
+.lp-card-desc{font-size:11px;color:rgba(var(--ink-rgb),.74);margin-top:5px;line-height:1.45;}
 
 .lp-divider{
   position:relative;z-index:2;width:100%;max-width:500px;
   display:flex;align-items:center;gap:14px;margin-bottom:30px;
   animation:fadeUp .7s .48s ease both;
 }
-.lp-divider span{flex:1;height:1px;background:linear-gradient(90deg,transparent,rgba(0,201,190,.28),transparent);}
-.lp-divider p{font-size:10.5px;color:rgba(0,201,190,.55);font-weight:700;letter-spacing:2.5px;white-space:nowrap;}
+.lp-divider span{flex:1;height:1px;background:linear-gradient(90deg,transparent,rgba(var(--acc-rgb),.35),transparent);}
+.lp-divider p{font-family:"IBM Plex Mono",monospace;font-size:10.5px;color:var(--acc);font-weight:600;letter-spacing:2.5px;white-space:nowrap;}
 
 .lp-cta{
   position:relative;z-index:2;
   animation:fadeUp .7s .58s ease both;
   direction:rtl;text-align:center;font-size:13.5px;
-  color:rgba(255,255,255,.3);font-weight:600;
+  color:rgba(var(--ink-rgb),.74);font-weight:600;
 }
 .lp-cta span{
   display:inline-flex;align-items:center;gap:9px;
-  background:rgba(0,201,190,.09);border:1px solid rgba(0,201,190,.22);
-  border-radius:999px;padding:9px 22px;
+  background:rgba(var(--acc-rgb),.08);border:1px solid rgba(var(--acc-rgb),.3);
+  border-radius:8px;padding:9px 22px;
   animation:ctaPulse 2.8s ease-in-out infinite;
 }
-@keyframes ctaPulse{0%,100%{box-shadow:0 0 0 0 rgba(0,201,190,0);}50%{box-shadow:0 0 0 9px rgba(0,201,190,.07);}}
+@keyframes ctaPulse{0%,100%{box-shadow:0 0 0 0 rgba(var(--acc-rgb),0);}50%{box-shadow:0 0 0 8px rgba(var(--acc-rgb),.08);}}
 .lp-arrow{display:inline-block;animation:arrowBounce 1.6s ease-in-out infinite;}
 @keyframes arrowBounce{0%,100%{transform:translateX(0);}50%{transform:translateX(-7px);}}
 
 @keyframes fadeUp{from{opacity:0;transform:translateY(20px);}to{opacity:1;transform:translateY(0);}}
 
 .lp-footer{
-  position:absolute;bottom:10px;font-size:9.5px;font-weight:700;
-  letter-spacing:2.5px;color:rgba(255,255,255,.07);text-align:center;z-index:2;
+  position:absolute;bottom:10px;font-family:"IBM Plex Mono",monospace;font-size:9.5px;font-weight:600;
+  letter-spacing:2.5px;color:rgba(var(--ink-rgb),.74);text-align:center;z-index:2;
 }
 </style>
 
@@ -467,20 +569,20 @@ with st.sidebar:
     _loaded_t1 = st.session_state.get("_t1_file_name")
     if _loaded_daily or _loaded_t1:
         st.markdown(
-            '<div style="direction:rtl;font-size:11px;color:#888;margin-bottom:4px;">קבצים טעונים:</div>',
+            '<div style="direction:rtl;font-size:11px;color:rgba(var(--ink-rgb),.74);margin-bottom:4px;">קבצים טעונים:</div>',
             unsafe_allow_html=True,
         )
         for _fname in filter(None, [_loaded_daily, _loaded_t1]):
             st.markdown(
-                f'<div style="direction:rtl;font-size:11px;background:rgba(0,201,190,.08);'
-                f"border-right:3px solid #00c9be;border-radius:4px;padding:3px 7px;margin-bottom:3px;"
-                f'color:#0f6e56;font-weight:600;">📄 {_fname}</div>',
+                f'<div style="direction:rtl;font-size:11px;background:rgba(var(--acc-rgb),.1);'
+                f"border-right:3px solid rgb(var(--acc-rgb));border-radius:4px;padding:3px 7px;margin-bottom:3px;"
+                f'color:var(--acc-strong);font-weight:600;">📄 {_fname}</div>',
                 unsafe_allow_html=True,
             )
         st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
     st.caption("לאחר העלאת הקבצים הדרושים יש ללחוץ על אשר וטען קבצים.")
     sidebar_confirm = st.button(
-        "✅ אשר וטען קבצים", use_container_width=True, key="sidebar_confirm"
+        "✅ אשר וטען קבצים", width="stretch", key="sidebar_confirm"
     )
     # The demo-data loader only exists where demo_data/ ships (the public demo snapshot).
     sidebar_demo = False
@@ -488,7 +590,7 @@ with st.sidebar:
         st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
         st.caption("🧪 נתוני דמו — סידור לדוגמה מנתונים מומצאים, לא נתוני עובדים אמיתיים.")
         sidebar_demo = st.button(
-            "🧪 טען נתוני דמו", use_container_width=True, key="sidebar_demo",
+            "🧪 טען נתוני דמו", width="stretch", key="sidebar_demo",
         )
 
 def _load_demo_data_into_session():
@@ -665,14 +767,14 @@ if _gantt_swap:
         _swap_msg = f"שגיאה: {_e}"
 
     _is_ok = "✅" in _swap_msg
-    _color = "#00c9be" if _is_ok else "#ef4444"
+    _color = "#00c9be" if _is_ok else "rgb(var(--bad-rgb))"
     if _swap_msg:
         st.session_state["_gantt_swap_msg"] = _swap_msg
     st.session_state["show_gantt_page"] = True
     st.rerun()
 
 # ── localStorage polling bridge — detects swaps from gantt tab ──────────────
-_components.html(
+st.iframe(
     """<script>
 (function(){
   function poll(){
@@ -690,7 +792,7 @@ _components.html(
   poll();
 })();
 </script>""",
-    height=0,
+    height=1,
 )
 
 daily_file = sidebar_daily or st.session_state.get("daily_file_obj")
@@ -727,63 +829,12 @@ if not daily_file or not _has_fids:
     show_upload = st.session_state.get("show_upload_form", True)
     _goto_gantt = st.session_state.get("show_gantt_page", False)
 
-    # ── Zero-gap dark background ──
+    # ── Upload screen page CSS: no sidebar, centred content column ──
     st.markdown(
-        """
-    <style>
-    /* ── Global font — avoid span to preserve Material Symbols icon font ── */
-    html, body, p, div, label, h1, h2, h3, h4, button { font-family:'Heebo',sans-serif !important; }
-    /* Restore Material Symbols font on icon spans inside buttons */
-    button span[aria-hidden="true"],
-    button span[class*="icon"] { font-family:'Material Symbols Rounded','Material Symbols Outlined',sans-serif !important; }
-    section[data-testid="stSidebar"],
-    header[data-testid="stHeader"],
-    #MainMenu, footer                         { display:none !important; }
-    html, body,
-    .stApp,
-    [data-testid="stAppViewContainer"],
-    [data-testid="stMain"],
-    [data-testid="stMainBlockContainer"],
-    [data-testid="stVerticalBlock"],
-    .main .block-container,
-    .block-container                          { background:#04080f !important;
-                                                padding:0 !important; margin:0 !important;
-                                                max-width:100% !important; gap:0 !important; }
-    iframe                                    { display:block !important; border:none !important;
-                                                margin:0 !important; padding:0 !important; }
-    /* Style action buttons — color/font inherit to children naturally, no * rule needed */
-    div[data-testid="stButton"] > button        { background:linear-gradient(120deg,#009e96 0%,#00c9be 100%) !important;
-                                                color:#fff !important; font-size:13px !important;
-                                                font-weight:800 !important;
-                                                padding:10px 20px !important;
-                                                min-height:40px !important; height:auto !important;
-                                                border-radius:50px !important; border:none !important;
-                                                box-shadow:0 6px 24px rgba(0,201,190,.4) !important;
-                                                letter-spacing:.8px !important; }
-    div[data-testid="stButton"] > button:hover  { box-shadow:0 10px 32px rgba(0,201,190,.6) !important;
-                                                transform:translateY(-2px) !important; }
-    /* Reset file uploader browse button to Streamlit default */
-    div[data-testid^="stFileUploader"] div[data-testid="stButton"] > button
-                                                { all:unset !important;
-                                                display:inline-flex !important; align-items:center !important;
-                                                padding:4px 16px !important; border-radius:4px !important;
-                                                font-size:14px !important; font-weight:400 !important;
-                                                letter-spacing:normal !important;
-                                                cursor:pointer !important; border:1px solid rgba(250,250,250,.2) !important;
-                                                color:rgba(250,250,250,.8) !important;
-                                                background:transparent !important; }
-    /* File uploaders */
-    div[data-testid="stFileUploader"]         { background:rgba(0,201,190,.06) !important;
-                                                border:1px solid rgba(0,201,190,.28) !important;
-                                                border-radius:16px !important; padding:16px 20px !important; }
-    div[data-testid="stFileUploader"] label p,
-    div[data-testid="stFileUploader"] small   { color:rgba(255,255,255,.88) !important; }
-    div[data-testid="stFileUploaderDropzone"] { background:rgba(0,201,190,.04) !important;
-                                                border-color:rgba(0,201,190,.3) !important; }
-    div[data-testid="stFileUploaderDropzoneInstructions"] small { color:rgba(255,255,255,.5) !important; }
-    /* Tab bar — center labels */
-    div[data-testid="stTabs"] > div[role="tablist"]             { justify-content:center !important; }
-    </style>""",
+        """<style>
+        section[data-testid="stSidebar"], [data-testid="stExpandSidebarButton"], footer { display: none !important; }
+        [data-testid="stMainBlockContainer"], .block-container { max-width: 1080px !important; padding-top: 1rem !important; }
+        </style>""",
         unsafe_allow_html=True,
     )
 
@@ -808,126 +859,167 @@ if not daily_file or not _has_fids:
 .lp-divider   { margin-bottom:0 !important; }
 .lp-cta, .lp-footer { display:none !important; }
 </style>"""
-        _components.html(
+        st.iframe(
             "<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
-            "<body style='margin:0;padding:0;background:#04080f'>"
+            "<body style='margin:0;padding:0;background:var(--bg)'>"
+            + iframe_theme_head(_theme_key_now)
             + _hero_css
             + LANDING_PAGE
             + "</body></html>",
             height=590,
-            scrolling=False,
         )
 
         # ── Native Streamlit button — blends with dark bg ──
         st.markdown(
-            "<div style='height:48px;background:#04080f'></div>", unsafe_allow_html=True
+            "<div style='height:48px;background:var(--bg)'></div>", unsafe_allow_html=True
         )
         _, col_btn, _ = st.columns([1, 1, 1])
         with col_btn:
-            if st.button("✈️  Let's Fly", use_container_width=True, key="lf_btn"):
+            if st.button("✈️  Let's Fly", width="stretch", key="lf_btn"):
                 st.session_state["show_upload_form"] = True
                 st.rerun()
         st.markdown(
-            "<div style='height:40px;background:#04080f'></div>", unsafe_allow_html=True
+            "<div style='height:40px;background:var(--bg)'></div>", unsafe_allow_html=True
         )
 
     else:
-        # ── Mini hero + uploaders ──
+        # ── Upload screen (A+C redesign 2026-09-26) ──
+        from app.styles import upload_hero_html, paper_planes_html
+        st.markdown(paper_planes_html(subtle=True), unsafe_allow_html=True)
         if _goto_gantt:
             st.markdown(
-                '<div style="direction:rtl;background:#0d1f30;border:1px solid rgba(0,201,190,.3);'
-                'border-radius:12px;padding:14px 18px;margin:12px 0 8px;text-align:right;">'
-                '<span style="font-size:15px;font-weight:900;color:#00c9be;">📅 גאנט עובדים</span>'
-                '&nbsp;&nbsp;<span style="font-size:13px;color:rgba(200,220,240,.7);">— יש להזין קבצים תחילה</span>'
+                '<div style="direction:rtl;background:var(--card-2);border:1px solid rgba(var(--acc-rgb),.3);'
+                'border-radius:10px;padding:14px 18px;margin:12px 0 8px;text-align:right;">'
+                '<span style="font-size:15px;font-weight:900;color:var(--acc);">📅 גאנט עובדים</span>'
+                '&nbsp;&nbsp;<span style="font-size:13px;color:rgba(var(--ink-rgb),.74);">— יש להזין קבצים תחילה</span>'
                 "</div>",
                 unsafe_allow_html=True,
             )
-        _mini_css = """<style>
-#lp {
-  min-height: unset !important;
-  padding: 16px 24px 14px !important;
-}
-.lp-logo-wrap { width:120px !important; height:120px !important; margin-bottom:4px !important; }
-.lp-tag       { margin-bottom:8px !important; font-size:10.5px !important; }
-.lp-grid, .lp-divider, .lp-cta, .lp-footer { display:none !important; }
-</style>"""
-        _components.html(
-            "<!DOCTYPE html><html><head><meta charset='utf-8'></head>"
-            "<body style='margin:0;padding:0;background:#04080f'>"
-            + _mini_css
-            + LANDING_PAGE
-            + "</body></html>",
-            height=185,
-            scrolling=False,
+
+        _up_daily = bool(st.session_state.get("main_daily")) or bool(st.session_state.get("daily_file_obj"))
+        _up_fids = (bool(st.session_state.get("main_fids1")) or bool(st.session_state.get("main_fids2"))
+                    or _has_fids)
+        _render_theme_picker()
+        st.markdown(
+            upload_hero_html([
+                ("סידור יומי", "done" if _up_daily else "cur"),
+                ("קבצי FIDS", "done" if _up_fids else ("cur" if _up_daily else "todo")),
+                ("אישור וטעינה", "cur" if (_up_daily and _up_fids) else "todo"),
+            ]),
+            unsafe_allow_html=True,
         )
 
-        _, col_up, _ = st.columns([1, 2, 1])
-        with col_up:
+        def _upload_card(ukey, icon, title, hint, chip, chip_kind, types):
+            """One glass drop card: icon + title + requirement chip, then the native
+            uploader (its own label is hidden — the header is the label)."""
+            _done = bool(st.session_state.get(ukey))
+            with st.container(key=f"up_{ukey}_{'ok' if _done else 'todo'}"):
+                st.markdown(
+                    f'<div class="up-head"><span class="up-ico">{icon}</span>'
+                    f'<div><div class="up-title-s">{title}</div><div class="up-hint">{hint}</div></div>'
+                    f'<span class="up-chip up-chip-{"ok" if _done else chip_kind}">'
+                    f'{"נטען ✓" if _done else chip}</span></div>',
+                    unsafe_allow_html=True,
+                )
+                return st.file_uploader(title, type=types, key=ukey, label_visibility="collapsed")
+
+        # The page is LTR, so the first column is the LEFT one: the daily roster
+        # (step 1) goes on the right, the FIDS files on the left.
+        _col_fids, _col_roster = st.columns(2, gap="large")
+        with _col_roster:
+            main_daily = _upload_card("main_daily", "📑", "קובץ סידור יומי",
+                                      "הרשימה של הצוותים והמשמרות", "חובה", "req", ["xlsx"])
+            main_t1 = _upload_card("main_t1", "🧳", "קובץ סידור טרמינל 1",
+                                   "רק אם יש טיסות בטרמינל 1", "אופציונלי", "opt", ["xlsx"])
+        with _col_fids:
+            main_fids1 = _upload_card("main_fids1", "📡", "FIDS – יום נוכחי",
+                                      "ממנו נבנה לוח הטיסות", "חובה", "req", None)
+            main_fids2 = _upload_card("main_fids2", "🌙", "FIDS – יום הבא / אחרי חצות",
+                                      "לטיסות שאחרי חצות", "מומלץ", "rec", None)
+
+        _now_daily = bool(main_daily) or bool(st.session_state.get("daily_file_obj"))
+        _now_fids = bool(main_fids1) or bool(main_fids2) or _has_fids
+        _ready = _now_daily and _now_fids
+        _, _col_cta, _ = st.columns([1, 2, 1])
+        with _col_cta:
+            _missing = [n for n, ok in (("סידור יומי", _now_daily), ("קובץ FIDS", _now_fids)) if not ok]
             st.markdown(
-                '<div style="text-align:center;color:rgba(0,201,190,.85);'
-                "font-size:15px;font-weight:800;margin-bottom:14px;"
-                'letter-spacing:1px;">📂 העלאת קבצים</div>',
+                '<div class="up-missing">' + (
+                    "חסר עוד: " + " · ".join(f"<b>{m}</b>" for m in _missing) if _missing
+                    else "✓ הכול מוכן — אפשר לטעון"
+                ) + "</div>",
                 unsafe_allow_html=True,
             )
-            main_daily = st.file_uploader(
-                "📋 קובץ סידור יומי", type=["xlsx"], key="main_daily"
-            )
-            st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
-            main_t1 = st.file_uploader(
-                "🛄 קובץ סידור טרמינל 1 (אופציונלי)", type=["xlsx"], key="main_t1"
-            )
-            st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
-            main_fids1 = st.file_uploader(
-                "📡 קובץ FIDS – יום נוכחי (חובה)", type=None, key="main_fids1"
-            )
-            st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
-            main_fids2 = st.file_uploader(
-                "📡 קובץ FIDS – יום הבא / אחרי חצות (מומלץ)",
-                type=None,
-                key="main_fids2",
-            )
-            st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
-            st.caption("לאחר העלאת הקבצים הדרושים יש ללחוץ על אשר וטען קבצים.")
-            main_confirm = st.button(
-                "✅ אשר וטען קבצים", use_container_width=True, key="main_confirm"
-            )
+            with st.container(key="up_confirm_ready" if _ready else "up_confirm"):
+                main_confirm = st.button(
+                    "✅ אשר וטען קבצים", width="stretch", key="main_confirm", type="primary"
+                )
 
             if main_confirm:
                 if not main_fids1 and not main_fids2 and not st.session_state.get("fids_file1_bytes") and not st.session_state.get("fids_file2_bytes"):
                     st.error("📡 קובץ FIDS הוא חובה — לוח הטיסות נבנה ממנו. אנא העלי לפחות את קובץ היום הנוכחי.")
-                if main_daily:
-                    st.session_state["daily_file_obj"] = main_daily
-                if main_t1:
-                    st.session_state["t1_file_obj"] = main_t1
-                    st.session_state["_t1_file_name"] = main_t1.name
-                if main_fids1:
-                    st.session_state["fids_file1_bytes"] = main_fids1.read()
-                    st.session_state["fids_file1_name"] = main_fids1.name
                 else:
-                    st.session_state.pop("fids_file1_bytes", None)
-                    st.session_state.pop("fids_file1_name", None)
-                if main_fids2:
-                    st.session_state["fids_file2_bytes"] = main_fids2.read()
-                    st.session_state["fids_file2_name"] = main_fids2.name
-                else:
-                    st.session_state.pop("fids_file2_bytes", None)
-                    st.session_state.pop("fids_file2_name", None)
-                st.session_state.pop("fids_applied", None)
-                st.session_state.pop("_fids_combined_raw", None)
+                    if main_daily:
+                        st.session_state["daily_file_obj"] = main_daily
+                    if main_t1:
+                        st.session_state["t1_file_obj"] = main_t1
+                        st.session_state["_t1_file_name"] = main_t1.name
+                    if main_fids1:
+                        st.session_state["fids_file1_bytes"] = main_fids1.read()
+                        st.session_state["fids_file1_name"] = main_fids1.name
+                    else:
+                        st.session_state.pop("fids_file1_bytes", None)
+                        st.session_state.pop("fids_file1_name", None)
+                    if main_fids2:
+                        st.session_state["fids_file2_bytes"] = main_fids2.read()
+                        st.session_state["fids_file2_name"] = main_fids2.name
+                    else:
+                        st.session_state.pop("fids_file2_bytes", None)
+                        st.session_state.pop("fids_file2_name", None)
+                    st.session_state.pop("fids_applied", None)
+                    st.session_state.pop("_fids_combined_raw", None)
+                    # Without this, the page falls straight through to
+                    # st.stop() below still showing the upload form — daily_file/
+                    # _has_fids (used by the "if not daily_file or not _has_fids"
+                    # gate around this whole block) were already computed, from
+                    # the PRE-click session_state, earlier in this same script
+                    # run, so the just-saved files only take effect on the NEXT
+                    # rerun — i.e. the user had to click "אשר וטען קבצים" twice
+                    # (user report 2026-09-23). Rerunning now re-evaluates that
+                    # gate fresh, so one click is enough.
+                    st.rerun()
 
             if os.path.isdir(os.path.join(os.path.dirname(__file__), "demo_data")):
-                st.markdown("<div style='margin-top:6px'></div>", unsafe_allow_html=True)
+                st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
                 st.caption("🧪 נתוני דמו — סידור לדוגמה מנתונים מומצאים, לא נתוני עובדים אמיתיים.")
-                if st.button("🧪 טען נתוני דמו", use_container_width=True, key="main_demo"):
+                if st.button("🧪 טען נתוני דמו", width="stretch", key="main_demo"):
                     _load_demo_data_into_session()
                     st.rerun()
     st.stop()
 
-# Restore app chrome for the main app
-st.markdown(HERO_HTML, unsafe_allow_html=True)
+# Restore app chrome for the main app — header with the live clock (the
+# separate date strip further down was folded into it).
+from zoneinfo import ZoneInfo as _ZI_HERO
+_hero_now = datetime.now(tz=_ZI_HERO("Asia/Jerusalem"))
+_HERO_DAYS = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
+_hero_day = _HERO_DAYS[_hero_now.weekday()]
+st.markdown(
+    hero_html(f'{"שבת" if _hero_day == "שבת" else "יום " + _hero_day} {_hero_now.strftime("%d/%m")}',
+              _hero_now.strftime("%H:%M")),
+    unsafe_allow_html=True,
+)
+
+_render_theme_picker()
 
 if "schedule_success_msg" in st.session_state:
     st.success(st.session_state["schedule_success_msg"])
+_fc = st.session_state.get("_lookahead_forecast") or []
+if _fc and st.session_state.get("_segments_built"):
+    # Shadow build of the segments still to come, on today's data: a heads-up while
+    # there is still time to act (a worker sent home / sick moves this next time).
+    _fc_txt = "  ·  ".join(f"{x['flight']} {x['time']} — {x['role']}" for x in _fc[:8])
+    st.warning(f"⚠️ צפי לחוסר במשמרות הבאות (לפי הנתונים כרגע): {_fc_txt}"
+               + (f" ועוד {len(_fc) - 8}" if len(_fc) > 8 else ""))
 
 
 # ── טעינת קבצים עם מטמון — פרסינג האקסלים רץ רק כשהקבצים משתנים ─────────────
@@ -1187,7 +1279,7 @@ if _diff_to_show:
                 else ("rgba(185,28,28,.07)" if _dtype == "del" else "rgba(0,0,0,.03)")
             )
             _detail_html = (
-                ("<br><span style='font-size:10px;color:#888;'>" + _detail + "</span>")
+                ("<br><span style='font-size:10px;color:rgba(var(--ink-rgb),.74);'>" + _detail + "</span>")
                 if _detail
                 else ""
             )
@@ -1198,7 +1290,7 @@ if _diff_to_show:
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        if st.button("✕ סגור", key="close_refresh_diff", use_container_width=True):
+        if st.button("✕ סגור", key="close_refresh_diff", width="stretch"):
             st.session_state.pop("_refresh_diff", None)
             st.rerun()
 if "removed_employees" not in st.session_state:
@@ -1260,7 +1352,7 @@ if _removed_early:
 if "תגבור שלוחה" in employees_df.columns:
     employees_df = employees_df[employees_df["תגבור שלוחה"] != True].copy()
 
-@st.dialog("📋 סיכום הורדות ממשמרת", width="large")
+@st.dialog("📑 סיכום הורדות ממשמרת", width="large")
 def _removal_summary_dialog():
     """פופ-אפ סיכום עובדים שהוסרו ממשמרת."""
     _rem_emps = st.session_state.get("removed_employees", {})
@@ -1272,28 +1364,64 @@ def _removal_summary_dialog():
     _html = (
         '<div dir="rtl" style="overflow-x:auto">'
         '<table style="width:100%;border-collapse:collapse;text-align:center;font-size:14px;">'
-        '<thead><tr style="background:#1e1e2e;color:#ccc;">'
-        '<th style="padding:10px 14px;border-bottom:2px solid #444;">שם עובד</th>'
-        '<th style="padding:10px 14px;border-bottom:2px solid #444;">שעת הורדה</th>'
-        '<th style="padding:10px 14px;border-bottom:2px solid #444;">סיבת הורדה</th>'
-        '<th style="padding:10px 14px;border-bottom:2px solid #444;">טיסות שהיה משובץ</th>'
+        '<thead><tr style="background:rgba(var(--ink-rgb),.08);color:var(--ink);">'
+        '<th style="padding:10px 14px;border-bottom:2px solid rgba(var(--ink-rgb),.2);">שם עובד</th>'
+        '<th style="padding:10px 14px;border-bottom:2px solid rgba(var(--ink-rgb),.2);">שעת הורדה</th>'
+        '<th style="padding:10px 14px;border-bottom:2px solid rgba(var(--ink-rgb),.2);">סיבת הורדה</th>'
+        '<th style="padding:10px 14px;border-bottom:2px solid rgba(var(--ink-rgb),.2);">טיסות שהיה משובץ</th>'
         '</tr></thead><tbody>'
     )
     for _i, (_sname, _sreason) in enumerate(_rem_emps.items()):
-        _bg = "#16161f" if _i % 2 == 0 else "#1a1a28"
+        _bg = "rgba(var(--ink-rgb),.03)" if _i % 2 == 0 else "rgba(var(--ink-rgb),.06)"
         _time_str = _rem_times.get(_sname, "—")
         _tl = _rem_tasks.get(_sname, [])
         _ts = " &nbsp;|&nbsp; ".join(_tl) if _tl else "—"
         _html += (
             f'<tr style="background:{_bg};">'
-            f'<td style="padding:9px 14px;border-bottom:1px solid #333;">{safe_html(_sname)}</td>'
-            f'<td style="padding:9px 14px;border-bottom:1px solid #333;">{_time_str}</td>'
-            f'<td style="padding:9px 14px;border-bottom:1px solid #333;">{safe_html(str(_sreason))}</td>'
-            f'<td style="padding:9px 14px;border-bottom:1px solid #333;">{_ts}</td>'
+            f'<td style="padding:9px 14px;border-bottom:1px solid rgba(var(--ink-rgb),.12);">{safe_html(_sname)}</td>'
+            f'<td style="padding:9px 14px;border-bottom:1px solid rgba(var(--ink-rgb),.12);">{_time_str}</td>'
+            f'<td style="padding:9px 14px;border-bottom:1px solid rgba(var(--ink-rgb),.12);">{safe_html(str(_sreason))}</td>'
+            f'<td style="padding:9px 14px;border-bottom:1px solid rgba(var(--ink-rgb),.12);">{_ts}</td>'
             f'</tr>'
         )
     _html += "</tbody></table></div>"
     st.markdown(_html, unsafe_allow_html=True)
+
+
+@st.dialog("⚠️ העובד/ת לא מוסמכ/ת או לא פנוי/ה לתפקיד")
+def _confirm_force_typed_assign_dialog():
+    """Manual-reassignment typed-name path (user rule 2026-09-22): typing a
+    name isn't limited to the pre-vetted candidate list, but a name that
+    fails the qualification/availability check must be confirmed here before
+    it's applied — never silently ignored and never silently forced."""
+    _pending = st.session_state.get("_pending_force_typed")
+    if not _pending:
+        return
+    _name, _tidx, _flight, _role = _pending["name"], _pending["tidx"], _pending["flight"], _pending["role"]
+    st.markdown(
+        f'<div dir="rtl">ל-<b>{safe_html(_name)}</b> אין הסמכה מתאימה לתפקיד '
+        f'<b>{safe_html(_role)}</b> בטיסה <b>{safe_html(_flight)}</b>, או שיש '
+        f'חפיפה עם משימה אחרת שלה/ו.</div>',
+        unsafe_allow_html=True,
+    )
+    _dc1, _dc2 = st.columns(2)
+    with _dc1:
+        if st.button("הכרח שיבוץ", width="stretch", type="primary", key="force_typed_confirm"):
+            _sched_now = st.session_state.get("schedule_df")
+            if _sched_now is not None and _tidx in _sched_now.index:
+                st.session_state["schedule_df"] = force_assign_worker(
+                    _sched_now, _tidx, _name, st.session_state.get("employees_snap"),
+                    keep_prior=True,
+                    reason_tag="הכרח שיבוץ - הוקלד ידנית ללא הסמכה/זמינות מתאימה",
+                )
+                for _k in ["labeled_df", "workload_df", "continuity_df", "output_df", "_ar_highlighted"]:
+                    st.session_state.pop(_k, None)
+            st.session_state.pop("_pending_force_typed", None)
+            st.rerun()
+    with _dc2:
+        if st.button("ביטול", width="stretch", key="force_typed_cancel"):
+            st.session_state.pop("_pending_force_typed", None)
+            st.rerun()
 
 
 def _render_who_works_today():
@@ -1774,7 +1902,7 @@ def _render_who_works_today():
 
     _edited = st.data_editor(
         _display_df,
-        use_container_width=True,
+        width="stretch",
         num_rows="fixed",
         hide_index=True,
         key="shift_hours_editor",
@@ -2071,7 +2199,7 @@ def _render_who_works_today():
 
     # ── Save button (always available) ────────────────────────────────────────
     if st.button(
-        "💾 שמור שעות משמרת", use_container_width=True, key="save_shift_hours"
+        "💾 שמור שעות משמרת", width="stretch", key="save_shift_hours"
     ):
         if _edited is not None and "employees_snap" in st.session_state:
             for (_, _r), _si in zip(_edited.iterrows(), _row_shift_idx):
@@ -2127,7 +2255,7 @@ def _render_who_works_today():
                     data=excel_bytes,
                     file_name="flight_assignments.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch",
                 )
             except Exception:
                 pass
@@ -2142,7 +2270,7 @@ def _render_who_works_today():
             _any_tasks = True
 
             st.markdown(
-                f'<div style="background:#fff3f3;border-right:4px solid #e74c3c;'
+                f'<div style="background:rgba(var(--bad-rgb),.12);color:var(--bad-ink);border-right:4px solid rgb(var(--bad-rgb));'
                 f"border-radius:6px;padding:8px 12px;margin:8px 0 4px 0;"
                 f'font-weight:700;direction:rtl;">✈️ {safe_html(_rname)}</div>',
                 unsafe_allow_html=True,
@@ -2173,6 +2301,43 @@ def _render_who_works_today():
                         key=f"repl_{_tidx}",
                         label_visibility="collapsed",
                     )
+                # Typing a name directly is not limited to the pre-vetted
+                # candidate list above — a shift manager sometimes wants to
+                # place someone the automatic check would reject (user rule
+                # 2026-09-22). Applied immediately (not part of the "שיבוץ
+                # ידני" batch button below): an exact name match that IS
+                # already qualified/free applies right away; one that isn't
+                # opens the force-or-cancel dialog instead of silently doing
+                # nothing or silently overriding.
+                _tc1, _tc2 = st.columns([3, 1])
+                with _tc1:
+                    _typed_name = st.text_input(
+                        "", key=f"repl_typed_{_tidx}",
+                        placeholder="או הקלד שם עובד/ת...",
+                        label_visibility="collapsed",
+                    )
+                with _tc2:
+                    if st.button("שבץ", key=f"repl_typed_go_{_tidx}", width="stretch"):
+                        _tn = clean_text(_typed_name)
+                        if not _tn:
+                            st.warning("יש להקליד שם עובד/ת")
+                        elif employees_df[employees_df["שם"].astype(str).str.strip() == _tn].empty:
+                            st.warning(f"העובד/ת '{_tn}' לא נמצא/ה במאגר העובדים")
+                        elif _tn in (_candidates or []):
+                            st.session_state["schedule_df"] = do_swap(_sched, _tidx, _tn, "unassign")
+                            for _k in ["labeled_df", "workload_df", "continuity_df",
+                                       "output_df", "_ar_highlighted"]:
+                                st.session_state.pop(_k, None)
+                            st.success(f"✅ {_tn} שובצ/ה ל-{_role} בטיסה {_flight}")
+                            st.rerun()
+                        else:
+                            st.session_state["_pending_force_typed"] = {
+                                "name": _tn, "tidx": _tidx, "flight": _flight, "role": _role,
+                            }
+                            st.rerun()
+
+        if st.session_state.get("_pending_force_typed"):
+            _confirm_force_typed_assign_dialog()
 
         if not _any_tasks:
             # אין טיסות לשיבוץ מחדש — עדכן snap אם צריך
@@ -2182,7 +2347,7 @@ def _render_who_works_today():
                 st.session_state["employees_snap"] = employees_df.copy()
                 st.rerun()
             st.success("✅ השיבוץ מעודכן — כל משימות העובדים שהוסרו כוסו.")
-            if st.button("📋 סיכום הורדות", use_container_width=True, key="show_removal_summary_notask"):
+            if st.button("📑 סיכום הורדות", width="stretch", key="show_removal_summary_notask"):
                 _removal_summary_dialog()
             return
 
@@ -2226,7 +2391,7 @@ def _render_who_works_today():
             with _col_auto:
                 if st.button(
                     "🤖 שיבוץ אוטומטי",
-                    use_container_width=True,
+                    width="stretch",
                     type="primary",
                     key="do_auto_reassign",
                 ):
@@ -2237,7 +2402,7 @@ def _render_who_works_today():
             with _col1:
                 if st.button(
                     "🔄 שיבוץ ידני",
-                    use_container_width=True,
+                    width="stretch",
                     key="do_reassign",
                 ):
                     _new_sched = _sched.copy()
@@ -2258,7 +2423,7 @@ def _render_who_works_today():
             with _col2:
                 if st.button(
                     "💾 שמור ללא שיבוץ",
-                    use_container_width=True,
+                    width="stretch",
                     key="save_no_reassign",
                 ):
                     _new_sched = _sched.copy()
@@ -2274,17 +2439,104 @@ def _render_who_works_today():
 
             with _col3:
                 if st.button(
-                    "📋 סיכום הורדות", use_container_width=True, key="show_removal_summary_btn"
+                    "📑 סיכום הורדות", width="stretch", key="show_removal_summary_btn"
                 ):
                     _removal_summary_dialog()
 
-_mc1, _mc2, _mc3 = st.columns([1, 1, 1])
-with _mc2:
-    st.markdown(
-        '<div style="text-align:center;font-size:16px;font-weight:700;margin-bottom:4px;">🛫 טיסות מהסידור היומי</div>',
-        unsafe_allow_html=True,
+def _coverage_stats(sched):
+    """Staffing coverage of a built schedule: slots filled vs open (❌), and
+    the flights that still have open slots (in schedule order)."""
+    if sched is None or sched.empty or "עובד" not in sched.columns:
+        return None
+    _open = sched["עובד"].astype(str).str.contains("❌", na=False)
+    _total = int(len(sched))
+    _n_open = int(_open.sum())
+    _by_flight = {}
+    if "טיסה" in sched.columns:
+        for _f, _o in zip(sched["טיסה"].astype(str).str.strip(), _open):
+            if _o:
+                _by_flight[_f] = _by_flight.get(_f, 0) + 1
+    return {
+        "total": _total, "open": _n_open,
+        "pct": (100.0 * (_total - _n_open) / _total) if _total else 100.0,
+        "by_flight": _by_flight,
+    }
+
+
+def coverage_meter_html(cov, link=False):
+    """Coverage bar under the stats row: how full the schedule is, and (when the
+    schedule tab is open) a jump link to the first flight with an open slot."""
+    if not cov:
+        return ""
+    _pct = cov["pct"]
+    _shown = f"{_pct:.0f}" if cov["open"] == 0 or _pct < 99.5 else "99"
+    _miss = cov["open"]
+    _cls = "cov-miss" if _miss else "cov-ok"
+    if _miss:
+        _nf = len(cov["by_flight"])
+        _sub = f"{_miss} משבצות חסרות ב-{_nf} טיסות ⚠"
+        if link and cov["by_flight"]:
+            _first = next(iter(cov["by_flight"]))
+            _anchor = "".join(ch for ch in _first if ch.isalnum())
+            _sub += (f' · <a class="stat-jump" href="#fl-{_anchor}" title="קפיצה לכרטיס הטיסה">'
+                     f'לטיסה הראשונה שחסרה ↓</a>')
+    else:
+        _sub = "כל המשבצות מאוישות ✓"
+    return (
+        f'<div class="cov {_cls}" role="status" dir="rtl">'
+        f'<div class="cov-head"><b>כיסוי הסידור</b><span class="cov-pct">{_shown}%</span></div>'
+        f'<div class="cov-bar"><i style="width:{_pct:.1f}%"></i></div>'
+        f'<div class="cov-sub">{_sub}</div></div>'
     )
-    st.metric("", len(flights_df))
+
+
+def _stats_row_items(flights, now):
+    """The four numbers under the header: flights, T1 flights, open slots
+    in the built schedule, and the next departure from now."""
+    # (inline — _t1_flight_mask is defined further down the script)
+    _n_t1 = sum(
+        get_terminal(clean_text(str(g)) or clean_text(str(b))) == "1"
+        for g, b in zip(flights.get("גייט", pd.Series("", index=flights.index)),
+                        flights.get("שלוחה", pd.Series("", index=flights.index)))
+    ) if len(flights) else 0
+    _sched = st.session_state.get("schedule_df")
+    if _sched is not None and not _sched.empty and "עובד" in _sched.columns:
+        _missing = int(_sched["עובד"].astype(str).str.contains("❌", na=False).sum())
+        _missing_item = ("משבצות חסרות", f"{_missing} ⚠" if _missing else "0", "warn" if _missing else "gold")
+    else:
+        _missing_item = ("משבצות חסרות", "—", "")
+    _next = "—"
+    if len(flights) and "המראה" in flights.columns:
+        _now_m = now.hour * 60 + now.minute
+        _best = None
+        for _f, _t in zip(flights.get("טיסה", flights.index), flights["המראה"]):
+            _m = re.match(r"^\s*(\d{1,2}):(\d{2})", str(_t))
+            if not _m:
+                continue
+            _mins = int(_m.group(1)) * 60 + int(_m.group(2))
+            _delta = (_mins - _now_m) % 1440
+            if _best is None or _delta < _best[0]:
+                _best = (_delta, str(_f).strip(), f"{int(_m.group(1)):02d}:{_m.group(2)}")
+        if _best:
+            _next = f"{_best[1]} <small>· {_best[2]}</small>"
+            if st.session_state.get("active_main_tab") == "schedule":
+                _anchor = "".join(ch for ch in _best[1] if ch.isalnum())
+                _shown_flights = set()
+                if _sched is not None and not _sched.empty and "טיסה" in _sched.columns:
+                    _shown_flights = set(_sched["טיסה"].astype(str).str.strip())
+                if _best[1] in _shown_flights:
+                    _next = f'<a class="stat-jump" href="#fl-{_anchor}" title="קפיצה לכרטיס הטיסה">{_next} ↓</a>'
+                elif _sched is not None and not _sched.empty:
+                    # not part of the schedule that is built/shown (e.g. a day flight while only
+                    # the night schedule exists) — say so instead of offering a dead link
+                    _next += '<span class="stat-jump-note" style="display:block">עדיין לא שובצה בסידור</span>'
+    return [
+        ("טיסות היום", str(len(flights)), "gold"),
+        ("טיסות טרמינל 1", str(_n_t1), ""),
+        _missing_item,
+        ("הטיסה הבאה", _next, ""),
+    ]
+
 
 # ── בניית טבלת הטיסות ──────────────────────────────────────────────────────
 # אם saved_flight_edits קיים — הוא ה-DataFrame המלא (כולל שורות שנוספו ידנית)
@@ -2630,6 +2882,10 @@ if (_fids1 or _fids2) and not st.session_state.get("fids_applied"):
     # לוח הטיסות נבנה מה-FIDS בלבד (הנחיית משתמש 2026-07-05) — לשונית
     # "דוח שיבוץ טיסות - המראות" בקובץ היומי אינה מקור הטיסות יותר.
     _fids_combined = parse_fids_combined([_fids1, _fids2])
+    # No flight table at all — e.g. an unrelated HTML page uploaded by mistake
+    # instead of the FIDS export (real 11.09.2026 upload). Without it
+    # no flight has a Pax count, so build_schedule skips all of them as FERRY.
+    st.session_state["_fids_unreadable"] = _fids_combined is None
     _fids_board = None
     if _fids_combined is not None:
         _fids_board = flights_from_fids(_fids_combined)
@@ -2650,6 +2906,14 @@ if (_fids1 or _fids2) and not st.session_state.get("fids_applied"):
     st.session_state["saved_flight_edits"] = flights_editor_df.copy()
     st.session_state["fids_applied"] = True
 
+if (_fids1 or _fids2) and st.session_state.get("_fids_unreadable"):
+    st.warning(
+        "⚠️ לא נמצאה טבלת טיסות בקובץ ה-FIDS שהועלה — ייתכן שהועלה בטעות קובץ "
+        "אחר במקום קובץ הפידס. "
+        "בלי FIDS אין מספרי נוסעים, גייטים וטרמינלים, והשיבוץ לא ייבנה. "
+        "יש להעלות את קובץ ה-FIDS של יום הסידור."
+    )
+
 display_df = _build_display_df(flights_editor_df)
 display_df.index = range(1, len(display_df) + 1)
 
@@ -2665,17 +2929,26 @@ display_df.index = range(1, len(display_df) + 1)
 # table isn't wired to any expensive recompute on every rerun (the schedule
 # build only runs on its own explicit button), so the extra reruns from
 # editing are cheap.
+# Stats row sits right above the flights table, computed from the final
+# flights board (FIDS gates included, so the T1 count is real).
+st.markdown(stats_html(_stats_row_items(flights_editor_df, _hero_now)), unsafe_allow_html=True)
+st.markdown(
+    coverage_meter_html(_coverage_stats(st.session_state.get("schedule_df")),
+                        link=st.session_state.get("active_main_tab") == "schedule"),
+    unsafe_allow_html=True,
+)
+
 _flights_editable = is_admin()
 edited_display = st.data_editor(
     display_df,
-    use_container_width=True,
+    width="stretch",
     num_rows="fixed",
     column_config={
         "טיסה / יעד": st.column_config.TextColumn("✈️ טיסה / יעד", disabled=True),
         "המראה": st.column_config.TextColumn("🕒 המראה", disabled=True),
         "ETD": st.column_config.TextColumn("⏱️ ETD", disabled=not _flights_editable),
         "מטוס / רישוי": st.column_config.TextColumn("🛩️ מטוס / רישוי", disabled=not _flights_editable),
-        "גייט": st.column_config.TextColumn("🚪 גייט", disabled=not _flights_editable),
+        "גייט": st.column_config.TextColumn("🛂 גייט", disabled=not _flights_editable),
         "נוסעים": st.column_config.TextColumn("👥 נוסעים", disabled=not _flights_editable),
     },
     key="flights_editor",
@@ -2683,9 +2956,9 @@ edited_display = st.data_editor(
 if _flights_editable:
     col_save, col_clear = st.columns([3, 1])
     with col_save:
-        save_clicked = st.button("💾 שמור נתונים", use_container_width=True)
+        save_clicked = st.button("💾 שמור נתונים", width="stretch")
     with col_clear:
-        clear_clicked = st.button("🗑️ נקה", use_container_width=True)
+        clear_clicked = st.button("🗑️ נקה", width="stretch")
 else:
     save_clicked = clear_clicked = False
     st.caption("👁️ צפייה בלבד — אין הרשאת עריכה.")
@@ -2791,16 +3064,7 @@ _DAY_HE = {
 }
 _day_he = _DAY_HE.get(_now_il.strftime("%A"), _now_il.strftime("%A"))
 
-st.markdown(
-    f'<div style="direction:rtl;text-align:center;background:linear-gradient(90deg,#eef5ff,#f0fdf4);'
-    f"border:1px solid #c7d9f5;border-radius:10px;padding:7px 16px;margin-bottom:10px;"
-    f'font-size:13.5px;color:#1e3a5f;font-weight:600;">'
-    f'📅 {_day_he}, {_now_il.strftime("%d/%m/%Y")}'
-    f"&nbsp;&nbsp;|&nbsp;&nbsp;"
-    f'🕐 שעה נוכחית (ישראל): <strong style="font-size:15px;">{_now_il.strftime("%H:%M")}</strong>'
-    f"</div>",
-    unsafe_allow_html=True,
-)
+# (the date/time strip that used to be here is now the clock in the header)
 
 
 def render_worker_gantt(schedule_df):
@@ -2825,13 +3089,14 @@ def render_worker_gantt(schedule_df):
     df = df.sort_values(["עובד", "start_dt"])
 
     role_colors = {
-        "ראש צוות": "#8e24aa",
-        "דייל": "#1e88e5",
-        "מפקח TSA": "#d32f2f",
-        "שומר TSA": "#2e7d32",
-        "מתאם תורים": "#f9a825",
-        "טרייני רצ": "#fb8c00",
-        "טרייני ר״צ": "#fb8c00",
+        # colour-blind-safe (no red/green pair), same set as the flight cards
+        "ראש צוות": "rgb(var(--r-tl))",
+        "דייל": "rgb(var(--r-agent))",
+        "מפקח TSA": "rgb(var(--r-insp))",
+        "שומר TSA": "rgb(var(--r-guard))",
+        "מתאם תורים": "rgb(var(--r-queue))",
+        "טרייני רצ": "rgb(var(--r-train))",
+        "טרייני ר״צ": "rgb(var(--r-train))",
     }
 
     workers = df["עובד"].dropna().unique().tolist()
@@ -2845,13 +3110,13 @@ def render_worker_gantt(schedule_df):
             f"""
             <div style="
                 direction:rtl;
-                background:#111827;
-                border:1px solid #334155;
+                background:var(--card-2);
+                border:1px solid rgba(var(--ink-rgb),.15);
                 border-radius:14px;
                 padding:10px 14px;
                 margin-top:14px;
                 font-weight:800;
-                color:white;
+                color:var(--ink);
             ">
                 👤 {worker}
             </div>
@@ -2871,7 +3136,7 @@ def render_worker_gantt(schedule_df):
                     <div style="
                         direction:rtl;
                         background:{color};
-                        color:white;
+                        color:var(--ink);
                         border-radius:12px;
                         padding:10px;
                         margin-top:6px;
@@ -2889,8 +3154,106 @@ def render_worker_gantt(schedule_df):
                 )
 
 
+# ── Special TL-trainee instructions (user rule 2026-09-22) ─────────────────────
+# Optional, day-specific requests from Yogev (who owns TL-trainee certification):
+# pair a named טרייני ר"צ with a named חונך/מסמיך רצים on some flight of a given
+# body category. Filling this is never required to build a schedule; when rows
+# exist they are forced onto the build (apply_special_tl_trainee_instructions,
+# run LAST in _run_build_schedule) — every other flight still gets the general
+# mentor-priority/maximization pass (maximize_tl_trainee_coverage).
+with st.expander("🎓 הנחיות מיוחדות לטרייני ר\"צ (אופציונלי)", expanded=False):
+    st.caption(
+        "בקשות שיבוץ ספציפיות לחניכה/הסמכה של ר\"צ חדשים — לא חובה למלא כדי לבנות סידור. "
+        "כשיש שורות, השיבוץ יתבצע לפיהן; בכל מקרה המערכת מנסה למקסם את שיבוץ הטריינים."
+    )
+    _instr_trainee_names, _instr_tl_names = [], []
+    if "טרייני רצ" in employees_df.columns:
+        _tn = employees_df
+        if "in_daily_excel" in _tn.columns:
+            _on_roster = _tn["in_daily_excel"].astype(str).str.strip().isin(("1", "1.0"))
+            if _on_roster.any():
+                _tn = _tn[_on_roster]
+        _instr_trainee_names = sorted(
+            _tn.loc[_tn["טרייני רצ"].astype(str).str.strip() == "כן", "שם"].dropna().unique().tolist())
+    if "ראש צוות" in employees_df.columns:
+        _mn = employees_df
+        if "in_daily_excel" in _mn.columns:
+            _on_roster2 = _mn["in_daily_excel"].astype(str).str.strip().isin(("1", "1.0"))
+            if _on_roster2.any():
+                _mn = _mn[_on_roster2]
+        _instr_tl_names = sorted(
+            _mn.loc[_mn["ראש צוות"].astype(str).str.strip() == "כן", "שם"].dropna().unique().tolist())
+
+    _prev_instr = st.session_state.get("special_tl_instructions")
+    _instr_base = _prev_instr if _prev_instr is not None and not _prev_instr.empty else pd.DataFrame(
+        columns=list(SPECIAL_INSTRUCTION_COLS))
+
+    if is_admin():
+        _instr_edited = st.data_editor(
+            _instr_base,
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            key="special_tl_instructions_editor",
+            column_config={
+                "שם הטרייני": st.column_config.SelectboxColumn("שם הטרייני", options=_instr_trainee_names),
+                "שם החונך": st.column_config.SelectboxColumn("שם החונך", options=_instr_tl_names),
+                "סוג הטיסה": st.column_config.SelectboxColumn(
+                    "סוג הטיסה", options=list(SPECIAL_INSTRUCTION_TYPES)),
+                "סוג מטוס": st.column_config.SelectboxColumn(
+                    "סוג מטוס", options=list(SPECIAL_INSTRUCTION_BODY_CATS)),
+            },
+        )
+        st.session_state["special_tl_instructions"] = _instr_edited
+    else:
+        st.dataframe(_instr_base, width="stretch", hide_index=True)
+
+    for _u in (st.session_state.get("_unmet_tl_instructions") or []):
+        st.warning(
+            f'⚠️ לא נמצאה טיסה עבור ההנחיה: {_u.get("שם הטרייני", "")} + {_u.get("שם החונך", "")} '
+            f'({_u.get("סוג הטיסה", "")}, {_u.get("סוג מטוס", "")}) — {_u.get("סיבה", "")}'
+        )
+
 # ── Build button ──────────────────────────────────────────────────────────────
-col_btn_auto, col_btn_seg, col_btn_hours, col_btn_manual = st.columns(4)
+# st.columns lays out left-to-right, so the main action ("בנה שיבוץ לכל היום")
+# goes LAST to land rightmost — first in RTL reading order — and the reset
+# ("התחל סידור חדש") ends up at the far (left) end.
+# The build-mode buttons are compact (not stretched across the whole page) —
+# an empty spacer column takes the left side.
+col_btn_manual, col_btn_hours, col_btn_seg, col_btn_auto = st.columns(
+    [0.8, 1, 1, 1], gap="small")
+
+
+def _active_build_mode():
+    """Which build mode is open — its button carries the gold highlight."""
+    if st.session_state.get("show_segment_form"):
+        return "segment"
+    if st.session_state.get("show_time_form"):
+        return "hours"
+    return "full"
+
+
+def _open_build_mode(mode):
+    """Only one build panel at a time (full-day terminal chooser / segment / hours)."""
+    st.session_state["show_full_form"] = (mode == "full")
+    st.session_state["show_segment_form"] = (mode == "segment")
+    st.session_state["show_time_form"] = (mode == "hours")
+
+
+def _build_panel_header(title, subtitle, close_key):
+    """Title (right) + a small ✕ close button (left) for a build panel.
+    Returns True when ✕ was clicked. Call inside the panel's st.container."""
+    # Build panels are direction:rtl (styles.py), so their columns already
+    # run right-to-left: the first column is the rightmost.
+    _c_title, _c_close = st.columns([12, 1], vertical_alignment="center")
+    with _c_title:
+        st.markdown(
+            f'<div class="build-panel-title">{title}</div>'
+            + (f'<div class="build-panel-sub">{subtitle}</div>' if subtitle else ""),
+            unsafe_allow_html=True,
+        )
+    with _c_close:
+        return st.button("✕", key=close_key, help="סגור")
 
 # Column marking a row that belongs to an EARLIER segment of the same
 # operational day (see the נייט/דיי/אפטר builds). Such rows are seeded into the
@@ -2978,12 +3341,134 @@ def _restore_locked_segment(schedule_df, locked_df, emps_df):
     return out
 
 
-def _run_build_schedule(flights_df, emps_df, locked_df=None):
+class EmptyScheduleError(Exception):
+    """build_schedule produced no tasks at all; the message (Hebrew) explains why."""
+
+
+def _empty_schedule_reason(flights_df):
+    """Hebrew explanation for a build that produced no tasks. The usual cause is
+    the FIDS: it is the only source of Pax, and a flight with no Pax is treated
+    as a FERRY and skipped — so a missing/wrong-date FIDS empties the schedule."""
+    _base = "לא נוצר אף שיבוץ — "
+    if flights_df is None or flights_df.empty:
+        return _base + "אין טיסות בלוח הטיסות."
+    _fobjs = [
+        _NamedBytesIO(st.session_state[f"fids_file{_i}_bytes"],
+                      st.session_state.get(f"fids_file{_i}_name", "fids.html"))
+        if st.session_state.get(f"fids_file{_i}_bytes") else None
+        for _i in (1, 2)
+    ]
+    _fids = parse_fids_combined(_fobjs) if any(_fobjs) else None
+    if _fids is None:
+        return (_base + "קובץ ה-FIDS שהועלה לא מכיל טבלת טיסות (ייתכן שהועלה בטעות קובץ "
+                "אחר במקום קובץ הפידס). בלי FIDS אין "
+                "מספרי נוסעים, ולכן כל הטיסות זוהו כטיסות FERRY ולא שובצו. "
+                "יש להעלות את קובץ ה-FIDS של יום הסידור ולבנות מחדש.")
+    _m = re.search(r"(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})", str(getattr(daily_file, "name", "")))
+    _fids_days = fids_days_of_month(_fids)
+    if _m and _fids_days and int(_m.group(1)) not in _fids_days:
+        return (_base + f"קובץ ה-FIDS הוא מתאריך אחר (יום {', '.join(map(str, sorted(_fids_days)))} "
+                f"בחודש) מהסידור היומי ({_m.group(0)}). יש להעלות את קובץ ה-FIDS "
+                "של יום הסידור ולבנות מחדש.")
+    _pax = flights_df.get("נוסעים", pd.Series("", index=flights_df.index)).astype(str).str.strip()
+    if not (~_pax.isin(["", "0", "nan", "None"])).any():
+        return (_base + "לאף טיסה אין מספר נוסעים, ולכן כולן זוהו כטיסות FERRY. "
+                "ייתכן שקובץ ה-FIDS לא תואם את הסידור היומי — יש לבדוק שהוא מאותו יום.")
+    return _base + "לא נמצאו עובדים זמינים לאף טיסה. יש לבדוק את קובץ הסידור היומי."
+
+
+def _show_build_error(exc, generic_msg):
+    if isinstance(exc, EmptyScheduleError):
+        st.error(f"❌ {exc}")
+    else:
+        st.error(generic_msg)
+        st.exception(exc)
+
+
+# ── Terminal scope of a build (user 2026-09-26): after pressing any of the three
+# build buttons the admin picks 1 / 3 / both. Building ONE terminal builds only
+# that terminal's flights; the other terminal's rows already in the schedule are
+# locked (seeded as busy, restored verbatim), so building T3 and then T1 shares
+# worker state instead of double-booking a transfer worker.
+BUILD_SCOPE_LABELS = {"both": "שני הטרמינלים", "3": "טרמינל 3 בלבד", "1": "טרמינל 1 בלבד"}
+
+
+def _t1_flight_mask(df):
+    """Boolean Series — True for Terminal 1 flights (gate numbers 30-40 or שלוחה=1)."""
+    gate = df.get("גייט", pd.Series("", index=df.index)).astype(str)
+    branch = df.get("שלוחה", pd.Series("", index=df.index)).astype(str)
+    return pd.Series(
+        [get_terminal(clean_text(g) or clean_text(b)) == "1" for g, b in zip(gate, branch)],
+        index=df.index, dtype=bool,
+    )
+
+
+def _has_t1_flights(df):
+    return df is not None and len(df) > 0 and bool(_t1_flight_mask(df).any())
+
+
+def _scope_picker(key, flights_df):
+    """Radio: which terminal(s) to build. Shown only when the day has T1 flights."""
+    if not _has_t1_flights(flights_df):
+        return "both"
+    return st.radio(
+        "איזה טרמינל לבנות?", ["both", "3", "1"], index=0, horizontal=True, key=key,
+        format_func=lambda v: BUILD_SCOPE_LABELS[v],
+        help="בנייה של טרמינל אחד משאירה את השיבוץ הקיים של הטרמינל השני כמות שהוא, "
+             "כך שאפשר לבנות קודם טרמינל 3 ואחר כך טרמינל 1 (או להפך) והעובדים מתואמים ביניהם.",
+    )
+
+
+def _split_by_scope(base_df, scope, prev_schedule):
+    """(flights to build, existing rows of the OTHER terminal to lock or None,
+    other-terminal flights to keep on screen or None)."""
+    if scope not in ("1", "3"):
+        return base_df, None, None
+    _is_t1 = _t1_flight_mask(base_df)
+    _mine = _is_t1 if scope == "1" else ~_is_t1
+    _build, _other = base_df[_mine].copy(), base_df[~_mine].copy()
+    _locked = _extra = None
+    if prev_schedule is not None and not prev_schedule.empty and not _other.empty:
+        _nums = {clean_text(str(v)) for v in _other["טיסה"]}
+        _pm = prev_schedule["טיסה"].astype(str).map(clean_text).isin(_nums)
+        if _pm.any():
+            _locked = prev_schedule[_pm].copy()
+            _kept = set(_locked["טיסה"].astype(str).map(clean_text))
+            _extra = _other[_other["טיסה"].astype(str).map(clean_text).isin(_kept)].copy()
+    return _build, _locked, _extra
+
+
+def _merge_locked(a, b):
+    """Union of two locked-row frames (both slices of the same schedule)."""
+    if a is None or a.empty:
+        return b
+    if b is None or b.empty:
+        return a
+    _m = pd.concat([a, b])
+    return _m[~_m.index.duplicated()].copy()
+
+
+def _set_scope_label(scope, other_locked):
+    """Banner text when the schedule on screen covers a single terminal."""
+    if scope in ("1", "3") and (other_locked is None or other_locked.empty):
+        st.session_state["schedule_terminal_label"] = BUILD_SCOPE_LABELS[scope]
+    else:
+        st.session_state.pop("schedule_terminal_label", None)
+
+
+def _run_build_schedule(flights_df, emps_df, locked_df=None, extra_flights_df=None,
+                        lookahead_flights_df=None):
     """
     locked_df: rows from previously-built segments. They are seeded so their
     workers count as busy, and pinned back to their original values after the
     post-passes — a later segment may never move work the previous team already
     published.
+    extra_flights_df: flights that are NOT built here (their rows are in
+    locked_df) but stay in the flights snapshot so the display keeps showing
+    them — the other terminal of a single-terminal build.
+    lookahead_flights_df: flights of the segments AFTER this one (segmented builds
+    only). A shadow build of them (app/lookahead.py) reserves the scarce workers
+    they will need and produces a shortage forecast; never published.
     """
     import time as _time
     start_time = _time.time()
@@ -3014,43 +3499,58 @@ def _run_build_schedule(flights_df, emps_df, locked_df=None):
     if locked_df is not None and not locked_df.empty:
         _pre = _to_native_df(locked_df).copy()
         _pre[LOCKED_COL] = True
-    schedule_df = build_schedule(flights_df, _sched_emps, pre_assignments=_pre)
-    # Reserve dual-certified (ר"צ+TSA) workers for uncovered inspector slots
-    # BEFORE upgrade_teamleads, so any ר"צ slot it vacates can be back-filled.
-    schedule_df = reserve_dual_certified_for_tsa(schedule_df, _sched_emps)
-    schedule_df = upgrade_teamleads(schedule_df, _sched_emps)
-    schedule_df = optimize_tl_continuity(schedule_df, _sched_emps)
-    schedule_df = fix_wasteful_gaps(schedule_df, _sched_emps)
-    schedule_df = pair_trainee_attendants(schedule_df, _sched_emps)
-    schedule_df = consolidate_tsa_inspectors_by_pier(schedule_df, _sched_emps)
-    schedule_df = backfill_remaining_gaps(schedule_df, _sched_emps)
-    schedule_df = protect_early_shift_preflight_breaks(schedule_df, _sched_emps)
-    # LAST: re-assert the trainee/mentor pairing invariant — the passes
-    # above can move either side of a pair independently.
-    schedule_df = improve_night_continuity(schedule_df, _sched_emps)
-    schedule_df = avoid_fresh_start_assignments(schedule_df, _sched_emps)
-    schedule_df = fill_idle_gaps(schedule_df, _sched_emps)
-    schedule_df = enforce_trainee_pairing(schedule_df, _sched_emps)
-    # ר"צים get priority over plain attendants for floor work, then idle time
-    # between a worker's flights is traded/handed away (user rules 2026-09-20).
-    # After enforce_trainee_pairing (both passes skip trainee flights) and
-    # before the final fix_wasteful_gaps cleanup.
-    schedule_df = boost_runner_floor_time(schedule_df, _sched_emps)
-    schedule_df = compact_idle_gaps(schedule_df, _sched_emps)
-    # Re-run wasteful-gap cleanup AFTER every pass that can still reassign a
-    # flight (pair_trainee_attendants / backfill_remaining_gaps /
-    # enforce_trainee_pairing all hand vacated slots to a substitute without
-    # checking whether doing so strands THEM with a purposeless gap). The
-    # first fix_wasteful_gaps call above only sees the schedule as it stood
-    # right after optimize_tl_continuity — found via real 12.07.2026 data:
-    # agent#67 (03:30-11:00) had a clean day until enforce_trainee_pairing
-    # backfilled LY323 (08:25-09:30) onto her at the very end, isolated by a
-    # ~2h25m gap after her break with nothing to bridge it — she'd have gone
-    # back to the counters and back down again for one flight ("טרטור").
-    schedule_df = fix_wasteful_gaps(schedule_df, _sched_emps)
+    _late_from = 8 * 60 if st.session_state.get("_building_segment") == "night" else None
+    # Look-ahead (user 2026-09-27): reserve, for the segments after this one, the
+    # scarce workers (מפקח TSA / ראש צוות) they will need, so this segment cannot
+    # park them on a lesser task at the same time — real 23.08: TSA-inspector#3. Advisory:
+    # any failure just means "no reservations", as before.
+    _resv, _forecast, _shadow_missing = None, [], 0
+    if lookahead_flights_df is not None and not lookahead_flights_df.empty:
+        try:
+            _later = _effective_flights_for_schedule(_to_native_df(lookahead_flights_df))
+            _resv, _forecast, _shadow_missing = lookahead.shadow_lookahead(
+                flights_df, _later, _sched_emps, _pre, late_shift_from=_late_from)
+        except Exception:
+            _resv, _forecast, _shadow_missing = None, [], 0
+    _pre_real = _pre
+    if _resv is not None and not _resv.empty:
+        _pre_real = _resv.copy() if _pre is None else pd.concat([_pre, _resv], ignore_index=True)
+    # The whole ordered pass list lives in app/pipeline.py (shared with the offline harnesses).
+    schedule_df = run_build_pipeline(
+        flights_df, _sched_emps, pre_assignments=_pre_real,
+        # NIGHT segment: prefer people already on shift over pulling in the day shift.
+        late_shift_from=_late_from,
+    )
+    if (_pre_real is not _pre and not is_empty_schedule(schedule_df)
+            and lookahead.count_missing(schedule_df, flights_df) > _shadow_missing):
+        # The reservations cost this segment a role the shadow could fill: not worth it.
+        _pre_real = _pre
+        schedule_df = run_build_pipeline(
+            flights_df, _sched_emps, pre_assignments=_pre, late_shift_from=_late_from)
+    if is_empty_schedule(schedule_df):
+        raise EmptyScheduleError(_empty_schedule_reason(flights_df))
+    # Explicit day-specific TL-trainee requests (Yogev, entered in "הנחיות
+    # מיוחדות" before the build — user rule 2026-09-22) win over every
+    # priority/balance pass above: apply LAST so nothing downstream can
+    # silently undo them. Best-effort — an instruction that cannot be placed
+    # is reported back, never blocks the build.
+    _special_instr = st.session_state.get("special_tl_instructions")
+    if _special_instr is not None and len(_special_instr):
+        schedule_df, _unmet_instr = apply_special_tl_trainee_instructions(
+            schedule_df, _sched_emps, flights_df, _special_instr)
+        st.session_state["_unmet_tl_instructions"] = _unmet_instr
+    else:
+        st.session_state["_unmet_tl_instructions"] = []
 
-    if _pre is not None:
-        schedule_df = _restore_locked_segment(schedule_df, _pre, _sched_emps)
+    if _pre_real is not None:
+        schedule_df = _restore_locked_segment(schedule_df, _pre_real, _sched_emps)
+    schedule_df = lookahead.drop_reserved(schedule_df)      # reservations are never published
+    st.session_state["_lookahead_forecast"] = _forecast
+
+    if extra_flights_df is not None and not extra_flights_df.empty:
+        flights_df = pd.concat(
+            [flights_df, _effective_flights_for_schedule(_to_native_df(extra_flights_df))],
+            ignore_index=True)
 
     # Pre-compute display data so the next render is instant (avoids 5-7s re-compute on re-render)
     labeled_df, workload_df, continuity_df, output_df = recompute_from_schedule(
@@ -3108,53 +3608,116 @@ def _run_build_schedule(flights_df, emps_df, locked_df=None):
 # see it. The rebuild itself already happened by this point; this rerun only
 # guarantees every widget below renders from the settled post-rebuild state.
 if st.session_state.pop("_pending_gate_rebuild", False):
-    _run_build_schedule(flights_editor_df, employees_df)
     _pg_msg = st.session_state.pop("_pending_gate_success", "")
-    if _pg_msg:
-        st.toast(_pg_msg, icon="✅")
-    st.rerun()
+    try:
+        # A single-terminal schedule stays single-terminal after a gate edit.
+        _pg_scope = next((k for k in ("1", "3")
+                          if st.session_state.get("schedule_terminal_label") == BUILD_SCOPE_LABELS[k]), "both")
+        _run_build_schedule(_split_by_scope(flights_editor_df, _pg_scope, None)[0], employees_df)
+    except Exception as exc:
+        # No st.rerun() on failure — it would wipe the error before it is seen.
+        # The gate edit is already in saved_flight_edits, and the previous
+        # schedule stays on screen (_run_build_schedule only stores a new one
+        # at the very end of a successful build).
+        _show_build_error(exc, "השער נשמר, אבל הבנייה מחדש של הסידור נכשלה — מוצג הסידור הקודם.")
+    else:
+        if _pg_msg:
+            st.toast(_pg_msg, icon="✅")
+        st.rerun()
+
+def _build_wait_html(title: str) -> str:
+    """Animated wait banner shown while a build runs (about 15 s)."""
+    return (
+        '<div class="build-wait" role="status" aria-live="polite" dir="rtl">'
+        f'<div class="bw-title">⏳ {title}…</div>'
+        '<div class="bw-sub">קורא נתונים, משבץ ומלטש · לוקח בדרך כלל כ-15 שניות</div>'
+        '<div class="bw-bar"><i></i></div></div>'
+    )
+
+
+def _build_full_day(scope):
+    """The "כל היום" build, for the chosen terminal scope."""
+    _status = st.empty()
+    try:
+        _status.markdown(_build_wait_html("בונה שיבוץ"), unsafe_allow_html=True)
+        st.session_state.pop("schedule_hours_label", None)  # סידור מלא — ללא באנר שעות
+        # בנייה מלאה מאפסת את מצב הבנייה לפי משמרות
+        st.session_state.pop("_segments_built", None)
+        st.session_state.pop("_segment_built_until", None)
+        _bf, _lk, _ex = _split_by_scope(flights_editor_df, scope, st.session_state.get("schedule_df"))
+        if _bf.empty:
+            _status.empty()
+            st.warning("אין טיסות בטרמינל שנבחר.")
+            return
+        _run_build_schedule(_bf, employees_df, locked_df=_lk, extra_flights_df=_ex)
+        _set_scope_label(scope, _lk)
+        st.session_state["show_full_form"] = False
+        _status.empty()
+        st.rerun()
+    except Exception as exc:
+        _status.empty()
+        _show_build_error(exc, "הייתה שגיאה בבניית השיבוץ.")
+
 
 with col_btn_auto:
     if not is_admin():
         st.caption("👁️ צפייה בלבד — אין הרשאה לבנות שיבוץ.")
-    elif st.button("🚀 בנה שיבוץ לכל היום", use_container_width=True):
-        try:
-            _status = st.empty()
-            _status.info("⏳ בונה שיבוץ... נא להמתין")
-            st.session_state.pop("schedule_hours_label", None)  # סידור מלא — ללא באנר שעות
-            # בנייה מלאה מאפסת את מצב הבנייה לפי משמרות
-            st.session_state.pop("_segments_built", None)
-            st.session_state.pop("_segment_built_until", None)
-            _run_build_schedule(flights_editor_df, employees_df)
-            _status.empty()
+    elif st.button(f"**בנה לכל היום**  \n:gray[כל {len(flights_editor_df)} הטיסות בבת אחת]",
+                   width="stretch", key="mode_full",
+                   type="primary" if _active_build_mode() == "full" else "secondary"):
+        if _has_t1_flights(flights_editor_df):
+            # Terminal 1 flights exist → ask which terminal(s) first.
+            _open_build_mode("full")
             st.rerun()
-        except Exception as exc:
-            st.error("הייתה שגיאה בבניית השיבוץ.")
-            st.exception(exc)
+        else:
+            _open_build_mode(None)
+            _build_full_day("both")
 
 with col_btn_seg:
-    if is_admin() and st.button("🌙 בנה לפי משמרת", use_container_width=True,
+    if is_admin() and st.button("**לפי משמרת**  \n:gray[נייט · דיי · אפטר]",
+                 width="stretch", key="mode_segment",
+                 type="primary" if _active_build_mode() == "segment" else "secondary",
                  help="הסידור נבנה שלוש פעמים ביום — נייט, דיי ואפטר. כל בנייה ממשיכה את הקודמת."):
-        st.session_state["show_segment_form"] = True
+        _open_build_mode("segment")
         st.rerun()
 
 with col_btn_hours:
-    if is_admin() and st.button("🕐 בנה שיבוץ לפי שעות", use_container_width=True,
+    if is_admin() and st.button("**לפי שעות**  \n:gray[טווח המראות שתבחר]",
+                 width="stretch", key="mode_hours",
+                 type="primary" if _active_build_mode() == "hours" else "secondary",
                  help="בחר טווח שעות ובנה שיבוץ רק לטיסות שהמראתן בטווח"):
-        st.session_state["show_time_form"] = True
+        _open_build_mode("hours")
         st.rerun()
+
+# ── בחירת טרמינל לבנייה של כל היום (מופיע אחרי הלחיצה, רק כשיש טיסות T1) ─────
+if st.session_state.get("show_full_form", False) and is_admin():
+    with st.container(key="build_panel_full"):
+        if _build_panel_header("🚀 בניית סידור לכל היום", "בחר איזה טרמינל לבנות", "full_cancel"):
+            st.session_state["show_full_form"] = False
+            st.rerun()
+        _full_scope = _scope_picker("scope_full", flights_editor_df)
+        _fg, _fg_sp = st.columns([1, 3])
+        with _fg:
+            if st.button("✅ התחל בנייה", width="stretch", key="full_go", type="primary"):
+                _build_full_day(_full_scope)
 
 @st.dialog("⚠️ שים לב!")
 def _confirm_new_schedule_dialog():
+    _sd = st.session_state.get("schedule_df")
+    _rows = 0 if _sd is None else len(_sd)
+    _saved = (f"הסידור הנוכחי ({_rows} שורות שיבוץ) יישמר בלשונית \"היסטוריה\" לפני האיפוס."
+              if _rows else "אין סידור בנוי כרגע, ולכן לא יישמר דבר בהיסטוריה.")
     st.markdown(
-        '<div dir="rtl" style="font-size:17px;font-weight:700;color:#f5c542;'
-        'text-align:center;padding:10px 0 18px;">'
-        '⚠️ לחיצה על כפתור זה תאפס את כל הנתונים הקיימים.</div>',
+        '<div dir="rtl" style="font-size:17px;font-weight:700;color:var(--acc-strong);'
+        'text-align:center;padding:10px 0 6px;">'
+        '⚠️ לחיצה על כפתור זה תאפס את כל הנתונים הקיימים.</div>'
+        f'<div dir="rtl" style="text-align:center;padding:0 0 18px;color:rgba(var(--ink-rgb),.8);">'
+        f'{_saved}<br>הקבצים שהועלו, ההחתמות והפרסום לעובדים יתאפסו.</div>',
         unsafe_allow_html=True,
     )
     _c_confirm, _c_cancel = st.columns(2)
     with _c_confirm:
-        if st.button("✅ כן, אפס והתחל סידור חדש", use_container_width=True, type="primary"):
+        if st.button("✅ כן, אפס והתחל סידור חדש", width="stretch", type="primary"):
             _now = app_now()
             _sched_for_archive = st.session_state.get("schedule_df")
             _report_bytes = None
@@ -3207,7 +3770,8 @@ def _confirm_new_schedule_dialog():
             for _k in [
                 "schedule_df", "flights_snap", "employees_snap", "labeled_df",
                 "workload_df", "continuity_df", "output_df", "build_seconds",
-                "schedule_hours_label", "_build_id", "saved_flight_edits",
+                "schedule_hours_label", "schedule_terminal_label", "show_full_form",
+                "_build_id", "saved_flight_edits",
                 "fids_applied", "fids_file1_bytes", "fids_file1_name",
                 "fids_file2_bytes", "fids_file2_name", "daily_file_obj",
                 "employees_file_obj", "t1_file_obj", "_t1_file_name",
@@ -3216,6 +3780,7 @@ def _confirm_new_schedule_dialog():
                 "_segments_built", "_segment_built_until", "show_segment_form",
                 "_segment_snapshots", "_segment_current", "_view_segment",
                 "_manual_emp_edits",
+                "special_tl_instructions", "_unmet_tl_instructions",
             ]:
                 st.session_state.pop(_k, None)
             session_checkpoint.clear_checkpoint()
@@ -3223,12 +3788,60 @@ def _confirm_new_schedule_dialog():
             st.toast("✅ הסידור הקודם נשמר בלשונית \"היסטוריה\" — אפשר להתחיל סידור חדש.", icon="⭐")
             st.rerun()
     with _c_cancel:
-        if st.button("ביטול", use_container_width=True):
+        if st.button("ביטול", width="stretch"):
+            st.rerun()
+
+
+@st.dialog("בדיקה לפני שיגור")
+def _publish_check_dialog(_sched):
+    """Shows what is still open before the schedule goes out to the workers."""
+    _cov = _coverage_stats(_sched)
+    _removed = st.session_state.get("removed_employees", {}) or {}
+    if _cov and _cov["open"]:
+        st.markdown(
+            f'<div class="banner banner-warn" dir="rtl">⚠️ {_cov["open"]} משבצות עדיין חסרות '
+            f'ב-{len(_cov["by_flight"])} טיסות. אפשר לשגר בכל זאת, אבל העובדים יראו חורים.</div>',
+            unsafe_allow_html=True,
+        )
+        _rows = "".join(
+            f'<tr><td>{safe_html(_f)}</td><td>{_n}</td></tr>'
+            for _f, _n in list(_cov["by_flight"].items())[:12]
+        )
+        _more = len(_cov["by_flight"]) - 12
+        st.markdown(
+            '<table class="chk-table" dir="rtl"><thead><tr><th>טיסה</th><th>משבצות חסרות</th></tr></thead>'
+            f'<tbody>{_rows}</tbody></table>'
+            + (f'<div class="chk-more" dir="rtl">ועוד {_more} טיסות…</div>' if _more > 0 else ""),
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="banner banner-ok" dir="rtl">✅ כל המשבצות מאוישות.</div>',
+            unsafe_allow_html=True,
+        )
+    if _removed:
+        st.markdown(
+            f'<div dir="rtl" class="chk-note">🚫 {len(_removed)} עובדים הורדו ממשמרת ולא ישובצו.</div>',
+            unsafe_allow_html=True,
+        )
+    _c_go, _c_back = st.columns(2)[::-1]
+    with _c_go:
+        _go_label = "📣 שגר בכל זאת" if (_cov and _cov["open"]) else "📣 שגר עכשיו"
+        if st.button(_go_label, width="stretch", type="primary", key="publish_go"):
+            _now = app_now()
+            if publish_state.publish_schedule(_sched, st.session_state.get("_build_id"), _now):
+                st.toast("✅ הסידור שוגר לעובדים.", icon="📣")
+                st.rerun()
+            else:
+                st.error("שגיאה בשיגור הסידור.")
+    with _c_back:
+        if st.button("חזרה לתיקון", width="stretch", key="publish_back"):
             st.rerun()
 
 
 with col_btn_manual:
-    if is_admin() and st.button("⭐ התחל סידור חדש", use_container_width=True,
+    if is_admin() and st.button("**התחל סידור חדש**  \n:gray[שומר את הנוכחי להיסטוריה]",
+                 width="stretch", key="mode_new",
                  help="שומר עותק של הסידור הנוכחי (כולל סיכום ההורדות ממשמרת ונתוני ההחתמות) בלשונית \"היסטוריה\" ומתחיל סידור חדש מאפס"):
         _confirm_new_schedule_dialog()
 
@@ -3243,223 +3856,267 @@ _SEGMENT_META = {
 }
 
 if st.session_state.get("show_segment_form", False):
-    st.markdown(
-        '<div style="direction:rtl;background:#f0f4ff;border:1px solid #c0d0f0;'
-        'border-radius:12px;padding:16px 18px;margin-top:8px;">',
-        unsafe_allow_html=True,
-    )
-    st.markdown("**🌙 בניית סידור לפי משמרת**")
-    try:
-        from app.scheduler import compute_segment_boundaries
+    with st.container(key="build_panel_seg"):
+        if _build_panel_header("🌙 בניית סידור לפי משמרת",
+                               "נייט, דיי ואפטר — כל בנייה ממשיכה את הקודמת", "seg_cancel"):
+            st.session_state["show_segment_form"] = False
+            st.rerun()
+        try:
+            from app.scheduler import compute_segment_boundaries
 
-        _segs = compute_segment_boundaries(
-            _effective_flights_for_schedule(_to_native_df(flights_editor_df)),
-            _to_native_df(employees_df),
-        )
-        _done = set(st.session_state.get("_segments_built", []))
-        _cols = st.columns(3)
-        for _col, _key in zip(_cols, ("night", "day", "after")):
-            _seg = _segs.get(_key)
-            _he, _icon = _SEGMENT_META[_key]
-            with _col:
-                if not _seg:
-                    st.caption(f"{_icon} {_he} — אין טיסות")
-                    continue
-                _fm, _tm = _seg["from_minutes"], _seg["to_minutes"]
-                st.markdown(
-                    f'<div dir="rtl" style="font-size:13px;line-height:1.7;">'
-                    f'<b>{_icon} {_he}</b><br>'
-                    f'{_seg["first_flight"]} '
-                    f'<span dir="ltr">{_fm // 60:02d}:{_fm % 60:02d}</span> ← '
-                    f'{_seg["last_flight"]} '
-                    f'<span dir="ltr">{_tm // 60:02d}:{_tm % 60:02d}</span><br>'
-                    f'{len(_seg["flights"])} טיסות'
-                    + (' · <b style="color:#2e7d32;">נבנה ✓</b>' if _key in _done else '')
-                    + '</div>',
-                    unsafe_allow_html=True,
-                )
-                if st.button(f"בנה {_he}", use_container_width=True, key=f"seg_go_{_key}"):
-                    try:
-                        _status = st.empty()
-                        _status.info(f"⏳ בונה את סידור ה{_he}... נא להמתין")
-                        _wanted = set(_seg["flights"])
-                        # נייט ממשיך לשבץ ר"צ/מפקח גם על טיסות שאחרי הגבול,
-                        # כל עוד המשמרת שלהם מכסה אותן — שאר התפקידים בטיסות
-                        # האלה נשארים לצוות הדיי.
-                        _ext = set(_seg.get("extension", []))
-                        _ext_roles = set(_seg.get("extension_roles", []))
-                        _seg_flights = flights_editor_df[
-                            flights_editor_df["טיסה"].apply(
-                                lambda v: clean_text(str(v)) in (_wanted | _ext)
-                            )
-                        ].copy()
-                        # כל מה שכבר נבנה בסבבים קודמים — ננעל ומועבר כבסיס.
-                        _locked = None
-                        _prev = st.session_state.get("schedule_df")
-                        if _prev is not None and not _prev.empty and _done:
-                            _prev_flights = set()
-                            for _k2 in _done:
-                                _s2 = _segs.get(_k2)
-                                if _s2:
-                                    _prev_flights |= set(_s2["flights"])
-                            _pf = _prev["טיסה"].astype(str).str.strip()
-                            _mask = _pf.isin(_prev_flights - _wanted)
-                            # טיסות ההרחבה של הנייט יושבות בתוך הקטע של הדיי,
-                            # ולכן החיסור למעלה מוחק בדיוק את מה שהנייט שיבץ
-                            # עליהן. יש לנעול את שורות ההרחבה שלהן בנפרד.
-                            _nseg = _segs.get("night") or {}
-                            _ext_prev = set(_nseg.get("extension", [])) if "night" in _done else set()
-                            if _ext_prev & _wanted:
-                                # רק שיבוצים ממשיים — משבצת הרחבה שנשארה חסרה
-                                # שייכת לקטע הזה, ונעילתה הייתה מונעת ממנו
-                                # לאייש אותה לעולם.
-                                _mask |= (
-                                    _pf.isin(_ext_prev & _wanted)
-                                    & _prev["תפקיד בסיס"].astype(str).str.strip().isin(
-                                        set(_nseg.get("extension_roles", []))
+            _segs = compute_segment_boundaries(
+                _effective_flights_for_schedule(_to_native_df(flights_editor_df)),
+                _to_native_df(employees_df),
+            )
+            _done = set(st.session_state.get("_segments_built", []))
+            _seg_scope = _scope_picker("scope_seg", flights_editor_df)
+            # The panel is RTL, so the first column (נייט) is the rightmost.
+            _cols = st.columns(3)
+            _t1_mask_all = _t1_flight_mask(flights_editor_df)
+            _flt_keys_all = flights_editor_df["טיסה"].astype(str).map(clean_text)
+            for _col, _key in zip(_cols, ("night", "day", "after")):
+                _seg = _segs.get(_key)
+                _he, _icon = _SEGMENT_META[_key]
+                with _col:
+                    if not _seg:
+                        st.markdown(
+                            f'<div class="seg-card seg-card-empty"><div class="seg-name">{_icon} {_he}</div>'
+                            f'<div class="seg-range">אין טיסות במשמרת הזו</div></div>',
+                            unsafe_allow_html=True,
+                        )
+                        continue
+                    _fm, _tm = _seg["from_minutes"], _seg["to_minutes"]
+                    # Flight count follows the terminal chosen above.
+                    _in_seg = _flt_keys_all.isin(set(_seg["flights"]))
+                    if _seg_scope == "1":
+                        _n_flights = int((_in_seg & _t1_mask_all).sum())
+                    elif _seg_scope == "3":
+                        _n_flights = int((_in_seg & ~_t1_mask_all).sum())
+                    else:
+                        _n_flights = len(_seg["flights"])
+                    _built = _key in _done
+                    st.markdown(
+                        f'<div class="seg-card{" seg-card-built" if _built else ""}">'
+                        f'<div class="seg-name">{_icon} {_he}'
+                        + ('<span class="seg-built">נבנה ✓</span>' if _built else '')
+                        + '</div>'
+                        f'<div class="seg-range"><span dir="ltr">{_fm // 60:02d}:{_fm % 60:02d}</span>'
+                        f' – <span dir="ltr">{_tm // 60:02d}:{_tm % 60:02d}</span>'
+                        f' · {_seg["first_flight"]} ← {_seg["last_flight"]}</div>'
+                        f'<div class="seg-count"><b>{_n_flights}</b> טיסות'
+                        + (f' <span class="seg-scope">({BUILD_SCOPE_LABELS[_seg_scope]})</span>'
+                           if _seg_scope in ("1", "3") else '')
+                        + '</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(f"בנה {_he}", width="stretch", key=f"seg_go_{_key}",
+                                 disabled=(_n_flights == 0)):
+                        try:
+                            _status = st.empty()
+                            _status.markdown(_build_wait_html(f"בונה את סידור ה{_he}"), unsafe_allow_html=True)
+                            _wanted = set(_seg["flights"])
+                            # נייט ממשיך לשבץ ר"צ/מפקח גם על טיסות שאחרי הגבול,
+                            # כל עוד המשמרת שלהם מכסה אותן — שאר התפקידים בטיסות
+                            # האלה נשארים לצוות הדיי.
+                            _ext = set(_seg.get("extension", []))
+                            _ext_roles = set(_seg.get("extension_roles", []))
+                            _seg_flights = flights_editor_df[
+                                flights_editor_df["טיסה"].apply(
+                                    lambda v: clean_text(str(v)) in (_wanted | _ext)
+                                )
+                            ].copy()
+                            # כל מה שכבר נבנה בסבבים קודמים — ננעל ומועבר כבסיס.
+                            _locked = None
+                            _prev = st.session_state.get("schedule_df")
+                            if _prev is not None and not _prev.empty and _done:
+                                _prev_flights = set()
+                                for _k2 in _done:
+                                    _s2 = _segs.get(_k2)
+                                    if _s2:
+                                        _prev_flights |= set(_s2["flights"])
+                                _pf = _prev["טיסה"].astype(str).str.strip()
+                                _mask = _pf.isin(_prev_flights - _wanted)
+                                # טיסות ההרחבה של הנייט יושבות בתוך הקטע של הדיי,
+                                # ולכן החיסור למעלה מוחק בדיוק את מה שהנייט שיבץ
+                                # עליהן. יש לנעול את שורות ההרחבה שלהן בנפרד.
+                                _nseg = _segs.get("night") or {}
+                                _ext_prev = set(_nseg.get("extension", [])) if "night" in _done else set()
+                                if _ext_prev & _wanted:
+                                    # רק שיבוצים ממשיים — משבצת הרחבה שנשארה חסרה
+                                    # שייכת לקטע הזה, ונעילתה הייתה מונעת ממנו
+                                    # לאייש אותה לעולם.
+                                    _mask |= (
+                                        _pf.isin(_ext_prev & _wanted)
+                                        & _prev["תפקיד בסיס"].astype(str).str.strip().isin(
+                                            set(_nseg.get("extension_roles", []))
+                                        )
+                                        & ~_prev["עובד"].astype(str).str.contains("❌", na=False)
                                     )
-                                    & ~_prev["עובד"].astype(str).str.contains("❌", na=False)
-                                )
-                            if _mask.any():
-                                _locked = _prev[_mask].copy()
-                        # הגבול שנבנה עד כה — משמש לצ'יפ "המשך יבוא" בזרימת
-                        # העבודה. נקבע לפני הבנייה, כי recompute_from_schedule
-                        # רץ בתוך _run_build_schedule וקורא אותו משם.
-                        st.session_state["_segment_built_until"] = (
-                            None if _key == "after" else _seg["to_minutes"]
-                        )
-                        _run_build_schedule(_seg_flights, employees_df, locked_df=_locked)
-                        if _ext:
-                            # השאר מטיסות ההרחבה רק את תפקידי ההרחבה
-                            _sd = st.session_state["schedule_df"]
-                            _in_ext = _sd["טיסה"].astype(str).str.strip().isin(_ext)
-                            _is_ext_role = _sd["תפקיד בסיס"].astype(str).str.strip().isin(_ext_roles)
-                            st.session_state["schedule_df"] = _sd[~_in_ext | _is_ext_role].copy()
-                            (st.session_state["labeled_df"], st.session_state["workload_df"],
-                             st.session_state["continuity_df"], st.session_state["output_df"]) = \
-                                recompute_from_schedule(
-                                    st.session_state["schedule_df"],
-                                    st.session_state["flights_snap"],
-                                    st.session_state["employees_snap"],
-                                )
-                        st.session_state["_segments_built"] = sorted(_done | {_key})
-                        # שמור עותק של הסידור כפי שנבנה בקטע הזה — כך משמרת
-                        # מאוחרת יותר יכולה לחזור ולראות את הסידור של הקודמת,
-                        # וכל שלושת הסידורים נשמרים להיסטוריה בסוף היום.
-                        st.session_state.setdefault("_segment_snapshots", {})[_key] = {
-                            "label": _he,
-                            "icon": _icon,
-                            "output_df": st.session_state["output_df"].copy(),
-                            "schedule_df": st.session_state["schedule_df"].copy(),
-                            "labeled_df": st.session_state["labeled_df"].copy(),
-                            "range": f"{_seg['first_flight']}–{_seg['last_flight']}",
-                            "flights": sorted(_wanted | _ext),
-                        }
-                        st.session_state["_segment_current"] = _key
-                        st.session_state.pop("_view_segment", None)
-                        st.session_state["schedule_hours_label"] = (
-                            f"{_he}: {_seg['first_flight']}–{_seg['last_flight']}"
-                        )
-                        _status.empty()
-                        st.session_state["schedule_success_msg"] = (
-                            f"✅ סידור ה{_he} נבנה בהצלחה תוך "
-                            f"{st.session_state.get('build_seconds', 0)} שניות"
-                        )
-                        st.session_state["show_segment_form"] = False
-                        st.rerun()
-                    except Exception as _exc:
-                        st.error("שגיאה בבניית הסידור.")
-                        st.exception(_exc)
-    except Exception as _exc:
-        st.error("לא ניתן לחשב את גבולות המשמרות.")
-        st.exception(_exc)
+                                if _mask.any():
+                                    _locked = _prev[_mask].copy()
+                            # הגבול שנבנה עד כה — משמש לצ'יפ "המשך יבוא" בזרימת
+                            # העבודה. נקבע לפני הבנייה, כי recompute_from_schedule
+                            # רץ בתוך _run_build_schedule וקורא אותו משם.
+                            st.session_state["_segment_built_until"] = (
+                                None if _key == "after" else _seg["to_minutes"]
+                            )
+                            # טרמינל אחד בלבד: הטיסות של הטרמינל השני (אם כבר שובצו)
+                            # ננעלות כמו הקטעים הקודמים.
+                            _seg_build, _seg_oth, _seg_extra = _split_by_scope(
+                                _seg_flights, _seg_scope, st.session_state.get("schedule_df"))
+                            if _seg_build.empty:
+                                _status.empty()
+                                st.warning("אין טיסות בטרמינל שנבחר בקטע הזה.")
+                                continue
+                            _locked = _merge_locked(_locked, _seg_oth)
+                            # הצטרפות טיסות המשמרות הבאות (הסתכלות קדימה — ר' _run_build_schedule).
+                            _order = ("night", "day", "after")
+                            _later_nums = set()
+                            for _lk in _order[_order.index(_key) + 1:]:
+                                _ls = _segs.get(_lk)
+                                if _ls:
+                                    _later_nums |= set(_ls["flights"])
+                            _later_nums -= (_wanted | _ext)
+                            _later_df = flights_editor_df[
+                                flights_editor_df["טיסה"].apply(lambda v: clean_text(str(v)) in _later_nums)
+                            ].copy()
+                            _later_df = _split_by_scope(_later_df, _seg_scope, None)[0]
+                            st.session_state["_building_segment"] = _key
+                            try:
+                                _run_build_schedule(_seg_build, employees_df, locked_df=_locked,
+                                                    extra_flights_df=_seg_extra,
+                                                    lookahead_flights_df=_later_df)
+                            finally:
+                                st.session_state.pop("_building_segment", None)
+                            _set_scope_label(_seg_scope, _seg_oth)
+                            if _ext:
+                                # השאר מטיסות ההרחבה רק את תפקידי ההרחבה
+                                _sd = st.session_state["schedule_df"]
+                                _in_ext = _sd["טיסה"].astype(str).str.strip().isin(_ext)
+                                _is_ext_role = _sd["תפקיד בסיס"].astype(str).str.strip().isin(_ext_roles)
+                                st.session_state["schedule_df"] = _sd[~_in_ext | _is_ext_role].copy()
+                                (st.session_state["labeled_df"], st.session_state["workload_df"],
+                                 st.session_state["continuity_df"], st.session_state["output_df"]) = \
+                                    recompute_from_schedule(
+                                        st.session_state["schedule_df"],
+                                        st.session_state["flights_snap"],
+                                        st.session_state["employees_snap"],
+                                    )
+                            st.session_state["_segments_built"] = sorted(_done | {_key})
+                            # שמור עותק של הסידור כפי שנבנה בקטע הזה — כך משמרת
+                            # מאוחרת יותר יכולה לחזור ולראות את הסידור של הקודמת,
+                            # וכל שלושת הסידורים נשמרים להיסטוריה בסוף היום.
+                            st.session_state.setdefault("_segment_snapshots", {})[_key] = {
+                                "label": _he,
+                                "icon": _icon,
+                                "output_df": st.session_state["output_df"].copy(),
+                                "schedule_df": st.session_state["schedule_df"].copy(),
+                                "labeled_df": st.session_state["labeled_df"].copy(),
+                                "range": f"{_seg['first_flight']}–{_seg['last_flight']}",
+                                "flights": sorted(_wanted | _ext),
+                            }
+                            st.session_state["_segment_current"] = _key
+                            st.session_state.pop("_view_segment", None)
+                            st.session_state["schedule_hours_label"] = (
+                                f"{_he}: {_seg['first_flight']}–{_seg['last_flight']}"
+                            )
+                            _status.empty()
+                            st.session_state["schedule_success_msg"] = (
+                                f"✅ סידור ה{_he} נבנה בהצלחה תוך "
+                                f"{st.session_state.get('build_seconds', 0)} שניות"
+                            )
+                            st.session_state["show_segment_form"] = False
+                            st.rerun()
+                        except Exception as _exc:
+                            _show_build_error(_exc, "שגיאה בבניית הסידור.")
+        except Exception as _exc:
+            st.error("לא ניתן לחשב את גבולות המשמרות.")
+            st.exception(_exc)
 
-    if st.button("✖ סגור", key="seg_cancel"):
-        st.session_state["show_segment_form"] = False
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ── טופס זמנים ────────────────────────────────────────────────────────────────
 if st.session_state.get("show_time_form", False):
-    st.markdown(
-        '<div style="direction:rtl;background:#f0f4ff;border:1px solid #c0d0f0;'
-        'border-radius:12px;padding:16px 18px;margin-top:8px;">',
-        unsafe_allow_html=True,
-    )
-    st.markdown("**🕐 בחר טווח שעות לשיבוץ**", unsafe_allow_html=False)
-    tf_col1, tf_col2 = st.columns(2)
-    with tf_col1:
-        time_from = st.text_input(
-            "משעה", value="06:00", placeholder="HH:MM", key="tf_from"
-        )
-    with tf_col2:
-        time_to = st.text_input(
-            "עד שעה", value="23:59", placeholder="HH:MM", key="tf_to"
-        )
-
-    tf_go, tf_cancel = st.columns(2)
-    with tf_go:
-        if st.button(
-            "✅ בנה שיבוץ אוטומטי בטווח זה", use_container_width=True, key="tf_confirm"
-        ):
-            try:
-                from datetime import datetime as _dt
-
-                def _hm(s):
-                    # גמיש: מקבל "13:30", "1330", "13.30", "9" וכו'; מחזיר None אם לא תקין
-                    t = clean_text(str(s)).replace(".", ":").replace(" ", "")
-                    if ":" not in t and t.isdigit():
-                        t = (t[:-2] + ":" + t[-2:]) if len(t) >= 3 else (t + ":00")
-                    try:
-                        return _dt.strptime(t, "%H:%M")
-                    except ValueError:
-                        return None
-
-                t_from = _hm(time_from)
-                t_to = _hm(time_to)
-
-                if t_from is None or t_to is None:
-                    st.warning("⚠️ פורמט שעה לא תקין — הזן שעה כמו 13:30 (או 1330).")
-                else:
-                    # סנן רק טיסות שהמראה שלהן בטווח הזמן
-                    filtered_flights = flights_editor_df[
-                        flights_editor_df["המראה"].apply(
-                            lambda v: is_time_text(str(v))
-                            and _hm(str(v)) is not None
-                            and t_from <= _hm(str(v)) <= t_to
-                        )
-                    ].copy()
-
-                    if filtered_flights.empty:
-                        st.warning("לא נמצאו טיסות בטווח הזמן שנבחר.")
-                    else:
-                        status_box = st.empty()
-                        status_box.info("⏳ בונה שיבוץ אוטומטי... נא להמתין")
-
-                        # שמור את טווח השעות להצגה בבאנר מעל הסידור
-                        st.session_state["schedule_hours_label"] = (
-                            f"{t_from.strftime('%H:%M')}-{t_to.strftime('%H:%M')}"
-                        )
-                        # השתמש באותו נתיב בנייה כמו "בנה שיבוץ לכל היום" — כך
-                        # labeled_df/workload_df וכו' מחושבים מחדש מהטיסות המסוננות
-                        # (אחרת התצוגה נשארת עם הסידור המלא הישן מה-cache).
-                        _run_build_schedule(filtered_flights, employees_df)
-                        status_box.empty()
-
-                        st.session_state["schedule_success_msg"] = (
-                            f"✅ הסידור נבנה בהצלחה תוך "
-                            f"{st.session_state.get('build_seconds', 0)} שניות"
-                        )
-                        st.rerun()
-            except Exception as exc:
-                st.error("שגיאה בבניית השיבוץ.")
-                st.exception(exc)
-    with tf_cancel:
-        if st.button("✖ ביטול", use_container_width=True, key="tf_cancel"):
+    with st.container(key="build_panel_hours"):
+        if _build_panel_header("🕐 בנייה לפי שעות",
+                               "רק טיסות שההמראה שלהן בתוך הטווח", "tf_cancel"):
             st.session_state["show_time_form"] = False
             st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+        # RTL panel: first column is the rightmost → "משעה" then "עד שעה"
+        tf_col1, tf_col2, _tf_sp = st.columns([1, 1, 2])
+        with tf_col1:
+            time_from = st.text_input(
+                "משעה", value="06:00", placeholder="HH:MM", key="tf_from"
+            )
+        with tf_col2:
+            time_to = st.text_input(
+                "עד שעה", value="23:59", placeholder="HH:MM", key="tf_to"
+            )
+
+        _hours_scope = _scope_picker("scope_hours", flights_editor_df)
+        tf_go, _tf_go_sp = st.columns([1, 3])
+        with tf_go:
+            if st.button(
+                "✅ בנה בטווח הזה", width="stretch", key="tf_confirm", type="primary"
+            ):
+                try:
+                    from datetime import datetime as _dt
+
+                    def _hm(s):
+                        # גמיש: מקבל "13:30", "1330", "13.30", "9" וכו'; מחזיר None אם לא תקין
+                        t = clean_text(str(s)).replace(".", ":").replace(" ", "")
+                        if ":" not in t and t.isdigit():
+                            t = (t[:-2] + ":" + t[-2:]) if len(t) >= 3 else (t + ":00")
+                        try:
+                            return _dt.strptime(t, "%H:%M")
+                        except ValueError:
+                            return None
+
+                    t_from = _hm(time_from)
+                    t_to = _hm(time_to)
+
+                    if t_from is None or t_to is None:
+                        st.warning("⚠️ פורמט שעה לא תקין — הזן שעה כמו 13:30 (או 1330).")
+                    else:
+                        # סנן רק טיסות שהמראה שלהן בטווח הזמן
+                        filtered_flights = flights_editor_df[
+                            flights_editor_df["המראה"].apply(
+                                lambda v: is_time_text(str(v))
+                                and _hm(str(v)) is not None
+                                and t_from <= _hm(str(v)) <= t_to
+                            )
+                        ].copy()
+
+                        if filtered_flights.empty:
+                            st.warning("לא נמצאו טיסות בטווח הזמן שנבחר.")
+                        else:
+                            status_box = st.empty()
+                            status_box.markdown(_build_wait_html("בונה שיבוץ אוטומטי"), unsafe_allow_html=True)
+
+                            # שמור את טווח השעות להצגה בבאנר מעל הסידור
+                            st.session_state["schedule_hours_label"] = (
+                                f"{t_from.strftime('%H:%M')}-{t_to.strftime('%H:%M')}"
+                            )
+                            # השתמש באותו נתיב בנייה כמו "בנה שיבוץ לכל היום" — כך
+                            # labeled_df/workload_df וכו' מחושבים מחדש מהטיסות המסוננות
+                            # (אחרת התצוגה נשארת עם הסידור המלא הישן מה-cache).
+                            _hb, _hl, _hx = _split_by_scope(
+                                filtered_flights, _hours_scope, st.session_state.get("schedule_df"))
+                            if _hb.empty:
+                                status_box.empty()
+                                st.warning("אין טיסות בטרמינל שנבחר בטווח הזה.")
+                                st.stop()
+                            _run_build_schedule(_hb, employees_df, locked_df=_hl, extra_flights_df=_hx)
+                            _set_scope_label(_hours_scope, _hl)
+                            status_box.empty()
+
+                            st.session_state["schedule_success_msg"] = (
+                                f"✅ הסידור נבנה בהצלחה תוך "
+                                f"{st.session_state.get('build_seconds', 0)} שניות"
+                            )
+                            st.rerun()
+                except Exception as exc:
+                    _show_build_error(exc, "שגיאה בבניית השיבוץ.")
 
 # ── Tab navigation — defined here (not inside the "schedule built" gate
 # below) so the control-center and user-management tabs are reachable
@@ -3475,12 +4132,14 @@ TAB_WORKFLOW = "workflow"
 TAB_USERS = "users"
 TAB_EMPLOYEES = "employees"
 TAB_ARCHIVE = "archive"
+TAB_TIMELINE = "timeline"
 
 FULL_TAB_LABELS = {
-    TAB_SCHEDULE: "🛠️ סידור עבודה",
-    TAB_WORKFLOW: "📋 זרימת עבודה",
+    TAB_SCHEDULE: "🔧 סידור עבודה",
+    TAB_WORKFLOW: "📑 זרימת עבודה",
+    TAB_TIMELINE: "📈 ציר זמן",
     TAB_DASHBOARD: "⏱️ מרכז בקרה",
-    TAB_UNASSIGNED: "🚨 לא משובצים / הפסקות",
+    TAB_UNASSIGNED: "🚨 לא משובצים",
     TAB_AVAILABLE: "🟡 פנויים באולם",
     TAB_USERS: "👤 ניהול משתמשים",
     TAB_EMPLOYEES: "🧑‍✈️ ניהול עובדים",
@@ -3490,7 +4149,7 @@ FULL_TAB_LABELS = {
 
 def _render_archive_tab():
     st.markdown(
-        "<h3 style='text-align:right;border-bottom:2px solid rgba(255,255,255,0.15);"
+        "<h3 style='text-align:right;border-bottom:2px solid rgba(var(--ink-rgb),0.15);"
         "padding-bottom:8px;margin-bottom:16px;'>🗂️ היסטוריה</h3>",
         unsafe_allow_html=True,
     )
@@ -3498,83 +4157,85 @@ def _render_archive_tab():
     if not entries:
         st.info("אין עדיין סידורים בהיסטוריה — סידור נשמר כאן אוטומטית בכל לחיצה על \"⭐ התחל סידור חדש\".")
         return
-    for entry in entries:
-        _cols = st.columns([3, 2, 2, 2, 1])
-        with _cols[0]:
-            _by = entry.get("archived_by") or "—"
-            st.markdown(
-                f'<div dir="rtl" style="padding-top:8px;font-weight:700;">📅 {entry["date"]}'
-                f' <span style="color:#9ca3af;font-weight:400;">— נשמר בשעה {entry["archived_at"]}'
-                f' ע"י {_by}</span></div>',
-                unsafe_allow_html=True,
-            )
-        with _cols[1]:
-            _removed_n = entry.get("removed_count", 0)
-            st.markdown(
-                f'<div dir="rtl" style="padding-top:8px;color:#9ca3af;">{entry["rows"]} שורות שיבוץ'
-                + (f' &nbsp;|&nbsp; {_removed_n} הורדות ממשמרת' if _removed_n else '')
-                + '</div>',
-                unsafe_allow_html=True,
-            )
-        with _cols[2]:
-            _sched_bytes = schedule_archive.load_archived_schedule_bytes(entry["id"])
-            if _sched_bytes is not None:
-                st.download_button(
-                    "⬇️ קובץ שיבוץ", data=_sched_bytes,
-                    file_name=f"דוח שיבוץ טיסות - {entry['date']}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True, key=f"dl_archive_sched_{entry['id']}",
+    for _hi, entry in enumerate(entries):
+        with st.container(key=f"hist_card_{_hi}"):
+            # Reversed so the date sits rightmost (start of an RTL row) and the
+            # destructive מחק ends up at the far left end, not first in line.
+            _cols = st.columns([1, 2, 2, 2, 3])[::-1]
+            with _cols[0]:
+                _by = entry.get("archived_by") or "—"
+                st.markdown(
+                    f'<div dir="rtl" style="padding-top:8px;font-weight:700;">📅 {entry["date"]}'
+                    f' <span style="color:rgba(var(--ink-rgb),.74);font-weight:400;">— נשמר בשעה {entry["archived_at"]}'
+                    f' ע"י {_by}</span></div>',
+                    unsafe_allow_html=True,
                 )
-        with _cols[3]:
-            _removal_bytes = schedule_archive.load_archived_removal_bytes(entry["id"])
-            if _removal_bytes is not None:
-                st.download_button(
-                    "⬇️ ירידות ממשמרת", data=_removal_bytes,
-                    file_name=f"ירידות ממשמרת - {entry['date']}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True, key=f"dl_archive_removals_{entry['id']}",
+            with _cols[1]:
+                _removed_n = entry.get("removed_count", 0)
+                st.markdown(
+                    f'<div dir="rtl" style="padding-top:8px;color:rgba(var(--ink-rgb),.74);">{entry["rows"]} שורות שיבוץ'
+                    + (f' &nbsp;|&nbsp; {_removed_n} הורדות ממשמרת' if _removed_n else '')
+                    + '</div>',
+                    unsafe_allow_html=True,
                 )
-        with _cols[4]:
-            if is_super_admin():
-                if st.button("🗑️ מחק", use_container_width=True, key=f"del_archive_{entry['id']}"):
-                    st.session_state["_confirm_delete_archive_id"] = entry["id"]
-                    st.rerun()
-        # שלוש גרסאות היום — נייט / דיי / אפטר, כפי שכל משמרת בנתה אותן
-        _segs_hist = entry.get("segments") or []
-        if _segs_hist:
-            st.markdown(
-                '<div dir="rtl" style="color:#9ca3af;font-size:13px;padding:2px 0 4px;">'
-                'גרסאות המשמרות של אותו יום:</div>',
-                unsafe_allow_html=True,
-            )
-            _sc = st.columns(len(_segs_hist))
-            for _c, _sg in zip(_sc, _segs_hist):
-                with _c:
-                    _sb = schedule_archive.load_archived_segment_bytes(entry["id"], _sg.get("key", ""))
-                    if _sb is not None:
-                        st.download_button(
-                            f'⬇️ סידור {_sg.get("label", "")}'
-                            + (f'  ({_sg["range"]})' if _sg.get("range") else ""),
-                            data=_sb,
-                            file_name=f'סידור {_sg.get("label","")} - {entry["date"]}.xlsx',
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                            key=f'dl_archive_seg_{entry["id"]}_{_sg.get("key","")}',
-                        )
+            with _cols[2]:
+                _sched_bytes = schedule_archive.load_archived_schedule_bytes(entry["id"])
+                if _sched_bytes is not None:
+                    st.download_button(
+                        "⬇️ קובץ שיבוץ", data=_sched_bytes,
+                        file_name=f"דוח שיבוץ טיסות - {entry['date']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch", key=f"dl_archive_sched_{entry['id']}",
+                    )
+            with _cols[3]:
+                _removal_bytes = schedule_archive.load_archived_removal_bytes(entry["id"])
+                if _removal_bytes is not None:
+                    st.download_button(
+                        "⬇️ ירידות ממשמרת", data=_removal_bytes,
+                        file_name=f"ירידות ממשמרת - {entry['date']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch", key=f"dl_archive_removals_{entry['id']}",
+                    )
+            with _cols[4]:
+                if is_super_admin():
+                    if st.button("🗑️ מחק", width="stretch", key=f"del_archive_{entry['id']}"):
+                        st.session_state["_confirm_delete_archive_id"] = entry["id"]
+                        st.rerun()
+            # שלוש גרסאות היום — נייט / דיי / אפטר, כפי שכל משמרת בנתה אותן
+            _segs_hist = entry.get("segments") or []
+            if _segs_hist:
+                st.markdown(
+                    '<div dir="rtl" style="color:rgba(var(--ink-rgb),.74);font-size:13px;padding:2px 0 4px;text-align:right;">'
+                    'גרסאות המשמרות של אותו יום:</div>',
+                    unsafe_allow_html=True,
+                )
+                _sc = st.columns([1, 1, 1, 1])[::-1][:len(_segs_hist)]
+                for _c, _sg in zip(_sc, _segs_hist):
+                    with _c:
+                        _sb = schedule_archive.load_archived_segment_bytes(entry["id"], _sg.get("key", ""))
+                        if _sb is not None:
+                            st.download_button(
+                                f'⬇️ סידור {_sg.get("label", "")}'
+                                + (f'  ({_sg["range"]})' if _sg.get("range") else ""),
+                                data=_sb,
+                                file_name=f'סידור {_sg.get("label","")} - {entry["date"]}.xlsx',
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                width="stretch",
+                                key=f'dl_archive_seg_{entry["id"]}_{_sg.get("key","")}',
+                            )
 
-        if st.session_state.get("_confirm_delete_archive_id") == entry["id"]:
-            st.warning(f'⚠️ למחוק לצמיתות את הסידור מתאריך {entry["date"]} ({entry["archived_at"]})? לא ניתן לשחזר.')
-            _c_del_yes, _c_del_no = st.columns(2)
-            with _c_del_yes:
-                if st.button("כן, מחק לצמיתות", use_container_width=True, type="primary", key=f"del_confirm_{entry['id']}"):
-                    schedule_archive.delete_archived_schedule(entry["id"])
-                    st.session_state.pop("_confirm_delete_archive_id", None)
-                    st.rerun()
-            with _c_del_no:
-                if st.button("ביטול", use_container_width=True, key=f"del_cancel_{entry['id']}"):
-                    st.session_state.pop("_confirm_delete_archive_id", None)
-                    st.rerun()
-        st.markdown("<div style='border-bottom:1px solid rgba(255,255,255,0.08);margin:6px 0;'></div>", unsafe_allow_html=True)
+            if st.session_state.get("_confirm_delete_archive_id") == entry["id"]:
+                st.warning(f'⚠️ למחוק לצמיתות את הסידור מתאריך {entry["date"]} ({entry["archived_at"]})? לא ניתן לשחזר.')
+                _c_del_yes, _c_del_no = st.columns(2)
+                with _c_del_yes:
+                    if st.button("כן, מחק לצמיתות", width="stretch", type="primary", key=f"del_confirm_{entry['id']}"):
+                        schedule_archive.delete_archived_schedule(entry["id"])
+                        st.session_state.pop("_confirm_delete_archive_id", None)
+                        st.rerun()
+                with _c_del_no:
+                    if st.button("ביטול", width="stretch", key=f"del_cancel_{entry['id']}"):
+                        st.session_state.pop("_confirm_delete_archive_id", None)
+                        st.rerun()
 
 
 if "schedule_df" not in st.session_state:
@@ -3588,12 +4249,13 @@ if "schedule_df" not in st.session_state:
         st.session_state["active_main_tab"] = TAB_DASHBOARD
     active_main_tab = st.session_state["active_main_tab"]
 
-    _nav_cols_pre = st.columns(len(_pre_tab_labels))
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)  # separate the tab bar from the build buttons above
+    _nav_cols_pre = st.container(key="nav_bar_pre").columns(len(_pre_tab_labels))
     for _ci, (_tk, _tlabel) in enumerate(reversed(list(_pre_tab_labels.items()))):
         with _nav_cols_pre[_ci]:
             _is_active = (active_main_tab == _tk)
             if st.button(
-                _tlabel, use_container_width=True, key=f"nav_tab_pre_{_tk}",
+                _tlabel, width="stretch", key=f"nav_tab_pre_{_tk}",
                 type="primary" if _is_active else "secondary",
             ):
                 st.session_state["active_main_tab"] = _tk
@@ -3614,7 +4276,7 @@ if "schedule_df" not in st.session_state:
         _render_archive_tab()
     else:
         st.markdown(
-            "<h3 style='text-align:right;border-bottom:2px solid rgba(255,255,255,0.15);"
+            "<h3 style='text-align:right;border-bottom:2px solid rgba(var(--ink-rgb),0.15);"
             "padding-bottom:8px;margin-bottom:16px;'>⏱️ מרכז בקרה</h3>",
             unsafe_allow_html=True,
         )
@@ -3625,39 +4287,17 @@ if "schedule_df" not in st.session_state:
 if "schedule_df" in st.session_state:
     if "build_seconds" in st.session_state:
         st.markdown(
-            f"""
-            <div style="
-                background:#0f3d2e;
-                color:white;
-                padding:14px;
-                border-radius:12px;
-                text-align:center;
-                font-size:18px;
-                font-weight:600;
-                margin-bottom:15px;
-            ">
-                ⏱️ זמן הפקת הסידור: {st.session_state['build_seconds']} שניות 🎉
-            </div>
-            """,
+            f'<div class="banner banner-ok">⏱️ זמן הפקת הסידור: {st.session_state["build_seconds"]} שניות 🎉</div>',
+            unsafe_allow_html=True,
+        )
+    if st.session_state.get("schedule_terminal_label"):
+        st.markdown(
+            f'<div class="banner banner-info">🛫 סידור מוצג ל{st.session_state["schedule_terminal_label"]}</div>',
             unsafe_allow_html=True,
         )
     if st.session_state.get("schedule_hours_label"):
         st.markdown(
-            f"""
-            <div style="
-                background:#1e3a5f;
-                color:white;
-                padding:12px;
-                border-radius:12px;
-                text-align:center;
-                font-size:17px;
-                font-weight:600;
-                margin-bottom:15px;
-                direction:rtl;
-            ">
-                🕐 סידור מוצג לשעות <span dir="ltr" style="unicode-bidi:isolate;">{st.session_state['schedule_hours_label']}</span>
-            </div>
-            """,
+            f'<div class="banner banner-info">🕐 סידור מוצג לשעות <span dir="ltr" style="unicode-bidi:isolate;">{st.session_state["schedule_hours_label"]}</span></div>',
             unsafe_allow_html=True,
         )
     live_schedule = st.session_state["schedule_df"]
@@ -3976,13 +4616,14 @@ if "schedule_df" in st.session_state:
         st.session_state["active_main_tab"] = TAB_SCHEDULE
     active_main_tab = st.session_state["active_main_tab"]
 
-    _nav_cols = st.columns(len(TAB_LABELS))
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)  # separate the tab bar from the build buttons above
+    _nav_cols = st.container(key="nav_bar").columns(len(TAB_LABELS))
     for _ci, (_tk, _tlabel) in enumerate(reversed(list(TAB_LABELS.items()))):
         with _nav_cols[_ci]:
             _is_active = (active_main_tab == _tk)
             if st.button(
                 _tlabel,
-                use_container_width=True,
+                width="stretch",
                 key=f"nav_tab_{_tk}",
                 type="primary" if _is_active else "secondary",
             ):
@@ -3994,12 +4635,12 @@ if "schedule_df" in st.session_state:
     st.markdown(
         """<style>
         [data-testid="stExpander"] {
-            background: rgba(255,255,255,0.04) !important;
-            border: 1px solid rgba(255,255,255,0.1) !important;
+            background: rgba(var(--ink-rgb),0.04) !important;
+            border: 1px solid rgba(var(--ink-rgb),0.1) !important;
             border-radius: 10px !important;
         }
         [data-testid="stExpander"] summary {
-            color: rgba(255,255,255,0.85) !important;
+            color: rgba(var(--ink-rgb),0.85) !important;
             font-weight: 600 !important;
             direction: rtl !important;
         }
@@ -4024,7 +4665,7 @@ if "schedule_df" in st.session_state:
 
     if active_main_tab == TAB_DASHBOARD:
         st.markdown(
-            "<h3 style='text-align:right;border-bottom:2px solid rgba(255,255,255,0.15);padding-bottom:8px;margin-bottom:16px;'>⏱️ מרכז בקרה</h3>",
+            "<h3 style='text-align:right;border-bottom:2px solid rgba(var(--ink-rgb),0.15);padding-bottom:8px;margin-bottom:16px;'>⏱️ מרכז בקרה</h3>",
             unsafe_allow_html=True,
         )
 
@@ -4036,8 +4677,7 @@ if "schedule_df" in st.session_state:
         if _ar_preview_outer is not None:
             _ar_changes_outer = st.session_state.get("_ar_changes", {})
             st.markdown(
-                '<div style="background:#fffbe6;border:2px solid #f5a623;border-radius:12px;'
-                'padding:16px 18px;margin:10px 0 12px 0;direction:rtl;">',
+                '<div style="border-top:2px solid rgba(var(--acc-rgb),.55);margin:14px 0 6px;"></div>',
                 unsafe_allow_html=True,
             )
             st.markdown("### 🤖 הצעת שיבוץ אוטומטי — ממתינה לאישור")
@@ -4053,14 +4693,14 @@ if "schedule_df" in st.session_state:
                         "עובד ישן": _old_label,
                         "עובד חדש ✨": _new_label,
                     })
-                st.dataframe(pd.DataFrame(_rows_outer), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_rows_outer), width="stretch", hide_index=True)
             else:
                 st.info("לא נמצאו שינויים — כל הטיסות כבר מכוסות.")
             st.markdown("</div>", unsafe_allow_html=True)
 
             _ob1, _ob2, _ob3 = st.columns(3)
             with _ob1:
-                if st.button("✅ אישור — אמץ שיבוץ", use_container_width=True, type="primary", key="ar_confirm"):
+                if st.button("✅ אישור — אמץ שיבוץ", width="stretch", type="primary", key="ar_confirm"):
                     _highlighted = set(st.session_state["_ar_changes"].keys())
                     st.session_state["schedule_df"] = st.session_state["_ar_preview"]
                     st.session_state["employees_snap"] = employees_df.copy()
@@ -4070,7 +4710,7 @@ if "schedule_df" in st.session_state:
                         st.session_state.pop(_k, None)
                     st.rerun()
             with _ob2:
-                if st.button("🔄 נסה שוב — עובד אחר", use_container_width=True, key="ar_retry"):
+                if st.button("🔄 נסה שוב — עובד אחר", width="stretch", key="ar_retry"):
                     _excl = {k: set(v) for k, v in st.session_state.get("_ar_excluded", {}).items()}
                     for _idx, _ch in _ar_changes_outer.items():
                         if "❌" not in _ch["new"]:
@@ -4081,7 +4721,7 @@ if "schedule_df" in st.session_state:
                         st.session_state.pop(_k, None)
                     st.rerun()
             with _ob3:
-                if st.button("✕ ביטול", use_container_width=True, key="ar_cancel"):
+                if st.button("✕ ביטול", width="stretch", key="ar_cancel"):
                     for _k in ["_ar_preview", "_ar_changes", "_ar_excluded"]:
                         st.session_state.pop(_k, None)
                     st.rerun()
@@ -4129,24 +4769,25 @@ if "schedule_df" in st.session_state:
 
         _removed_count = len(st.session_state.get("removed_employees", {}))
 
-        c1, c2, c3 = st.columns(3)
+        st.markdown('<div class="sec-title">🟢 עכשיו במשמרת</div>', unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)[::-1]  # Hebrew: first item on the right
         c1.metric("☕ בהפסקה", _on_break_now)
         c2.metric("🚫 הורדו ממשמרת", _removed_count)
-        c3.metric("🚪 כרגע באולם", _in_lounge_count)
+        c3.metric("🛂 כרגע באולם", _in_lounge_count)
 
         st.markdown(
-            "<h4 style='text-align:right;border-bottom:2px solid rgba(255,255,255,0.15);padding-bottom:8px;margin:24px 0 16px;'>👥 סיווג עובדים לשיבוץ</h4>",
+            '<div class="sec-title">👥 סיווג עובדים לשיבוץ</div>',
             unsafe_allow_html=True,
         )
 
-        e1, e2, e3, e4, e5, e6 = st.columns(6)
+        e1, e2, e3, e4, e5, e6 = st.columns(6)[::-1]
         e1.metric("פעילים לשיבוץ", active_schedulable_count)
         e2.metric("בידוק חוליה", hulya_count)
 
         with e3:
             st.metric("מתדרכות גיבוי ר״צ", trainer_backup_count)
             if trainer_backup_count:
-                with st.popover("👁 רשימה", use_container_width=True):
+                with st.popover("👁 רשימה", width="stretch"):
                     st.markdown("**מתדרכות גיבוי ר״צ:**")
                     for _n in sorted(_trainer_names):
                         st.markdown(f"• {_n}")
@@ -4154,7 +4795,7 @@ if "schedule_df" in st.session_state:
         with e4:
             st.metric('מנהלים כר"צ', mgr_backup_rz_count)
             if mgr_backup_rz_count:
-                with st.popover("👁 רשימה", use_container_width=True):
+                with st.popover("👁 רשימה", width="stretch"):
                     st.markdown('**מנהלים לתגבור ר"צ:**')
                     for _n in sorted(_mgr_names):
                         st.markdown(f"• {_n}")
@@ -4164,12 +4805,12 @@ if "schedule_df" in st.session_state:
         with e6:
             st.metric("לא נספרים", excluded_count)
             if excluded_count:
-                with st.popover("👁 רשימה", use_container_width=True):
+                with st.popover("👁 רשימה", width="stretch"):
                     st.markdown("**לא נספרים בשיבוץ:**")
                     for _n in _excluded_names:
                         st.markdown(f"• {_n}")
 
-        st.markdown("<hr><h4 style='text-align:right'>📊 ניתוח פיקים</h4>", unsafe_allow_html=True)
+        st.markdown('<div class="sec-title">📊 ניתוח פיקים</div>', unsafe_allow_html=True)
         _peak_data = build_peak_analysis(live_flights)
         render_peak_analysis(_peak_data)
 
@@ -4228,35 +4869,23 @@ if "schedule_df" in st.session_state:
         if publish_state.is_published(st.session_state.get("_build_id")):
             _pub_at = publish_state.get_published_at() or ""
             st.markdown(
-                f'<div style="direction:rtl;background:#0f3d2e;border:1px solid #1c6b4a;'
-                f'border-radius:10px;padding:10px 16px;margin-bottom:10px;text-align:center;'
-                f'font-weight:700;color:#7ee8b8;">✅ הסידור מפורסם ועדכני — עובדים רואים אותו'
+                f'<div class="banner banner-ok">✅ הסידור מפורסם ועדכני — עובדים רואים אותו'
                 f' (שוגר ב-{_pub_at})</div>',
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(
-                '<div style="direction:rtl;background:#3d2e0f;border:1px solid #6b5a1c;'
-                'border-radius:10px;padding:10px 16px;margin-bottom:10px;text-align:center;'
-                'font-weight:700;color:#f0d27e;">⚠️ הסידור עדיין בטיוטה — לא הופץ לעובדים.'
+                '<div class="banner banner-warn">⚠️ הסידור עדיין בטיוטה — לא הופץ לעובדים.'
                 ' לחצו על "שגר סידור" בתחתית העמוד כדי לפרסם אותו.</div>',
                 unsafe_allow_html=True,
             )
         st.markdown(
             '<div style="text-align:right;direction:rtl;font-weight:700;'
-            'font-size:14px;color:#aaa;padding:2px 0 0 0;">🔎 חיפוש לפי טיסה / יעד / עובד</div>',
+            'font-size:14px;color:rgba(var(--ink-rgb),.74);padding:2px 0 0 0;">🔎 חיפוש לפי טיסה / יעד / עובד</div>',
             unsafe_allow_html=True,
         )
         search = st.text_input("חיפוש", label_visibility="collapsed")
-        _txt_col, _chk_col = st.columns([20, 1])
-        with _txt_col:
-            st.markdown(
-                '<div style="text-align:right;direction:rtl;font-size:14px;font-weight:700;'
-                'color:#aaa;padding-top:6px;">הצג רק טיסות עם חוסר</div>',
-                unsafe_allow_html=True,
-            )
-        with _chk_col:
-            only_missing = st.checkbox("", key="only_missing_chk", label_visibility="collapsed")
+        only_missing = st.toggle("הצג רק טיסות עם חוסר", key="only_missing_chk")
         # ── מסנן טרמינל — הפרדה ברורה בין סידור T3 לסידור T1 ─────────────────
         if "טרמינל" in display_df.columns and (display_df["טרמינל"] == "1").any():
             _term_view = st.radio(
@@ -4280,12 +4909,12 @@ if "schedule_df" in st.session_state:
             _is_past = _shown_seg != _cur_seg
             st.markdown(
                 '<div dir="rtl" style="text-align:center;font-size:22px;font-weight:800;'
-                f'padding:14px 0 4px;color:{"#f0d27e" if _is_past else "inherit"};">'
+                f'padding:14px 0 4px;color:{"var(--acc-strong)" if _is_past else "inherit"};">'
                 f'{_shown["icon"]} סידור משמרת {_shown["label"]}'
                 + (' <span style="font-size:14px;font-weight:600;">(סידור קודם — לצפייה בלבד)</span>'
                    if _is_past else '')
                 + '</div>'
-                f'<div dir="rtl" style="text-align:center;font-size:13px;color:#888;'
+                f'<div dir="rtl" style="text-align:center;font-size:13px;color:rgba(var(--ink-rgb),.74);'
                 f'padding-bottom:10px;">{_shown["range"]}</div>',
                 unsafe_allow_html=True,
             )
@@ -4297,14 +4926,14 @@ if "schedule_df" in st.session_state:
                 for _bc, _pk in zip(_btn_cols, _prev_keys):
                     with _bc:
                         if st.button(f'סידור {_snaps_ui[_pk]["label"]}',
-                                     key=f"view_seg_{_pk}", use_container_width=True,
+                                     key=f"view_seg_{_pk}", width="stretch",
                                      disabled=(_shown_seg == _pk)):
                             st.session_state["_view_segment"] = _pk
                             st.rerun()
                 if _is_past:
                     with _btn_cols[-1]:
                         if st.button(f'↩ חזרה לסידור {_snaps_ui[_cur_seg]["label"]}',
-                                     key="view_seg_back", use_container_width=True,
+                                     key="view_seg_back", width="stretch",
                                      type="primary"):
                             st.session_state.pop("_view_segment", None)
                             st.rerun()
@@ -4369,8 +4998,8 @@ if "schedule_df" in st.session_state:
             if _cur_crossing and not _gap_sep_shown:
                 st.markdown(
                     '<div dir="rtl" style="text-align:center;padding:10px 0;margin:8px 0;'
-                    'border-top:2px dashed #666;border-bottom:2px dashed #666;'
-                    'color:#888;font-size:13px;letter-spacing:1px;">'
+                    'border-top:2px dashed rgba(var(--ink-rgb),.3);border-bottom:2px dashed rgba(var(--ink-rgb),.3);'
+                    'color:rgba(var(--ink-rgb),.74);font-size:13px;letter-spacing:1px;">'
                     '🌙 טיסות לילה — פעילות מתחילה לפני חצות</div>',
                     unsafe_allow_html=True,
                 )
@@ -4516,7 +5145,7 @@ if "schedule_df" in st.session_state:
                                         unsafe_allow_html=True)
                             if st.button("✅ עדכן שער ובנה מחדש",
                                          key=f"apply_gate_{_fnum}",
-                                         use_container_width=True):
+                                         width="stretch"):
                                 _g_in = clean_text(st.session_state.get(_gk, "")).upper()
                                 if not _g_in:
                                     st.warning("יש להזין ערך שער תקין.")
@@ -4551,7 +5180,7 @@ if "schedule_df" in st.session_state:
                         if _diag_data:
                             st.dataframe(
                                 pd.DataFrame(_diag_data),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
 
@@ -4587,14 +5216,14 @@ if "schedule_df" in st.session_state:
                                     st.markdown(
                                         f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
                                         f"<b>{safe_html(_ft['name'])}</b> "
-                                        f"<span style='color:#888;'>— {safe_html(_ft['reason'])}</span></div>",
+                                        f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_ft['reason'])}</span></div>",
                                         unsafe_allow_html=True,
                                     )
                                 with _fc2:
                                     if st.button(
                                         "הכרח שיבוץ",
                                         key=f"force_{_fnum}_{_missing_role}_{_ft['name']}",
-                                        use_container_width=True,
+                                        width="stretch",
                                     ):
                                         st.session_state["schedule_df"] = force_assign_worker(
                                             _sched_diag, _fslot_idx[0], _ft["name"], _diag_emps_df,
@@ -4617,7 +5246,7 @@ if "schedule_df" in st.session_state:
                                     if st.button(
                                         "שבץ במקום",
                                         key=f"move_{_fnum}_{_missing_role}_{_ft['name']}",
-                                        use_container_width=True,
+                                        width="stretch",
                                     ):
                                         st.session_state["schedule_df"] = force_assign_worker(
                                             _sched_diag, _fslot_idx[0], _ft["name"], _diag_emps_df,
@@ -4660,14 +5289,14 @@ if "schedule_df" in st.session_state:
                                         st.markdown(
                                             f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
                                             f"<b>{safe_html(_tt['name'])}</b> "
-                                            f"<span style='color:#888;'>— {safe_html(_tt['reason'])}</span></div>",
+                                            f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_tt['reason'])}</span></div>",
                                             unsafe_allow_html=True,
                                         )
                                     with _tc2:
                                         if st.button(
                                             "הכרח שיבוץ",
                                             key=f"force_term_{_fnum}_{_missing_role}_{_tt['name']}",
-                                            use_container_width=True,
+                                            width="stretch",
                                         ):
                                             st.session_state["schedule_df"] = force_assign_worker(
                                                 _sched_diag, _fslot_idx[0], _tt["name"], _diag_emps_df,
@@ -4726,14 +5355,14 @@ if "schedule_df" in st.session_state:
                                         st.markdown(
                                             f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
                                             f"<b>{safe_html(_st_t['name'])}</b> "
-                                            f"<span style='color:#888;'>— {safe_html(_st_t['reason'])}</span></div>",
+                                            f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_st_t['reason'])}</span></div>",
                                             unsafe_allow_html=True,
                                         )
                                     with _sc2:
                                         if st.button(
                                             "הכרח שיבוץ",
                                             key=f"force_shortshift_{_fnum}_{_missing_role}_{_st_t['name']}",
-                                            use_container_width=True,
+                                            width="stretch",
                                         ):
                                             st.session_state["schedule_df"] = force_assign_worker(
                                                 _sched_diag, _fslot_idx[0], _st_t["name"], _diag_emps_df,
@@ -4799,7 +5428,7 @@ if "schedule_df" in st.session_state:
                                 if st.button(
                                     "שבץ בכפוף לאישור",
                                     key=f"nm_assign_{_fnum}_{_missing_role}",
-                                    use_container_width=True,
+                                    width="stretch",
                                 ):
                                     _nm_choice = _near_miss[_nm_labels.index(_nm_choice_label)][0]
                                     if len(_slot_idx_nm):
@@ -4819,7 +5448,10 @@ if "schedule_df" in st.session_state:
 
         # ── Tab: פנויים באולם ─────────────────────────────────────────────────
     if active_main_tab == TAB_AVAILABLE:
-        st.subheader("🟡 עובדים פנויים באולם היציאה")
+        st.markdown(
+            "<h3 style='text-align:right;border-bottom:2px solid rgba(var(--ink-rgb),0.15);padding-bottom:8px;margin-bottom:16px;'>🟡 עובדים פנויים באולם היציאה</h3>",
+            unsafe_allow_html=True,
+        )
         available_df = build_available_in_hall(
             live_schedule, live_employees, live_flights
         )
@@ -4828,15 +5460,15 @@ if "schedule_df" in st.session_state:
         else:
             total_free = available_df["עובד"].nunique()
             long_gaps = available_df[available_df["פנות (דק׳)"] >= 60]["עובד"].nunique()
-            sc1, sc2 = st.columns(2)
+            sc1, sc2 = st.columns(2)[::-1]  # first item on the right
             sc1.metric("עובדים פנויים באולם", total_free)
             sc2.metric("מתוכם פנויים שעה+", long_gaps)
-            st.markdown("---")
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
             roles = ["הכל"] + sorted(
                 available_df["תפקיד עיקרי"].dropna().unique().tolist()
             )
             selected_role = st.selectbox(
-                "סנן לפי תפקיד:", roles, key="avail_role_filter"
+                "סינון לפי תפקיד", roles, key="avail_role_filter"
             )
             filtered = (
                 available_df
@@ -4844,17 +5476,73 @@ if "schedule_df" in st.session_state:
                 else available_df[available_df["תפקיד עיקרי"] == selected_role]
             )
             for _, r in filtered.iterrows():
-                gap_color = "#fff3cd" if r["פנות (דק׳)"] < 60 else "#d4edda"
-                gap_border = "#ffc107" if r["פנות (דק׳)"] < 60 else "#28a745"
+                # short gap (between flights) = lavender, long / free-till-end = blue (the old
+                # yellow-vs-green pair was hard to tell apart with colour blindness; the text
+                # under each card also states which kind it is)
+                _short_gap = r["פנות (דק׳)"] < 60
+                gap_color = "rgba(var(--r-tl),.16)" if _short_gap else "rgba(var(--r-guard),.16)"
+                gap_border = "rgb(var(--r-tl))" if _short_gap else "rgb(var(--r-guard))"
                 st.markdown(
                     f'<div style="direction:rtl;background:{gap_color};border-right:5px solid {gap_border};'
                     f'border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:14px;">'
                     f'<strong>{safe_html(r["עובד"])}</strong> · {safe_html(r["תפקיד עיקרי"])} · משמרת: {safe_html(r["משמרת"])}<br>'
                     f'🕒 פנוי: <strong>{safe_html(r["פנוי מ"])} – {safe_html(r["פנוי עד"])}</strong>'
                     f' ({r["פנות (דק׳)"]} דק׳) · הבא: {safe_html(r["משימה הבאה"])}<br>'
-                    f'<span style="color:#555;font-size:12px">{safe_html(r["הערה"])}</span></div>',
+                    f'<span style="color:rgba(var(--ink-rgb),.8);font-size:12px">{safe_html(r["הערה"])}</span></div>',
                     unsafe_allow_html=True,
                 )
+
+    ## — Tab: ציר זמן ────────────────────────────────────────────────────────
+    if active_main_tab == TAB_TIMELINE:
+        @st.fragment
+        def _render_timeline_tab():
+            from app.timeline import timeline_html, role_options, build_tasks, axis_bounds
+            st.markdown(
+                "<h3 style='text-align:right;border-bottom:2px solid rgba(var(--ink-rgb),0.15);"
+                "padding-bottom:8px;margin-bottom:16px;'>📈 ציר זמן</h3>",
+                unsafe_allow_html=True,
+            )
+            _tl_src = live_schedule
+            _tl_roles = role_options(_tl_src)
+            _tl_c_role, _tl_c_sort, _tl_c_gap, _tl_c_q = st.columns([2, 2, 2, 2])[::-1]
+            with _tl_c_gap:
+                _tl_gap_lbl = st.selectbox("הדגשת חלונות פנויים", ["כבוי", "30+ דקות", "60+ דקות", "90+ דקות"],
+                                           index=2, key="tl_gap")
+            with _tl_c_sort:
+                _tl_sort_lbl = st.selectbox("מיון", ["לפי שעת התחלה", "לפי שם", "לפי עומס", "לפי תפקיד (מקובצים)"], key="tl_sort")
+            with _tl_c_q:
+                _tl_q = st.text_input("חיפוש עובד", key="tl_query", placeholder="שם עובד…")
+            with _tl_c_role:
+                _tl_role = st.selectbox("תפקיד", ["הכל"] + _tl_roles, key="tl_role")
+            _tl_view = None
+            _tl_b = axis_bounds(_tl_src)
+            if _tl_b:
+                _tl_hours = list(range(_tl_b[0], _tl_b[1] + 1, 60))
+                _tl_fmt = lambda m: f"{(m // 60) % 24:02d}:00"
+                _tl_c_sp, _tl_c_to, _tl_c_from = st.columns([4, 2, 2])  # RTL reading: from (right) then to
+                with _tl_c_from:
+                    _tl_from = st.selectbox("מתחילת שעה", _tl_hours, format_func=_tl_fmt, index=0, key="tl_from")
+                with _tl_c_to:
+                    _tl_to = st.selectbox("עד שעה", _tl_hours, format_func=_tl_fmt, index=len(_tl_hours) - 1, key="tl_to")
+                if (_tl_from, _tl_to) != (_tl_hours[0], _tl_hours[-1]) and _tl_to > _tl_from:
+                    _tl_view = (_tl_from, _tl_to)
+            _tl_now = app_now()
+            _tl_html = timeline_html(
+                _tl_src, role=None if _tl_role == "הכל" else _tl_role,
+                query=_tl_q, now_min=_tl_now.hour * 60 + _tl_now.minute,
+                employees=st.session_state.get("employees_snap"),
+                sort={"לפי שעת התחלה": "start", "לפי שם": "name", "לפי עומס": "load",
+                      "לפי תפקיד (מקובצים)": "role"}[_tl_sort_lbl],
+                gap_min={"כבוי": 0, "30+ דקות": 30, "60+ דקות": 60, "90+ דקות": 90}[_tl_gap_lbl],
+                view=_tl_view,
+            )
+            if _tl_html:
+                st.markdown(_tl_html, unsafe_allow_html=True)
+                st.markdown('<div class="tl-help">' + "העבירי עכבר מעל משימה לפרטים, לחיצה עליה פותחת את כרטיס הטיסה · הרקע הבהיר בשורה = שעות המשמרת · המספר ליד השם = כמות המשימות · הקו המקווקו = עכשיו" + '</div>', unsafe_allow_html=True)
+            else:
+                st.info("אין משימות משובצות להצגה בסינון הזה.")
+
+        _render_timeline_tab()
 
     ## — Tab: זרימת עבודה ─────────────────────────────────────────────────────
     if active_main_tab == TAB_WORKFLOW:
@@ -4870,7 +5558,7 @@ if "schedule_df" in st.session_state:
                 _wf_labeled = st.session_state.get("labeled_df", pd.DataFrame())
                 _wf_emps    = st.session_state.get("employees_snap", pd.DataFrame())
 
-                st.markdown("<h3 style='text-align:right'>📋 זרימת עבודה לפי עובד</h3>",
+                st.markdown("<h3 style='text-align:right'>📑 זרימת עבודה לפי עובד</h3>",
                             unsafe_allow_html=True)
 
                 # Hover tooltip for (ט) trainee-attendant name tags — shows which
@@ -4879,11 +5567,11 @@ if "schedule_df" in st.session_state:
                 st.markdown(
                     '<style>'
                     '.wf-trainee-tag{position:relative;cursor:help;'
-                    'border-bottom:1px dotted #888;}'
+                    'border-bottom:1px dotted rgba(var(--ink-rgb),.5);}'
                     '.wf-trainee-tag .wf-tooltip-box{visibility:hidden;opacity:0;'
                     'transition:opacity .15s;position:absolute;z-index:50;'
-                    'bottom:125%;right:0;background:#1e293b;color:#e0e0e0;'
-                    'border:1px solid #00c9be;border-radius:8px;padding:6px 10px;'
+                    'bottom:125%;right:0;background:var(--card);color:var(--ink);'
+                    'border:1px solid rgb(var(--acc-rgb));border-radius:8px;padding:6px 10px;'
                     'font-size:12px;white-space:nowrap;'
                     'box-shadow:0 4px 12px rgba(0,0,0,.4);}'
                     '.wf-trainee-tag:hover .wf-tooltip-box{visibility:visible;opacity:1;}'
@@ -4927,7 +5615,7 @@ if "schedule_df" in st.session_state:
                     st.button("נקה", key="wf_clear_search",
                               help="נקה חיפוש — הצג את כל העובדים",
                               on_click=lambda: st.session_state.update({"wf_search": ""}),
-                              use_container_width=True)
+                              width="stretch")
                     st.markdown("</div>", unsafe_allow_html=True)
 
                 # ── סינון לפי תפקיד ──────────────────────────────────────────
@@ -4952,7 +5640,7 @@ if "schedule_df" in st.session_state:
                     st.button("נקה סינון", key="wf_clear_role_filter",
                               help="הצג את כלל העובדים",
                               on_click=lambda: st.session_state.update({"wf_role_filter": "הכל"}),
-                              use_container_width=True)
+                              width="stretch")
 
                 # שמות העובדים העומדים בסינון התפקיד הנבחר (לפי עמודת ההסמכה)
                 _wf_role_names = None
@@ -5027,7 +5715,7 @@ if "schedule_df" in st.session_state:
                 _wf_term_names = None
                 if _wf_t1_names:
                     _wf_term_choice = st.radio(
-                        "תצוגת טרמינל — זרימת עבודה",
+                        "תצוגת טרמינל",
                         ["הכל", "טרמינל 3", "טרמינל 1"],
                         horizontal=True,
                         key="wf_term_filter",
@@ -5037,8 +5725,8 @@ if "schedule_df" in st.session_state:
                         _wf_term_names = _wf_t1_names
                         st.markdown(
                             '<div style="direction:rtl;text-align:right;font-weight:800;'
-                            'color:#e8930c;font-size:15px;padding:2px 0 6px;">'
-                            '🛄 זרימת עבודה — טרמינל 1</div>',
+                            'color:rgb(var(--t1-rgb));font-size:15px;padding:2px 0 6px;">'
+                            '🧳 זרימת עבודה — טרמינל 1</div>',
                             unsafe_allow_html=True,
                         )
                     elif _wf_term_choice == "טרמינל 3":
@@ -5335,30 +6023,36 @@ if "schedule_df" in st.session_state:
                 <style>
                 .wf-chips { display:flex; align-items:center; gap:5px; flex-wrap:wrap;
                             direction:rtl; justify-content:flex-start; padding:2px 0; }
-                .wf-sep   { color:#444; font-size:13px; flex-shrink:0; }
+                /* chip families follow the theme's pastel role colours
+                   (grey + pastel, colour-blind-safe — no green/red pair) */
+                .wf-sep   { color:rgba(var(--ink-rgb),.74); font-size:13px; flex-shrink:0; }
                 .wf-chip  { position:relative; border-radius:7px; padding:4px 10px;
                             font-size:12px; line-height:1.5; white-space:nowrap;
                             flex-shrink:0; direction:rtl; text-align:right; }
                 .wf-time  { direction:ltr; display:inline-block; font-size:10px;
-                            color:#aaa; unicode-bidi:embed; }
-                .wf-flight   { background:#0d2340; border:1px solid #1a4a80; color:#7bb8f5; }
-                .wf-flight.wf-t1 { background:#3a2405; border:1px solid #e8930c; color:#f5b942; }
-                .wf-t1-tag   { font-size:9px; font-weight:800; color:#e8930c; margin-left:3px; }
-                .wf-break    { background:#2a1a00; border:1px solid #7a4500; color:#f5a623; }
-                .wf-gate     { background:#0a1f2a; border:1px solid #0e5a7a; color:#4ac8f5; }
-                .wf-hall     { background:#2a1f0a; border:1px solid #8a6a1a; color:#e8c05a; }
-                .wf-refresh  { background:#1a0a2a; border:1px solid #5a2a8a; color:#c084fc; }
-                .wf-counters { background:#1a1a00; border:1px solid #5a5a00; color:#d4d44a; }
-                .wf-end      { background:#0a1f0a; border:1px solid #1a5a1a; color:#6ee77a; }
-                .wf-late     { background:#2a0a0a; border:1px solid #8a2a2a; color:#f56a6a; }
-                .wf-single   { font-size:14px; color:#f59e42; flex-shrink:0; }
+                            color:rgba(var(--ink-rgb),.74); unicode-bidi:embed; }
+                .wf-flight   { background:rgba(var(--r-guard),.14); border:1px solid rgba(var(--r-guard),.55); color:var(--r-guard-ink); }
+                .wf-flight.wf-t1 { background:rgba(var(--t1-rgb),.14); border:1px solid rgb(var(--t1-rgb)); color:var(--ink); }
+                .wf-t1-tag   { font-size:9px; font-weight:800; color:rgb(var(--t1-rgb)); margin-left:3px; }
+                .wf-break    { background:rgba(var(--r-tl),.16); border:1px solid rgba(var(--r-tl),.6); color:var(--r-tl-ink); }
+                .wf-gate     { background:rgba(var(--r-train),.14); border:1px solid rgba(var(--r-train),.55); color:var(--r-train-ink); }
+                .wf-hall     { background:rgba(var(--ink-rgb),.06); border:1px solid rgba(var(--ink-rgb),.35); color:var(--ink); }
+                /* charcoal: warm chips get neutral glass (yellow/orange at low alpha reads brown) */
+                html[data-ischedule-base="dark"] .wf-flight.wf-t1, html[data-ischedule-base="dark"] .wf-break,
+                html[data-ischedule-base="dark"] .wf-hall { background:rgba(var(--ink-rgb),.07); }
+                .wf-refresh  { background:rgba(var(--r-agent),.16); border:1px solid rgba(var(--r-agent),.55); color:var(--ink); }
+                .wf-counters { background:rgba(var(--r-agent),.14); border:1px solid rgba(var(--r-agent),.55); color:var(--ink); }
+                .wf-end      { background:var(--card); border:1px solid rgba(var(--ink-rgb),.35); color:var(--ink); }
+                .wf-late     { background:repeating-linear-gradient(135deg,rgba(var(--r-insp),.22) 0 6px,rgba(var(--r-insp),.08) 6px 12px);
+                               border:1px dashed rgb(var(--r-insp)); color:var(--r-insp-ink); }
+                .wf-single   { font-size:14px; color:rgb(var(--t1-rgb)); flex-shrink:0; }
                 .wf-badge { position:absolute; top:-7px; right:-7px;
                             border-radius:10px; font-size:9px; font-weight:bold;
                             min-width:16px; height:16px; padding:0 3px;
                             display:inline-flex; align-items:center;
                             justify-content:center; z-index:10; line-height:1; }
-                .wf-b1 { background:#f59e0b; color:#000; }
-                .wf-b2 { background:#22c55e; color:#000; }
+                .wf-b1 { background:rgb(var(--r-tl)); color:#fff; }
+                .wf-b2 { background:rgb(var(--r-guard)); color:var(--ink); }
                 div[data-testid="column"]:first-child button,
                 div[data-testid="column"]:nth-child(2) button {
                     font-size:13px; font-weight:bold; padding:6px 4px;
@@ -6189,8 +6883,8 @@ if "schedule_df" in st.session_state:
                     with _c_name:
                         st.markdown(
                             f'<div style="text-align:right;font-weight:bold;font-size:16px;'
-                            f'color:#e0e0e0;line-height:1.5">{_emp_name_html}</div>'
-                            + (f'<div style="text-align:right;font-size:13px;color:#aaa;'
+                            f'color:var(--ink);line-height:1.5">{_emp_name_html}</div>'
+                            + (f'<div style="text-align:right;font-size:13px;color:rgba(var(--ink-rgb),.74);'
                                f'direction:ltr;unicode-bidi:embed">{safe_html(_shift_str)}</div>'
                                if _shift_str else ""),
                             unsafe_allow_html=True,
@@ -6220,16 +6914,16 @@ if "schedule_df" in st.session_state:
                             st.button("○", key=f"wf_brief_{_row_id}",
                                       help=f"סמן בריפינג — {_emp_name} קיבל/ה משימות",
                                       on_click=_cb_brief,
-                                      use_container_width=True)
+                                      width="stretch")
                         elif _bstate == 1:
                             st.button("✓✓", key=f"wf_send_{_row_id}",
                                       help=f"שלח לאולם — {_emp_name} יורד/ת לשער",
                                       type="primary",
                                       on_click=_cb_send,
-                                      use_container_width=True)
+                                      width="stretch")
                         else:
                             st.markdown(
-                                '<div style="text-align:center;color:#22c55e;'
+                                '<div style="text-align:center;color:var(--acc-strong);'
                                 'font-size:18px;font-weight:bold;padding-top:4px">✓✓</div>',
                                 unsafe_allow_html=True,
                             )
@@ -6238,14 +6932,14 @@ if "schedule_df" in st.session_state:
                             st.button("בטל 1/2", key=f"wf_cancel1_{_row_id}",
                                       help="בטל בריפינג — חזור למצב ראשוני",
                                       on_click=_cb_cancel1,
-                                      use_container_width=True)
+                                      width="stretch")
                         elif _bstate == 2:
                             st.button("בטל 2/2", key=f"wf_cancel2_{_row_id}",
                                       help="בטל הורדה — חזור למצב בריפינג",
                                       on_click=_cb_cancel2,
-                                      use_container_width=True)
+                                      width="stretch")
 
-                    st.markdown('<hr style="margin:2px 0;border-color:#1e1e1e">',
+                    st.markdown('<hr style="margin:2px 0;border-color:rgba(var(--ink-rgb),.12)">',
                                 unsafe_allow_html=True)
 
                 if not _wf_groups:
@@ -6404,7 +7098,7 @@ if "schedule_df" in st.session_state:
                         else:
                             debug_rows.append({"שם משתנה": name, "מצב": "לא קיים", "שורות": ""})
 
-                    st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(debug_rows), width="stretch", hide_index=True)
                     
                     def clear_unassigned_search():
                         st.session_state["unassigned_search"] = ""
@@ -6423,7 +7117,7 @@ if "schedule_df" in st.session_state:
                         st.button(
                             "נקה חיפוש",
                             key="clear_unassigned_search",
-                            use_container_width=True,
+                            width="stretch",
                             on_click=clear_unassigned_search,
                         )
 
@@ -6478,7 +7172,7 @@ if "schedule_df" in st.session_state:
 
                         st.dataframe(
                             unassigned_view_df,
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                         )
 
@@ -6754,11 +7448,11 @@ if "schedule_df" in st.session_state:
                     with c3:
                         st.success(f"🟢 כרגע בהפסקה: {active_count}")
 
-                    st.markdown(f"#### 📋 עובדים לפי דחיפות הפסקה עכשיו ({len(break_priority_df)})")
+                    st.markdown(f"#### 📑 עובדים לפי דחיפות הפסקה עכשיו ({len(break_priority_df)})")
 
                     st.dataframe(
                         break_priority_df,
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
 
@@ -6989,7 +7683,7 @@ if "schedule_df" in st.session_state:
                     st.button(
                         "נקה חיפוש",
                         key="clear_unassigned_search",
-                        use_container_width=True,
+                        width="stretch",
                         on_click=clear_unassigned_search,
                     )
 
@@ -7016,13 +7710,13 @@ if "schedule_df" in st.session_state:
                     st.markdown(f"<p style='text-align:right;font-size:0.85em;color:gray;'>סה״כ עובדים לא משובצים: {len(unassigned_view_df)}</p>", unsafe_allow_html=True)
                     col_width = f"{100 // max(len(unassigned_view_df.columns), 1)}%"
                     header_html = "".join(
-                        f"<th style='text-align:center;padding:8px 12px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);color:inherit;width:{col_width};'>{col}</th>"
+                        f"<th style='text-align:center;padding:8px 12px;background:rgba(var(--ink-rgb),0.08);border:1px solid rgba(var(--ink-rgb),0.15);color:inherit;width:{col_width};'>{col}</th>"
                         for col in unassigned_view_df.columns
                     )
                     rows_html = ""
                     for _, row in unassigned_view_df.iterrows():
                         cells = "".join(
-                            f"<td style='text-align:center;padding:6px 12px;border:1px solid rgba(255,255,255,0.08);'>{'' if pd.isna(v) else v}</td>"
+                            f"<td style='text-align:center;padding:6px 12px;border:1px solid rgba(var(--ink-rgb),0.08);'>{'' if pd.isna(v) else v}</td>"
                             for v in row
                         )
                         rows_html += f"<tr>{cells}</tr>"
@@ -7431,7 +8125,7 @@ if "schedule_df" in st.session_state:
                 st.markdown("""
                 <style>
                 div[data-testid="stHorizontalBlock"]:has(> div[data-testid="column"]) .urgent-cell {
-                    border-bottom: 1px solid rgba(255,255,255,0.08);
+                    border-bottom: 1px solid rgba(var(--ink-rgb),0.08);
                     min-height: 42px; display:flex; align-items:center; justify-content:center;
                     font-size: 0.88em; padding: 4px 6px;
                 }
@@ -7442,7 +8136,7 @@ if "schedule_df" in st.session_state:
                 HEADERS = ["שם", "משמרת", "טיסה", "דדליין", "פעולה"]
                 DKEYS   = ["שם", "משמרת", "טיסה קרובה", "דדליין"]
 
-                C_HDR = "background:rgba(255,255,255,0.11);text-align:center;font-weight:700;font-size:0.85em;padding:10px 6px;border-radius:3px;letter-spacing:0.02em;"
+                C_HDR = "background:rgba(var(--ink-rgb),0.11);text-align:center;font-weight:700;font-size:0.85em;padding:10px 6px;border-radius:3px;letter-spacing:0.02em;"
                 C_CELL = "text-align:center;"
 
                 # כותרת
@@ -7452,7 +8146,7 @@ if "schedule_df" in st.session_state:
 
                 # שורות נתונים
                 for i, (idx, row) in enumerate(valid_rows):
-                    bg = "rgba(255,255,255,0.025)" if i % 2 == 0 else "rgba(255,255,255,0.06)"
+                    bg = "rgba(var(--ink-rgb),0.025)" if i % 2 == 0 else "rgba(var(--ink-rgb),0.06)"
                     emp_name = clean_text(row.get("שם", ""))
                     dcols = st.columns(RATIOS)
                     for dc, dk in zip(dcols[:-1], DKEYS):
@@ -7460,11 +8154,11 @@ if "schedule_df" in st.session_state:
                         dc.markdown(
                             f"<div style='background:{bg};{C_CELL}min-height:42px;display:flex;"
                             f"align-items:center;justify-content:center;font-size:0.88em;"
-                            f"padding:4px 4px;border-bottom:1px solid rgba(255,255,255,0.07);'>{val}</div>",
+                            f"padding:4px 4px;border-bottom:1px solid rgba(var(--ink-rgb),0.07);'>{val}</div>",
                             unsafe_allow_html=True
                         )
                     with dcols[-1]:
-                        if st.button("הוצא להפסקה", key=f"urgent_break_start_{idx}_{emp_name}", use_container_width=True):
+                        if st.button("הוצא להפסקה", key=f"urgent_break_start_{idx}_{emp_name}", width="stretch"):
                             _bp_start_break(emp_name, break_type="לפני טיסה", source="דדליין לפני טיסה")
                             st.rerun()
 
@@ -7474,7 +8168,7 @@ if "schedule_df" in st.session_state:
                         name = clean_text(row.get("שם", ""))
                         st.markdown(
                             f"<div style='direction:rtl;text-align:right;font-size:0.82em;"
-                            f"padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.07);'>"
+                            f"padding:4px 0;border-bottom:1px solid rgba(var(--ink-rgb),0.07);'>"
                             f"<b>{name}</b> — {calc}</div>",
                             unsafe_allow_html=True
                         )
@@ -7592,11 +8286,11 @@ if "schedule_df" in st.session_state:
 
                 coverage_rows.sort(key=lambda r: (r["_sort_key"], r["שם"]))
 
-                with st.expander(f"📋 בדיקת כיסוי הפסקות — {len(coverage_rows)} עובדים משובצים לטיסות"):
+                with st.expander(f"📑 בדיקת כיסוי הפסקות — {len(coverage_rows)} עובדים משובצים לטיסות"):
                     # כותרות
                     cov_ratios = [1.6, 1.1, 0.9, 2.4]
                     cov_headers = ["שם", "משמרת", "טיסה", "סטטוס"]
-                    C_HDR2 = "background:rgba(255,255,255,0.11);text-align:center;font-weight:700;font-size:0.82em;padding:8px 4px;border-radius:3px;"
+                    C_HDR2 = "background:rgba(var(--ink-rgb),0.11);text-align:center;font-weight:700;font-size:0.82em;padding:8px 4px;border-radius:3px;"
                     hh = st.columns(cov_ratios)
                     for hc, ht in zip(hh, cov_headers):
                         hc.markdown(f"<div style='{C_HDR2}'>{ht}</div>", unsafe_allow_html=True)
@@ -7607,7 +8301,7 @@ if "schedule_df" in st.session_state:
                         for col_w, key in zip(cc, ["שם", "משמרת", "טיסה", "סטטוס"]):
                             col_w.markdown(
                                 f"<div style='background:{bg};text-align:center;font-size:0.82em;"
-                                f"padding:5px 4px;border-bottom:1px solid rgba(255,255,255,0.06);'>"
+                                f"padding:5px 4px;border-bottom:1px solid rgba(var(--ink-rgb),0.06);'>"
                                 f"{cr[key]}</div>",
                                 unsafe_allow_html=True
                             )
@@ -7644,7 +8338,7 @@ if "schedule_df" in st.session_state:
             active_break_df = pd.DataFrame(active_break_rows)
 
             active_count = len(active_break_rows)
-            count_badge = f" <span style='font-size:0.75em;background:rgba(80,200,80,0.25);border-radius:10px;padding:2px 10px;'>{active_count}</span>" if active_count > 0 else " <span style='font-size:0.75em;color:rgba(255,255,255,0.4);'>(אין)</span>"
+            count_badge = f" <span style='font-size:0.75em;background:rgba(var(--acc-rgb),.22);border-radius:10px;padding:2px 10px;'>{active_count}</span>" if active_count > 0 else " <span style='font-size:0.75em;color:rgba(var(--ink-rgb),.74);'>(אין)</span>"
             st.markdown(f"<h3 style='text-align:right'>🟢 עובדים בהפסקה כרגע{count_badge}</h3>", unsafe_allow_html=True)
 
             if active_break_df.empty:
@@ -7652,7 +8346,7 @@ if "schedule_df" in st.session_state:
             else:
                 AB_RATIOS = [1.8, 1.1, 1.1, 1.4, 1.6]
                 AB_HEADERS = ["שם", "התחלה", "זמן שחלף", "סוג", "פעולה"]
-                C_HDR = "background:rgba(255,255,255,0.11);text-align:center;font-weight:700;font-size:0.82em;padding:8px 4px;border-radius:3px;"
+                C_HDR = "background:rgba(var(--ink-rgb),0.11);text-align:center;font-weight:700;font-size:0.82em;padding:8px 4px;border-radius:3px;"
 
                 hcols = st.columns(AB_RATIOS)
                 for hc, ht in zip(hcols, AB_HEADERS):
@@ -7667,11 +8361,11 @@ if "schedule_df" in st.session_state:
                     if over_time:
                         bg = "rgba(220,60,60,0.18)"
                     else:
-                        bg = "rgba(255,255,255,0.025)" if idx % 2 == 0 else "rgba(255,255,255,0.06)"
-                    C_CELL = f"background:{bg};text-align:center;font-size:0.82em;padding:5px 4px;border-bottom:1px solid rgba(255,255,255,0.06);"
+                        bg = "rgba(var(--ink-rgb),0.025)" if idx % 2 == 0 else "rgba(var(--ink-rgb),0.06)"
+                    C_CELL = f"background:{bg};text-align:center;font-size:0.82em;padding:5px 4px;border-bottom:1px solid rgba(var(--ink-rgb),0.06);"
 
                     name_icon = "🔴" if over_time else "🟢"
-                    over_label = f" <span style='color:#ff6b6b;font-size:0.8em;'>(חרג ב-{elapsed_min - allowed_min} ד׳)</span>" if over_time else ""
+                    over_label = f" <span style='color:rgb(var(--bad-rgb));font-size:0.8em;'>(חרג ב-{elapsed_min - allowed_min} ד׳)</span>" if over_time else ""
                     elapsed_text = row.get("זמן שחלף", "")
 
                     rcols = st.columns(AB_RATIOS)
@@ -7683,11 +8377,11 @@ if "schedule_df" in st.session_state:
                     with rcols[4]:
                         b1, b2 = st.columns(2)
                         with b1:
-                            if st.button("סיים", key=f"active_break_end_{idx}_{emp_name}", use_container_width=True):
+                            if st.button("סיים", key=f"active_break_end_{idx}_{emp_name}", width="stretch"):
                                 _bp_end_break(emp_name)
                                 st.rerun()
                         with b2:
-                            if st.button("איפוס", key=f"active_break_reset_{idx}_{emp_name}", use_container_width=True):
+                            if st.button("איפוס", key=f"active_break_reset_{idx}_{emp_name}", width="stretch"):
                                 _bp_reset_break(emp_name)
                                 st.rerun()
 
@@ -7858,7 +8552,7 @@ if "schedule_df" in st.session_state:
             else:
                 CB_RATIOS = [1.8, 1.2, 1.4, 2.6]
                 CB_HEADERS = ["שם", "משמרת", "חלון מומלץ", "פעולה"]
-                C_HDR3 = "background:rgba(255,255,255,0.11);text-align:center;font-weight:700;font-size:0.82em;padding:8px 4px;border-radius:3px;"
+                C_HDR3 = "background:rgba(var(--ink-rgb),0.11);text-align:center;font-weight:700;font-size:0.82em;padding:8px 4px;border-radius:3px;"
 
                 # שורת בקרה: חיפוש + כפתור צמצום
                 ctrl_col1, ctrl_col2 = st.columns([3, 1])
@@ -7890,8 +8584,8 @@ if "schedule_df" in st.session_state:
                     if unassigned_inner_view == INNER_BREAKS:
                         for btn_i, row in enumerate(display_rows):
                             emp_name = row["שם"]
-                            bg = "rgba(255,255,255,0.025)" if btn_i % 2 == 0 else "rgba(255,255,255,0.06)"
-                            C_CELL3 = f"background:{bg};text-align:center;font-size:0.82em;padding:5px 4px;border-bottom:1px solid rgba(255,255,255,0.06);"
+                            bg = "rgba(var(--ink-rgb),0.025)" if btn_i % 2 == 0 else "rgba(var(--ink-rgb),0.06)"
+                            C_CELL3 = f"background:{bg};text-align:center;font-size:0.82em;padding:5px 4px;border-bottom:1px solid rgba(var(--ink-rgb),0.06);"
 
                             rcols = st.columns(CB_RATIOS)
                             rcols[0].markdown(f"<div style='{C_CELL3}'>{emp_name}</div>", unsafe_allow_html=True)
@@ -7902,11 +8596,11 @@ if "schedule_df" in st.session_state:
                                 safe_key = str(emp_name).replace(" ", "_").replace("/", "_").replace("-", "_")
                                 _act_col1, _act_col2 = st.columns(2)
                                 with _act_col1:
-                                    if st.button("הוצא להפסקה", key=f"combined_break_{btn_i}_{safe_key}", use_container_width=True):
+                                    if st.button("הוצא להפסקה", key=f"combined_break_{btn_i}_{safe_key}", width="stretch"):
                                         _bp_start_break(emp_name, break_type="יזומה", source="הוצאה יזומה")
                                         st.rerun()
                                 with _act_col2:
-                                    if st.button("הוצא לרענון", key=f"combined_refresh_{btn_i}_{safe_key}", use_container_width=True):
+                                    if st.button("הוצא לרענון", key=f"combined_refresh_{btn_i}_{safe_key}", width="stretch"):
                                         _bp_start_break(emp_name, break_type="רענון יזום", source="רענון יזום")
                                         st.rerun()
     if active_main_tab == TAB_SCHEDULE:
@@ -7962,20 +8656,15 @@ if "schedule_df" in st.session_state:
             data=departures_excel_data,
             file_name=f"דוח שיבוץ טיסות - המראות{_rep_suffix}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
 
         if is_admin():
             st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
             if st.button(
-                "📣 שגר סידור", use_container_width=True, type="primary",
-                help="מפרסם את הסידור הנוכחי — מרגע זה העובדים יראו אותו במסך האישי שלהם",
+                "📣 שגר סידור", width="stretch", type="primary",
+                help="בודק את הסידור ואז מפרסם אותו — מרגע השיגור העובדים יראו אותו במסך האישי שלהם",
             ):
-                _now = app_now()
-                if publish_state.publish_schedule(live_schedule, st.session_state.get("_build_id"), _now):
-                    st.toast("✅ הסידור שוגר לעובדים.", icon="📣")
-                    st.rerun()
-                else:
-                    st.error("שגיאה בשיגור הסידור.")
+                _publish_check_dialog(live_schedule)
         st.stop()
         st.stop()
