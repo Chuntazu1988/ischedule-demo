@@ -4862,590 +4862,599 @@ if "schedule_df" in st.session_state:
 
     # ── Tab: לוח מבצעים ──────────────────────────────────────────────────
     if active_main_tab == TAB_SCHEDULE:
-        # Draft-vs-published banner (user rule 2026-07-30): employees never
-        # see a schedule until an admin explicitly "שגר סידור"s it — this
-        # tells the admin/manager whether what's on screen right now has
-        # actually been sent out yet.
-        if publish_state.is_published(st.session_state.get("_build_id")):
-            _pub_at = publish_state.get_published_at() or ""
-            st.markdown(
-                f'<div class="banner banner-ok">✅ הסידור מפורסם ועדכני — עובדים רואים אותו'
-                f' (שוגר ב-{_pub_at})</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                '<div class="banner banner-warn">⚠️ הסידור עדיין בטיוטה — לא הופץ לעובדים.'
-                ' לחצו על "שגר סידור" בתחתית העמוד כדי לפרסם אותו.</div>',
-                unsafe_allow_html=True,
-            )
-        st.markdown(
-            '<div style="text-align:right;direction:rtl;font-weight:700;'
-            'font-size:14px;color:rgba(var(--ink-rgb),.74);padding:2px 0 0 0;">🔎 חיפוש לפי טיסה / יעד / עובד</div>',
-            unsafe_allow_html=True,
-        )
-        search = st.text_input("חיפוש", label_visibility="collapsed")
-        only_missing = st.toggle("הצג רק טיסות עם חוסר", key="only_missing_chk")
-        # ── מסנן טרמינל — הפרדה ברורה בין סידור T3 לסידור T1 ─────────────────
-        if "טרמינל" in display_df.columns and (display_df["טרמינל"] == "1").any():
-            _term_view = st.radio(
-                "תצוגת טרמינל",
-                ["הכל", "טרמינל 3", "טרמינל 1"],
-                horizontal=True,
-                key="schedule_term_filter",
-                label_visibility="collapsed",
-            )
-            if _term_view == "טרמינל 3":
-                display_df = display_df[display_df["טרמינל"] != "1"]
-            elif _term_view == "טרמינל 1":
-                display_df = display_df[display_df["טרמינל"] == "1"]
-        # ── כותרת המשמרת + מעבר לסידורים הקודמים של אותו יום ─────────────────
-        # מופיעה רק כשהסידור נבנה לפי משמרות (נייט/דיי/אפטר).
-        _cur_seg = st.session_state.get("_segment_current")
-        _snaps_ui = st.session_state.get("_segment_snapshots", {})
-        if _cur_seg and _cur_seg in _snaps_ui:
-            _shown_seg = st.session_state.get("_view_segment") or _cur_seg
-            _shown = _snaps_ui.get(_shown_seg, _snaps_ui[_cur_seg])
-            _is_past = _shown_seg != _cur_seg
-            st.markdown(
-                '<div dir="rtl" style="text-align:center;font-size:22px;font-weight:800;'
-                f'padding:14px 0 4px;color:{"var(--acc-strong)" if _is_past else "inherit"};">'
-                f'{_shown["icon"]} סידור משמרת {_shown["label"]}'
-                + (' <span style="font-size:14px;font-weight:600;">(סידור קודם — לצפייה בלבד)</span>'
-                   if _is_past else '')
-                + '</div>'
-                f'<div dir="rtl" style="text-align:center;font-size:13px;color:rgba(var(--ink-rgb),.74);'
-                f'padding-bottom:10px;">{_shown["range"]}</div>',
-                unsafe_allow_html=True,
-            )
-            # כפתור לכל סידור קודם שנבנה היום, ועוד אחד לחזרה לסידור הנוכחי
-            _prev_keys = [k for k in ("night", "day", "after")
-                          if k in _snaps_ui and k != _cur_seg]
-            if _prev_keys:
-                _btn_cols = st.columns(len(_prev_keys) + (1 if _is_past else 0))
-                for _bc, _pk in zip(_btn_cols, _prev_keys):
-                    with _bc:
-                        if st.button(f'סידור {_snaps_ui[_pk]["label"]}',
-                                     key=f"view_seg_{_pk}", width="stretch",
-                                     disabled=(_shown_seg == _pk)):
-                            st.session_state["_view_segment"] = _pk
-                            st.rerun()
-                if _is_past:
-                    with _btn_cols[-1]:
-                        if st.button(f'↩ חזרה לסידור {_snaps_ui[_cur_seg]["label"]}',
-                                     key="view_seg_back", width="stretch",
-                                     type="primary"):
-                            st.session_state.pop("_view_segment", None)
-                            st.rerun()
-
-        if only_missing:
-            display_df = display_df[
-                display_df.astype(str).apply(
-                    lambda row: row.str.contains("❌", na=False).any(), axis=1
-                )
-            ]
-        if search:
-            mask = display_df.astype(str).apply(
-                lambda row: row.str.contains(search, case=False, na=False).any(), axis=1
-            )
-            display_df = display_df[mask]
-
-            # When filtering by employee name, re-sort by THAT employee's actual
-            # role start time so her assignments appear in true chronological order
-            # (e.g. night flight at 22:30 comes before morning flight at 03:00).
-            _live_sched = st.session_state.get("schedule_df", pd.DataFrame())
-            if not _live_sched.empty and "עובד" in _live_sched.columns and "התחלה" in _live_sched.columns:
-                _emp_starts = (
-                    _live_sched[
-                        _live_sched["עובד"].astype(str).str.contains(search, case=False, na=False)
-                    ]
-                    .groupby("טיסה")["התחלה"]
-                    .min()
-                    .reset_index()
-                    .rename(columns={"התחלה": "_emp_start"})
-                )
-                if not _emp_starts.empty:
-                    # Normalise flight key for merging
-                    _emp_starts["_fk"] = _emp_starts["טיסה"].astype(str).str.replace(" ", "").str.upper()
-                    # Find which column in display_df holds the flight number
-                    _flt_col = next(
-                        (c for c in display_df.columns if "טיסה" in str(c) or "flight" in str(c).lower()),
-                        display_df.columns[0] if not display_df.empty else None
-                    )
-                    if _flt_col:
-                        _disp_fk = display_df[_flt_col].astype(str).str.replace(" ", "").str.upper()
-                        _start_map = dict(zip(_emp_starts["_fk"], _emp_starts["_emp_start"]))
-
-                        def _emp_sort_key(fk):
-                            s = _start_map.get(fk, "99:99")
-                            try:
-                                h, m = str(s).split(":")[:2]
-                                t = int(h) * 60 + int(m)
-                                # Pivot at 20:00 so night starts (22:xx, 23:xx, 00:xx)
-                                # sort before early-morning (03:xx, 04:xx, 05:xx).
-                                return (t - 20 * 60) % 1440
-                            except Exception:
-                                return 9999
-
-                        _sort_keys = _disp_fk.apply(_emp_sort_key).values
-                        display_df = display_df.iloc[_sort_keys.argsort()]
-        _highlighted_tasks = st.session_state.get("_ar_highlighted", set())
-        _transfer_delay_tasks = st.session_state.get("_transfer_delay_highlighted", set())
-        _gap_sep_shown = False   # separator before midnight-crossing block already shown
-        for _, row in display_df.iterrows():
-            _cur_crossing = bool(row.get("_midnight_crossing", False))
-            # Insert separator just before the first midnight-crossing flight
-            if _cur_crossing and not _gap_sep_shown:
+        @st.fragment
+        def _render_schedule_tab():
+            # display_df is filtered further down (terminal/search/missing) —
+            # without `global` that reassignment makes Python treat the name as
+            # local to this whole function, so even reading it beforehand (the
+            # T1-columns check right below) raises UnboundLocalError instead of
+            # seeing the module-level display_df built above.
+            global display_df
+            # Draft-vs-published banner (user rule 2026-07-30): employees never
+            # see a schedule until an admin explicitly "שגר סידור"s it — this
+            # tells the admin/manager whether what's on screen right now has
+            # actually been sent out yet.
+            if publish_state.is_published(st.session_state.get("_build_id")):
+                _pub_at = publish_state.get_published_at() or ""
                 st.markdown(
-                    '<div dir="rtl" style="text-align:center;padding:10px 0;margin:8px 0;'
-                    'border-top:2px dashed rgba(var(--ink-rgb),.3);border-bottom:2px dashed rgba(var(--ink-rgb),.3);'
-                    'color:rgba(var(--ink-rgb),.74);font-size:13px;letter-spacing:1px;">'
-                    '🌙 טיסות לילה — פעילות מתחילה לפני חצות</div>',
+                    f'<div class="banner banner-ok">✅ הסידור מפורסם ועדכני — עובדים רואים אותו'
+                    f' (שוגר ב-{_pub_at})</div>',
                     unsafe_allow_html=True,
                 )
-                _gap_sep_shown = True
-            render_flight_card_with_swap(
-                row,
-                st.session_state["schedule_df"],
-                st.session_state["employees_snap"],
-                highlighted_tasks=_highlighted_tasks,
-                transfer_delay_tasks=_transfer_delay_tasks,
+            else:
+                st.markdown(
+                    '<div class="banner banner-warn">⚠️ הסידור עדיין בטיוטה — לא הופץ לעובדים.'
+                    ' לחצו על "שגר סידור" בתחתית העמוד כדי לפרסם אותו.</div>',
+                    unsafe_allow_html=True,
+                )
+            st.markdown(
+                '<div style="text-align:right;direction:rtl;font-weight:700;'
+                'font-size:14px;color:rgba(var(--ink-rgb),.74);padding:2px 0 0 0;">🔎 חיפוש לפי טיסה / יעד / עובד</div>',
+                unsafe_allow_html=True,
             )
+            search = st.text_input("חיפוש", label_visibility="collapsed")
+            only_missing = st.toggle("הצג רק טיסות עם חוסר", key="only_missing_chk")
+            # ── מסנן טרמינל — הפרדה ברורה בין סידור T3 לסידור T1 ─────────────────
+            if "טרמינל" in display_df.columns and (display_df["טרמינל"] == "1").any():
+                _term_view = st.radio(
+                    "תצוגת טרמינל",
+                    ["הכל", "טרמינל 3", "טרמינל 1"],
+                    horizontal=True,
+                    key="schedule_term_filter",
+                    label_visibility="collapsed",
+                )
+                if _term_view == "טרמינל 3":
+                    display_df = display_df[display_df["טרמינל"] != "1"]
+                elif _term_view == "טרמינל 1":
+                    display_df = display_df[display_df["טרמינל"] == "1"]
+            # ── כותרת המשמרת + מעבר לסידורים הקודמים של אותו יום ─────────────────
+            # מופיעה רק כשהסידור נבנה לפי משמרות (נייט/דיי/אפטר).
+            _cur_seg = st.session_state.get("_segment_current")
+            _snaps_ui = st.session_state.get("_segment_snapshots", {})
+            if _cur_seg and _cur_seg in _snaps_ui:
+                _shown_seg = st.session_state.get("_view_segment") or _cur_seg
+                _shown = _snaps_ui.get(_shown_seg, _snaps_ui[_cur_seg])
+                _is_past = _shown_seg != _cur_seg
+                st.markdown(
+                    '<div dir="rtl" style="text-align:center;font-size:22px;font-weight:800;'
+                    f'padding:14px 0 4px;color:{"var(--acc-strong)" if _is_past else "inherit"};">'
+                    f'{_shown["icon"]} סידור משמרת {_shown["label"]}'
+                    + (' <span style="font-size:14px;font-weight:600;">(סידור קודם — לצפייה בלבד)</span>'
+                       if _is_past else '')
+                    + '</div>'
+                    f'<div dir="rtl" style="text-align:center;font-size:13px;color:rgba(var(--ink-rgb),.74);'
+                    f'padding-bottom:10px;">{_shown["range"]}</div>',
+                    unsafe_allow_html=True,
+                )
+                # כפתור לכל סידור קודם שנבנה היום, ועוד אחד לחזרה לסידור הנוכחי
+                _prev_keys = [k for k in ("night", "day", "after")
+                              if k in _snaps_ui and k != _cur_seg]
+                if _prev_keys:
+                    _btn_cols = st.columns(len(_prev_keys) + (1 if _is_past else 0))
+                    for _bc, _pk in zip(_btn_cols, _prev_keys):
+                        with _bc:
+                            if st.button(f'סידור {_snaps_ui[_pk]["label"]}',
+                                         key=f"view_seg_{_pk}", width="stretch",
+                                         disabled=(_shown_seg == _pk)):
+                                st.session_state["_view_segment"] = _pk
+                                st.rerun()
+                    if _is_past:
+                        with _btn_cols[-1]:
+                            if st.button(f'↩ חזרה לסידור {_snaps_ui[_cur_seg]["label"]}',
+                                         key="view_seg_back", width="stretch",
+                                         type="primary"):
+                                st.session_state.pop("_view_segment", None)
+                                st.rerun()
 
-        # ── ניתוח פיקי ראשי צוות ──────────────────────────────────────────
-        # Staffing-planning tool: finds the day's ר"צ demand peaks using the
-        # same anchor/block algorithm as the an existing internal reference
-        # tool (user rule 2026-09-05 — ground truth already in
-        # production; see analyze_tl_peaks/_tl_reference_peaks), labeled
-        # מקדים/(plain)/משני exactly like that tool's report. Reports, per
-        # peak: how many flights need a ר"צ (one each, no reuse credit), how
-        # many distinct real ר"צ the built schedule actually used, and
-        # whether it actually covered the peak (user rule 2026-09-04: "כמה
-        # טיסות יש בכל פיק וכמה ראשי צוות דרושים... כמה רצים זמינים").
-        _tl_sched = st.session_state.get("schedule_df", pd.DataFrame())
-        if not _tl_sched.empty:
-            _tl_peaks = analyze_tl_peaks(_tl_sched)
-            if _tl_peaks:
-                with st.expander(f"📊 ניתוח פיקי ראשי צוות ({len(_tl_peaks)} פיקים)", expanded=False):
-                    st.caption(
-                        "התוויות (למשל \"פיק בוקר מקדים/בוקר/בוקר משני\") מקובצות לפי יום וחלק-יום "
-                        "(בוקר/יום/צהריים/אחה\"צ/ערב/לילה) — הפיק הגדול ביותר בקבוצה (כולל בונוס "
-                        "לטיסות BKK/HKT שדורשות 2 ר\"צ) מקבל את השם הפשוט, פיקים לפניו \"מקדים\", "
-                        "פיקים אחריו \"משני\". "
-                        "\"דרושים\" = מספר משבצות הזמן שצריך למלא, לא מספר אנשים שונים — "
-                        "אותו ר\"צ יכול למלא כמה משבצות ברצף אם הן לא חופפות בזמן. "
-                        "\"זמינים\" = כמה ראשי צוות שונים הסידור בפועל שיבץ לפיק הזה. "
-                        "\"כיסוי בפועל\" מבוסס על הסידור שכבר נבנה, לא על חישוב עצמאי."
+            if only_missing:
+                display_df = display_df[
+                    display_df.astype(str).apply(
+                        lambda row: row.str.contains("❌", na=False).any(), axis=1
                     )
-                    for _peak in _tl_peaks:
-                        # "יש מספיק?" is read directly off the ACTUAL schedule
-                        # built for this peak (the ❌-unfilled ר"צ slots), not
-                        # off available_rc — a quick check showed a naive
-                        # first-fit match against available_rc over-predicts
-                        # shortages (flagged 4 unfillable flights in one peak
-                        # where the real scheduler, doing proper candidate
-                        # selection incl. legitimate back-to-back reuse, left
-                        # only 1 actually unfilled).
-                        _coverage = (
-                            f"⚠️ **חסר** — {_peak['unfilled']} מתוך {_peak['n_flights']} לא מאוישות"
-                            if _peak["unfilled"] else "✅ **מכוסה במלואו**"
-                        )
-                        st.markdown(
-                            f"**{_peak['label']}** — {_peak['n_flights']} טיסות · "
-                            f"דרושים **{_peak['required_rc']}** ראשי צוות · "
-                            f"זמינים **{_peak['available_rc']}** · {_coverage}"
-                        )
-
-        # ── אבחון טיסות עם תפקידים חסרים ─────────────────────────────────────
-        _sched_diag = st.session_state.get("schedule_df", pd.DataFrame())
-        _missing_flights = _sched_diag[
-            _sched_diag["עובד"].astype(str).str.contains("❌", na=False)
-        ]["טיסה"].unique().tolist() if not _sched_diag.empty else []
-
-        # Chronological order for the missing-roles diagnostic. Raw departure
-        # time puts the after-midnight NIGHT flights (LY027/LY083/LY001/LY005,
-        # boarding 22:xx-00:xx on 20.07 and departing 00:30-01:05 on 21.07) at
-        # the TOP because 00:30 < 06:00 numerically — but they belong at the
-        # BOTTOM chronologically (they are the tail of the night shift). Pivot
-        # at 02:00 (the operational-day start = the 02:00 shift): any flight
-        # whose earliest task boards BEFORE 02:00 is night-shift tail and sorts
-        # LAST; everything boarding 02:00+ sorts by boarding time (user
-        # 2026-07-20).
-        if _missing_flights and not _sched_diag.empty:
-            def _mf_chrono_key(_fnum):
-                _ft = _sched_diag[_sched_diag["טיסה"].astype(str) == str(_fnum)]
-                _starts = [
-                    time_to_minutes(clean_text(str(_x)))
-                    for _x in _ft["התחלה"].tolist()
-                    if is_time_text(clean_text(str(_x)))
                 ]
-                if not _starts:
-                    return 10 ** 6
-                return (min(_starts) - 2 * 60) % 1440
-            _missing_flights = sorted(_missing_flights, key=_mf_chrono_key)
+            if search:
+                mask = display_df.astype(str).apply(
+                    lambda row: row.str.contains(search, case=False, na=False).any(), axis=1
+                )
+                display_df = display_df[mask]
 
-        if _missing_flights:
-            with st.expander(f"🔍 אבחון תפקידים חסרים ({len(_missing_flights)} טיסות)", expanded=False):
-                _diag_flights_df = st.session_state.get("flights_snap", pd.DataFrame())
-                _diag_emps_df    = st.session_state.get("employees_snap", pd.DataFrame())
-                _diag_sched_list = _sched_diag.to_dict("records")
-
-                for _fnum in _missing_flights:
-                    _missing_roles_for_flight = _sched_diag[
-                        (_sched_diag["טיסה"].astype(str) == str(_fnum)) &
-                        (_sched_diag["עובד"].astype(str).str.contains("❌", na=False))
-                    ]["תפקיד בסיס"].unique().tolist()
-
-                    _flight_row = _diag_flights_df[
-                        _diag_flights_df["טיסה"].astype(str).str.strip() == str(_fnum).strip()
-                    ]
-                    if _flight_row.empty:
-                        continue
-                    _flight_dict = _flight_row.iloc[0].to_dict()
-
-                    st.markdown(f"### ✈️ טיסה {_fnum} ← {_flight_dict.get('יעד','')} ({_flight_dict.get('המראה','')})")
-
-                    # ── USA flight with no gate yet → explain the shortage is
-                    # due to missing gate info, and offer manual gate entry.
-                    # A TSA inspector is stationed at a specific pier/checkpoint,
-                    # which is derived from the gate — with no gate the pier is
-                    # unknown, so the inspector slot can't be resolved. FIDS often
-                    # leaves late-night US flights gate-less until closer to
-                    # departure (user rule 2026-07-13).
-                    _diag_dest = clean_text(str(_flight_dict.get("יעד", "")))
-                    _diag_gate = clean_text(str(_flight_dict.get("גייט", "")))
-                    if not _diag_gate or _diag_gate.lower() == "nan":
-                        _diag_gate = clean_text(str(_flight_dict.get("שלוחה", "")))
-                    _diag_gate_missing = (not _diag_gate) or _diag_gate.lower() == "nan"
-                    if (_diag_dest in USA_TSA_DESTS and _diag_gate_missing
-                            and "מפקח TSA" in _missing_roles_for_flight):
-                        # Plain, short, single-clause sentences — a longer sentence
-                        # mixing an em-dash / bold markdown near the mid-sentence
-                        # "TSA" (LTR) token got visually scrambled by the browser's
-                        # bidi algorithm (same class of bug as the terminal-transfer
-                        # label fix: see [[project_terminal1]] "never mix an arrow/
-                        # symbol character with adjacent Hebrew+LTR tokens").
-                        st.info(
-                            "ℹ️ לטיסה זו לארצות הברית עדיין לא הוזן שער יציאה. "
-                            "בלי שער אי אפשר לדעת לאיזו שלוחה לשבץ מפקח TSA, "
-                            "וזו הסיבה לחוסר בשיבוץ. ניתן להזין את השער ידנית כאן. "
-                            "לאחר ההזנה הסידור ייבנה מחדש והמידע יתעדכן בכל מקום "
-                            "רלוונטי באתר."
-                        )
-                        _gk = f"manual_gate_input_{_fnum}"
-                        _gc1, _gc2 = st.columns([3, 1])
-                        with _gc1:
-                            st.text_input(
-                                "שער יציאה (למשל C8 / D6):",
-                                key=_gk,
-                                placeholder="הזן שער...",
-                            )
-                        with _gc2:
-                            st.markdown("<div style='padding-top:28px'></div>",
-                                        unsafe_allow_html=True)
-                            if st.button("✅ עדכן שער ובנה מחדש",
-                                         key=f"apply_gate_{_fnum}",
-                                         width="stretch"):
-                                _g_in = clean_text(st.session_state.get(_gk, "")).upper()
-                                if not _g_in:
-                                    st.warning("יש להזין ערך שער תקין.")
-                                else:
-                                    # Don't mutate flights_editor_df / rebuild here —
-                                    # the flights data_editor and other widgets
-                                    # already rendered earlier in THIS script run,
-                                    # so a late in-place mutation here doesn't
-                                    # reliably reach them (found via real data
-                                    # 2026-07-13: the gate update silently didn't
-                                    # take effect). Instead, stash the request and
-                                    # rerun — the top of the script applies it
-                                    # (right after flights_editor_df is built) and
-                                    # rebuilds (right after _run_build_schedule is
-                                    # defined), both well before anything renders.
-                                    st.session_state["_pending_gate_update"] = {
-                                        "fnum": str(_fnum), "gate": _g_in,
-                                    }
-                                    st.rerun()
-
-                    for _missing_role in _missing_roles_for_flight:
-                        st.markdown(f"**❌ חסר: {_missing_role}**")
-                        # Build assignments list up to (but not including) this missing slot
-                        _prior = [t for t in _diag_sched_list
-                                  if t.get("טיסה") != str(_fnum) or "❌" not in str(t.get("עובד",""))]
-                        _diag_results = explain_missing_role(
-                            _flight_dict, _missing_role, _diag_emps_df, _prior
-                        )
-                        _diag_data = []
-                        for _d in _diag_results:
-                            _diag_data.append({"עובד": _d["name"], "סיבה לדחייה": _d["reason"]})
-                        if _diag_data:
-                            st.dataframe(
-                                pd.DataFrame(_diag_data),
-                                width="stretch",
-                                hide_index=True,
-                            )
-
-                        # ── "הכרח שיבוץ" (force-assign) — user 2026-07-20 ──────
-                        # A manual override: for a candidate who is qualified,
-                        # within shift, and at the right terminal but currently
-                        # BUSY on another flight (reason starts "כבר משובץ") — or
-                        # genuinely free ("✅ זמין") — offer a button that pulls
-                        # them onto THIS slot and reshuffles their conflicting
-                        # tasks (best-effort back-fill; a shortage may just move).
-                        # NOT offered for "לא מכסה"/"הפרדת טרמינלים" candidates —
-                        # those are hard shift/terminal constraints, not a
-                        # priority-order choice.
-                        _force_targets = [
-                            _d for _d in _diag_results
-                            if str(_d.get("reason", "")).startswith("כבר משובץ")
-                            or "זמין" in str(_d.get("reason", ""))
+                # When filtering by employee name, re-sort by THAT employee's actual
+                # role start time so her assignments appear in true chronological order
+                # (e.g. night flight at 22:30 comes before morning flight at 03:00).
+                _live_sched = st.session_state.get("schedule_df", pd.DataFrame())
+                if not _live_sched.empty and "עובד" in _live_sched.columns and "התחלה" in _live_sched.columns:
+                    _emp_starts = (
+                        _live_sched[
+                            _live_sched["עובד"].astype(str).str.contains(search, case=False, na=False)
                         ]
-                        _fslot_mask = (
-                            (_sched_diag["טיסה"].astype(str) == str(_fnum)) &
-                            (_sched_diag["תפקיד בסיס"].astype(str) == str(_missing_role)) &
-                            (_sched_diag["עובד"].astype(str).str.contains("❌", na=False))
+                        .groupby("טיסה")["התחלה"]
+                        .min()
+                        .reset_index()
+                        .rename(columns={"התחלה": "_emp_start"})
+                    )
+                    if not _emp_starts.empty:
+                        # Normalise flight key for merging
+                        _emp_starts["_fk"] = _emp_starts["טיסה"].astype(str).str.replace(" ", "").str.upper()
+                        # Find which column in display_df holds the flight number
+                        _flt_col = next(
+                            (c for c in display_df.columns if "טיסה" in str(c) or "flight" in str(c).lower()),
+                            display_df.columns[0] if not display_df.empty else None
                         )
-                        _fslot_idx = _sched_diag[_fslot_mask].index
-                        if _force_targets and len(_fslot_idx):
-                            st.caption(
-                                "🔧 הכרח שיבוץ — משבץ את העובד/ת לטיסה זו גם אם הוא/היא "
-                                "משובצ/ת כרגע במקום אחר; שאר משימותיו/ה יעודכנו בהתאם:"
+                        if _flt_col:
+                            _disp_fk = display_df[_flt_col].astype(str).str.replace(" ", "").str.upper()
+                            _start_map = dict(zip(_emp_starts["_fk"], _emp_starts["_emp_start"]))
+
+                            def _emp_sort_key(fk):
+                                s = _start_map.get(fk, "99:99")
+                                try:
+                                    h, m = str(s).split(":")[:2]
+                                    t = int(h) * 60 + int(m)
+                                    # Pivot at 20:00 so night starts (22:xx, 23:xx, 00:xx)
+                                    # sort before early-morning (03:xx, 04:xx, 05:xx).
+                                    return (t - 20 * 60) % 1440
+                                except Exception:
+                                    return 9999
+
+                            _sort_keys = _disp_fk.apply(_emp_sort_key).values
+                            display_df = display_df.iloc[_sort_keys.argsort()]
+            _highlighted_tasks = st.session_state.get("_ar_highlighted", set())
+            _transfer_delay_tasks = st.session_state.get("_transfer_delay_highlighted", set())
+            _gap_sep_shown = False   # separator before midnight-crossing block already shown
+            for _, row in display_df.iterrows():
+                _cur_crossing = bool(row.get("_midnight_crossing", False))
+                # Insert separator just before the first midnight-crossing flight
+                if _cur_crossing and not _gap_sep_shown:
+                    st.markdown(
+                        '<div dir="rtl" style="text-align:center;padding:10px 0;margin:8px 0;'
+                        'border-top:2px dashed rgba(var(--ink-rgb),.3);border-bottom:2px dashed rgba(var(--ink-rgb),.3);'
+                        'color:rgba(var(--ink-rgb),.74);font-size:13px;letter-spacing:1px;">'
+                        '🌙 טיסות לילה — פעילות מתחילה לפני חצות</div>',
+                        unsafe_allow_html=True,
+                    )
+                    _gap_sep_shown = True
+                render_flight_card_with_swap(
+                    row,
+                    st.session_state["schedule_df"],
+                    st.session_state["employees_snap"],
+                    highlighted_tasks=_highlighted_tasks,
+                    transfer_delay_tasks=_transfer_delay_tasks,
+                )
+
+            # ── ניתוח פיקי ראשי צוות ──────────────────────────────────────────
+            # Staffing-planning tool: finds the day's ר"צ demand peaks using the
+            # same anchor/block algorithm as the an existing internal reference
+            # tool (user rule 2026-09-05 — ground truth already in
+            # production; see analyze_tl_peaks/_tl_reference_peaks), labeled
+            # מקדים/(plain)/משני exactly like that tool's report. Reports, per
+            # peak: how many flights need a ר"צ (one each, no reuse credit), how
+            # many distinct real ר"צ the built schedule actually used, and
+            # whether it actually covered the peak (user rule 2026-09-04: "כמה
+            # טיסות יש בכל פיק וכמה ראשי צוות דרושים... כמה רצים זמינים").
+            _tl_sched = st.session_state.get("schedule_df", pd.DataFrame())
+            if not _tl_sched.empty:
+                _tl_peaks = analyze_tl_peaks(_tl_sched)
+                if _tl_peaks:
+                    with st.expander(f"📊 ניתוח פיקי ראשי צוות ({len(_tl_peaks)} פיקים)", expanded=False):
+                        st.caption(
+                            "התוויות (למשל \"פיק בוקר מקדים/בוקר/בוקר משני\") מקובצות לפי יום וחלק-יום "
+                            "(בוקר/יום/צהריים/אחה\"צ/ערב/לילה) — הפיק הגדול ביותר בקבוצה (כולל בונוס "
+                            "לטיסות BKK/HKT שדורשות 2 ר\"צ) מקבל את השם הפשוט, פיקים לפניו \"מקדים\", "
+                            "פיקים אחריו \"משני\". "
+                            "\"דרושים\" = מספר משבצות הזמן שצריך למלא, לא מספר אנשים שונים — "
+                            "אותו ר\"צ יכול למלא כמה משבצות ברצף אם הן לא חופפות בזמן. "
+                            "\"זמינים\" = כמה ראשי צוות שונים הסידור בפועל שיבץ לפיק הזה. "
+                            "\"כיסוי בפועל\" מבוסס על הסידור שכבר נבנה, לא על חישוב עצמאי."
+                        )
+                        for _peak in _tl_peaks:
+                            # "יש מספיק?" is read directly off the ACTUAL schedule
+                            # built for this peak (the ❌-unfilled ר"צ slots), not
+                            # off available_rc — a quick check showed a naive
+                            # first-fit match against available_rc over-predicts
+                            # shortages (flagged 4 unfillable flights in one peak
+                            # where the real scheduler, doing proper candidate
+                            # selection incl. legitimate back-to-back reuse, left
+                            # only 1 actually unfilled).
+                            _coverage = (
+                                f"⚠️ **חסר** — {_peak['unfilled']} מתוך {_peak['n_flights']} לא מאוישות"
+                                if _peak["unfilled"] else "✅ **מכוסה במלואו**"
                             )
-                            for _ft in _force_targets:
-                                _fc1, _fc2, _fc3 = st.columns([4, 1, 1])
-                                with _fc1:
-                                    st.markdown(
-                                        f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
-                                        f"<b>{safe_html(_ft['name'])}</b> "
-                                        f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_ft['reason'])}</span></div>",
-                                        unsafe_allow_html=True,
-                                    )
-                                with _fc2:
-                                    if st.button(
-                                        "הכרח שיבוץ",
-                                        key=f"force_{_fnum}_{_missing_role}_{_ft['name']}",
-                                        width="stretch",
-                                    ):
-                                        st.session_state["schedule_df"] = force_assign_worker(
-                                            _sched_diag, _fslot_idx[0], _ft["name"], _diag_emps_df,
-                                            keep_prior=True,
-                                        )
-                                        for _k in ["labeled_df", "workload_df",
-                                                   "continuity_df", "output_df",
-                                                   "_ar_highlighted"]:
-                                            st.session_state.pop(_k, None)
-                                        st.success(
-                                            f"✅ {_ft['name']} שובצ/ה בהכרח ל-{_missing_role} "
-                                            f"בטיסה {_fnum}. שאר משימותיו/ה עודכנו."
-                                        )
-                                        st.rerun()
-                                with _fc3:
-                                    # "שבץ במקום" — move the worker here, freeing
-                                    # ALL their overlapping tasks (no late arrival):
-                                    # e.g. pull them off an earlier דייל slot to
-                                    # cover this ר"צ. User rule 2026-07-22.
-                                    if st.button(
-                                        "שבץ במקום",
-                                        key=f"move_{_fnum}_{_missing_role}_{_ft['name']}",
-                                        width="stretch",
-                                    ):
-                                        st.session_state["schedule_df"] = force_assign_worker(
-                                            _sched_diag, _fslot_idx[0], _ft["name"], _diag_emps_df,
-                                            keep_prior=False,
-                                        )
-                                        for _k in ["labeled_df", "workload_df",
-                                                   "continuity_df", "output_df",
-                                                   "_ar_highlighted"]:
-                                            st.session_state.pop(_k, None)
-                                        st.success(
-                                            f"✅ {_ft['name']} הועבר/ה ל-{_missing_role} "
-                                            f"בטיסה {_fnum} במקום השיבוץ הקודם. "
-                                            f"שאר משימותיו/ה עודכנו."
-                                        )
-                                        st.rerun()
-
-                        # ── "הכרח שיבוץ" גם למי שנדחה על "הפרדת טרמינלים" —
-                        # LAST RESORT בלבד (user rule 2026-07-22: "רק במידה ואין
-                        # שום אופציה אחרת"). מוצג רק כש-_force_targets (למעלה)
-                        # ריק — אין אף מועמד/ת "כבר משובץ"/"זמין". העובד/ת
-                        # משובץ/ת לטיסה זו למרות שהוא/היא נמצא/ת בטרמינל האחר
-                        # לפי מיפוי הזמינות שלו/ה כרגע — כלומר זה מעכב את מעבר/ה
-                        # לטרמינל השני, לא דוחה טיסה קונקרטית אחרת (force_assign_
-                        # worker לא מוצא כאן משימה חופפת אמיתית לפנות, כי מדובר
-                        # רק בחלון-זמינות תיאורטי, לא שיבוץ בפועל).
-                        if not _force_targets and len(_fslot_idx):
-                            _term_targets = [
-                                _d for _d in _diag_results
-                                if "הפרדת טרמינלים" in str(_d.get("reason", ""))
-                            ]
-                            if _term_targets:
-                                st.caption(
-                                    "⚠️ מוצא אחרון — אין אף מועמד/ת זמינ/ה או במקום אחר; "
-                                    "הכפתור הבא ישבץ עובד/ת שנמצא/ת כרגע בטרמינל האחר, "
-                                    "ובכך יעכב את מעבר/ה בין הטרמינלים:"
-                                )
-                                for _tt in _term_targets:
-                                    _tc1, _tc2 = st.columns([4, 1])
-                                    with _tc1:
-                                        st.markdown(
-                                            f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
-                                            f"<b>{safe_html(_tt['name'])}</b> "
-                                            f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_tt['reason'])}</span></div>",
-                                            unsafe_allow_html=True,
-                                        )
-                                    with _tc2:
-                                        if st.button(
-                                            "הכרח שיבוץ",
-                                            key=f"force_term_{_fnum}_{_missing_role}_{_tt['name']}",
-                                            width="stretch",
-                                        ):
-                                            st.session_state["schedule_df"] = force_assign_worker(
-                                                _sched_diag, _fslot_idx[0], _tt["name"], _diag_emps_df,
-                                                keep_prior=True,
-                                                reason_tag="הכרח שיבוץ - מעכב מעבר בין טרמינלים",
-                                            )
-                                            _tdh = set(st.session_state.get("_transfer_delay_highlighted", set()))
-                                            _tdh.add(_fslot_idx[0])
-                                            st.session_state["_transfer_delay_highlighted"] = _tdh
-                                            for _k in ["labeled_df", "workload_df",
-                                                       "continuity_df", "output_df",
-                                                       "_ar_highlighted"]:
-                                                st.session_state.pop(_k, None)
-                                            st.success(
-                                                f"✅ {_tt['name']} שובצ/ה בהכרח ל-{_missing_role} "
-                                                f"בטיסה {_fnum} (מוצא אחרון) — מעבר/ה בין "
-                                                f"הטרמינלים יתעכב בהתאם."
-                                            )
-                                            st.rerun()
-
-                        # ── "הכרח שיבוץ" גם למי שנדחה על "משמרת לא מכסה" אבל יש
-                        # לו/ה מעבר-טרמינל מתוכנן (user rule 2026-07-25, מוצג
-                        # תמיד — גם כשקיימים מועמדי-_force_targets אחרים, לא
-                        # רק כמוצא אחרון: "יש להציג אותה באופציה"). שונה
-                        # מהקטגוריה הקודמת: כאן העובד/ת לא ב"טרמינל הלא נכון"
-                        # — היא בטרמינל הנכון, אבל חלון הזמינות שלה נחתך מוקדם
-                        # מדי בגלל חוצץ ההפסקה+מעבר שנשמר לפני המעבר בפועל (ר'
-                        # project_terminal1.md — "T1->T3 transfer buffer").
-                        # מציעים לה את הטיסה הזו במחיר עיכוב המעבר לטרמינל
-                        # השני (במקום לצאת בזמן להפסקה+מעבר, היא ממשיכה לעבוד
-                        # ומגיעה מאוחר יותר). מזוהה ע"י: יש לעובד/ת שדה "מעבר
-                        # טרמינל" לא ריק ב-employees_df (כלומר היא בעלת מעבר
-                        # מתוכנן היום), והסיבה שהוצגה היא "משמרת ... לא מכסה"
-                        # (לא הפרדת טרמינלים — היא כבר בטרמינל הנכון).
-                        if len(_fslot_idx):
-                            _transfer_names = set()
-                            if "מעבר טרמינל" in _diag_emps_df.columns:
-                                _tr_col = _diag_emps_df["מעבר טרמינל"].astype(str).str.strip()
-                                _transfer_names = set(
-                                    _diag_emps_df.loc[_tr_col.ne(""), "שם"].astype(str).str.strip()
-                                )
-                            _shift_short_targets = [
-                                _d for _d in _diag_results
-                                if str(_d.get("reason", "")).startswith("משמרת")
-                                and str(_d.get("name", "")).strip() in _transfer_names
-                            ]
-                            if _shift_short_targets:
-                                st.caption(
-                                    "⚠️ מוצא אחרון — העובד/ת בטרמינל הנכון אך חלון "
-                                    "הזמינות שלה קצר מדי בגלל חוצץ המעבר לטרמינל השני; "
-                                    "הכפתור הבא ישבץ אותה כאן ויעכב את המעבר שלה:"
-                                )
-                                for _st_t in _shift_short_targets:
-                                    _sc1, _sc2 = st.columns([4, 1])
-                                    with _sc1:
-                                        st.markdown(
-                                            f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
-                                            f"<b>{safe_html(_st_t['name'])}</b> "
-                                            f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_st_t['reason'])}</span></div>",
-                                            unsafe_allow_html=True,
-                                        )
-                                    with _sc2:
-                                        if st.button(
-                                            "הכרח שיבוץ",
-                                            key=f"force_shortshift_{_fnum}_{_missing_role}_{_st_t['name']}",
-                                            width="stretch",
-                                        ):
-                                            st.session_state["schedule_df"] = force_assign_worker(
-                                                _sched_diag, _fslot_idx[0], _st_t["name"], _diag_emps_df,
-                                                keep_prior=True,
-                                                reason_tag="הכרח שיבוץ - מעכב מעבר בין טרמינלים",
-                                            )
-                                            _tdh = set(st.session_state.get("_transfer_delay_highlighted", set()))
-                                            _tdh.add(_fslot_idx[0])
-                                            st.session_state["_transfer_delay_highlighted"] = _tdh
-                                            for _k in ["labeled_df", "workload_df",
-                                                       "continuity_df", "output_df",
-                                                       "_ar_highlighted"]:
-                                                st.session_state.pop(_k, None)
-                                            st.success(
-                                                f"✅ {_st_t['name']} שובצ/ה בהכרח ל-{_missing_role} "
-                                                f"בטיסה {_fnum} (מוצא אחרון) — מעבר/ה בין "
-                                                f"הטרמינלים יתעכב בהתאם."
-                                            )
-                                            st.rerun()
-
-                        # Near-miss candidates: qualified, conflict-free workers
-                        # whose shift ends just short (≤30 min) of the task end —
-                        # assignable only if they agree to extend. Uses the
-                        # conflict-safe get_extendable_candidates_for_swap (NOT
-                        # the raw "❓" diagnostic reasons, which don't check for
-                        # a scheduling conflict and could offer a double-booked
-                        # worker). Offered here because the normal swap flow
-                        # hard-excludes anyone outside their shift hours (user
-                        # rule 2026-07-13: "יש לשאול את המפקחים... האם הם מוכנים
-                        # למשוך את משמרתם... הצג אותם כאופציה לשיבוץ אבל ציין כי
-                        # זה תלוי באישור העובד").
-                        _slot_mask_nm = (
-                            (_sched_diag["טיסה"].astype(str) == str(_fnum)) &
-                            (_sched_diag["תפקיד בסיס"].astype(str) == str(_missing_role)) &
-                            (_sched_diag["עובד"].astype(str).str.contains("❌", na=False))
-                        )
-                        _slot_idx_nm = _sched_diag[_slot_mask_nm].index
-                        _near_miss = (
-                            get_extendable_candidates_for_swap(
-                                _sched_diag, _diag_emps_df, str(_fnum),
-                                str(_missing_role), _slot_idx_nm[0]
-                            ) if len(_slot_idx_nm) else []
-                        )
-                        if _near_miss:
-                            _nm_labels = [
-                                f"{n}  (משובצ/ת ל{d} — נדרש אישור)" if d
-                                else f"{n}  (פער {g} דק׳ מעבר לסיום המשמרת)"
-                                for (n, g, d) in _near_miss
-                            ]
-                            st.caption(
-                                "⏱️ שיבוץ בכפוף לאישור — עובד/ת שצריכ/ה להישאר "
-                                "מעבר לסיום המשמרת, או שמשובצ/ת לתפקיד אחר "
-                                "שיש למשוך אותו/ה ממנו:"
+                            st.markdown(
+                                f"**{_peak['label']}** — {_peak['n_flights']} טיסות · "
+                                f"דרושים **{_peak['required_rc']}** ראשי צוות · "
+                                f"זמינים **{_peak['available_rc']}** · {_coverage}"
                             )
-                            _nm_c1, _nm_c2 = st.columns([3, 1])
-                            _nm_key = f"nm_pick_{_fnum}_{_missing_role}"
-                            with _nm_c1:
-                                _nm_choice_label = st.selectbox(
-                                    "", _nm_labels, key=_nm_key,
-                                    label_visibility="collapsed",
+
+            # ── אבחון טיסות עם תפקידים חסרים ─────────────────────────────────────
+            _sched_diag = st.session_state.get("schedule_df", pd.DataFrame())
+            _missing_flights = _sched_diag[
+                _sched_diag["עובד"].astype(str).str.contains("❌", na=False)
+            ]["טיסה"].unique().tolist() if not _sched_diag.empty else []
+
+            # Chronological order for the missing-roles diagnostic. Raw departure
+            # time puts the after-midnight NIGHT flights (LY027/LY083/LY001/LY005,
+            # boarding 22:xx-00:xx on 20.07 and departing 00:30-01:05 on 21.07) at
+            # the TOP because 00:30 < 06:00 numerically — but they belong at the
+            # BOTTOM chronologically (they are the tail of the night shift). Pivot
+            # at 02:00 (the operational-day start = the 02:00 shift): any flight
+            # whose earliest task boards BEFORE 02:00 is night-shift tail and sorts
+            # LAST; everything boarding 02:00+ sorts by boarding time (user
+            # 2026-07-20).
+            if _missing_flights and not _sched_diag.empty:
+                def _mf_chrono_key(_fnum):
+                    _ft = _sched_diag[_sched_diag["טיסה"].astype(str) == str(_fnum)]
+                    _starts = [
+                        time_to_minutes(clean_text(str(_x)))
+                        for _x in _ft["התחלה"].tolist()
+                        if is_time_text(clean_text(str(_x)))
+                    ]
+                    if not _starts:
+                        return 10 ** 6
+                    return (min(_starts) - 2 * 60) % 1440
+                _missing_flights = sorted(_missing_flights, key=_mf_chrono_key)
+
+            if _missing_flights:
+                with st.expander(f"🔍 אבחון תפקידים חסרים ({len(_missing_flights)} טיסות)", expanded=False):
+                    _diag_flights_df = st.session_state.get("flights_snap", pd.DataFrame())
+                    _diag_emps_df    = st.session_state.get("employees_snap", pd.DataFrame())
+                    _diag_sched_list = _sched_diag.to_dict("records")
+
+                    for _fnum in _missing_flights:
+                        _missing_roles_for_flight = _sched_diag[
+                            (_sched_diag["טיסה"].astype(str) == str(_fnum)) &
+                            (_sched_diag["עובד"].astype(str).str.contains("❌", na=False))
+                        ]["תפקיד בסיס"].unique().tolist()
+
+                        _flight_row = _diag_flights_df[
+                            _diag_flights_df["טיסה"].astype(str).str.strip() == str(_fnum).strip()
+                        ]
+                        if _flight_row.empty:
+                            continue
+                        _flight_dict = _flight_row.iloc[0].to_dict()
+
+                        st.markdown(f"### ✈️ טיסה {_fnum} ← {_flight_dict.get('יעד','')} ({_flight_dict.get('המראה','')})")
+
+                        # ── USA flight with no gate yet → explain the shortage is
+                        # due to missing gate info, and offer manual gate entry.
+                        # A TSA inspector is stationed at a specific pier/checkpoint,
+                        # which is derived from the gate — with no gate the pier is
+                        # unknown, so the inspector slot can't be resolved. FIDS often
+                        # leaves late-night US flights gate-less until closer to
+                        # departure (user rule 2026-07-13).
+                        _diag_dest = clean_text(str(_flight_dict.get("יעד", "")))
+                        _diag_gate = clean_text(str(_flight_dict.get("גייט", "")))
+                        if not _diag_gate or _diag_gate.lower() == "nan":
+                            _diag_gate = clean_text(str(_flight_dict.get("שלוחה", "")))
+                        _diag_gate_missing = (not _diag_gate) or _diag_gate.lower() == "nan"
+                        if (_diag_dest in USA_TSA_DESTS and _diag_gate_missing
+                                and "מפקח TSA" in _missing_roles_for_flight):
+                            # Plain, short, single-clause sentences — a longer sentence
+                            # mixing an em-dash / bold markdown near the mid-sentence
+                            # "TSA" (LTR) token got visually scrambled by the browser's
+                            # bidi algorithm (same class of bug as the terminal-transfer
+                            # label fix: see [[project_terminal1]] "never mix an arrow/
+                            # symbol character with adjacent Hebrew+LTR tokens").
+                            st.info(
+                                "ℹ️ לטיסה זו לארצות הברית עדיין לא הוזן שער יציאה. "
+                                "בלי שער אי אפשר לדעת לאיזו שלוחה לשבץ מפקח TSA, "
+                                "וזו הסיבה לחוסר בשיבוץ. ניתן להזין את השער ידנית כאן. "
+                                "לאחר ההזנה הסידור ייבנה מחדש והמידע יתעדכן בכל מקום "
+                                "רלוונטי באתר."
+                            )
+                            _gk = f"manual_gate_input_{_fnum}"
+                            _gc1, _gc2 = st.columns([3, 1])
+                            with _gc1:
+                                st.text_input(
+                                    "שער יציאה (למשל C8 / D6):",
+                                    key=_gk,
+                                    placeholder="הזן שער...",
                                 )
-                            with _nm_c2:
-                                if st.button(
-                                    "שבץ בכפוף לאישור",
-                                    key=f"nm_assign_{_fnum}_{_missing_role}",
+                            with _gc2:
+                                st.markdown("<div style='padding-top:28px'></div>",
+                                            unsafe_allow_html=True)
+                                if st.button("✅ עדכן שער ובנה מחדש",
+                                             key=f"apply_gate_{_fnum}",
+                                             width="stretch"):
+                                    _g_in = clean_text(st.session_state.get(_gk, "")).upper()
+                                    if not _g_in:
+                                        st.warning("יש להזין ערך שער תקין.")
+                                    else:
+                                        # Don't mutate flights_editor_df / rebuild here —
+                                        # the flights data_editor and other widgets
+                                        # already rendered earlier in THIS script run,
+                                        # so a late in-place mutation here doesn't
+                                        # reliably reach them (found via real data
+                                        # 2026-07-13: the gate update silently didn't
+                                        # take effect). Instead, stash the request and
+                                        # rerun — the top of the script applies it
+                                        # (right after flights_editor_df is built) and
+                                        # rebuilds (right after _run_build_schedule is
+                                        # defined), both well before anything renders.
+                                        st.session_state["_pending_gate_update"] = {
+                                            "fnum": str(_fnum), "gate": _g_in,
+                                        }
+                                        st.rerun()
+
+                        for _missing_role in _missing_roles_for_flight:
+                            st.markdown(f"**❌ חסר: {_missing_role}**")
+                            # Build assignments list up to (but not including) this missing slot
+                            _prior = [t for t in _diag_sched_list
+                                      if t.get("טיסה") != str(_fnum) or "❌" not in str(t.get("עובד",""))]
+                            _diag_results = explain_missing_role(
+                                _flight_dict, _missing_role, _diag_emps_df, _prior
+                            )
+                            _diag_data = []
+                            for _d in _diag_results:
+                                _diag_data.append({"עובד": _d["name"], "סיבה לדחייה": _d["reason"]})
+                            if _diag_data:
+                                st.dataframe(
+                                    pd.DataFrame(_diag_data),
                                     width="stretch",
-                                ):
-                                    _nm_choice = _near_miss[_nm_labels.index(_nm_choice_label)][0]
-                                    if len(_slot_idx_nm):
-                                        st.session_state["schedule_df"] = do_swap(
-                                            _sched_diag, _slot_idx_nm[0], _nm_choice, "unassign"
-                                        )
-                                        for _k in ["labeled_df", "workload_df",
-                                                   "continuity_df", "output_df",
-                                                   "_ar_highlighted"]:
-                                            st.session_state.pop(_k, None)
-                                        st.success(
-                                            f"✅ {_nm_choice} שובצ/ה ל-{_missing_role} בטיסה {_fnum} "
-                                            f"— יש לוודא אישור להארכת המשמרת בפועל."
-                                        )
-                                        st.rerun()
-                    st.markdown("---")
+                                    hide_index=True,
+                                )
 
+                            # ── "הכרח שיבוץ" (force-assign) — user 2026-07-20 ──────
+                            # A manual override: for a candidate who is qualified,
+                            # within shift, and at the right terminal but currently
+                            # BUSY on another flight (reason starts "כבר משובץ") — or
+                            # genuinely free ("✅ זמין") — offer a button that pulls
+                            # them onto THIS slot and reshuffles their conflicting
+                            # tasks (best-effort back-fill; a shortage may just move).
+                            # NOT offered for "לא מכסה"/"הפרדת טרמינלים" candidates —
+                            # those are hard shift/terminal constraints, not a
+                            # priority-order choice.
+                            _force_targets = [
+                                _d for _d in _diag_results
+                                if str(_d.get("reason", "")).startswith("כבר משובץ")
+                                or "זמין" in str(_d.get("reason", ""))
+                            ]
+                            _fslot_mask = (
+                                (_sched_diag["טיסה"].astype(str) == str(_fnum)) &
+                                (_sched_diag["תפקיד בסיס"].astype(str) == str(_missing_role)) &
+                                (_sched_diag["עובד"].astype(str).str.contains("❌", na=False))
+                            )
+                            _fslot_idx = _sched_diag[_fslot_mask].index
+                            if _force_targets and len(_fslot_idx):
+                                st.caption(
+                                    "🔧 הכרח שיבוץ — משבץ את העובד/ת לטיסה זו גם אם הוא/היא "
+                                    "משובצ/ת כרגע במקום אחר; שאר משימותיו/ה יעודכנו בהתאם:"
+                                )
+                                for _ft in _force_targets:
+                                    _fc1, _fc2, _fc3 = st.columns([4, 1, 1])
+                                    with _fc1:
+                                        st.markdown(
+                                            f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
+                                            f"<b>{safe_html(_ft['name'])}</b> "
+                                            f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_ft['reason'])}</span></div>",
+                                            unsafe_allow_html=True,
+                                        )
+                                    with _fc2:
+                                        if st.button(
+                                            "הכרח שיבוץ",
+                                            key=f"force_{_fnum}_{_missing_role}_{_ft['name']}",
+                                            width="stretch",
+                                        ):
+                                            st.session_state["schedule_df"] = force_assign_worker(
+                                                _sched_diag, _fslot_idx[0], _ft["name"], _diag_emps_df,
+                                                keep_prior=True,
+                                            )
+                                            for _k in ["labeled_df", "workload_df",
+                                                       "continuity_df", "output_df",
+                                                       "_ar_highlighted"]:
+                                                st.session_state.pop(_k, None)
+                                            st.success(
+                                                f"✅ {_ft['name']} שובצ/ה בהכרח ל-{_missing_role} "
+                                                f"בטיסה {_fnum}. שאר משימותיו/ה עודכנו."
+                                            )
+                                            st.rerun()
+                                    with _fc3:
+                                        # "שבץ במקום" — move the worker here, freeing
+                                        # ALL their overlapping tasks (no late arrival):
+                                        # e.g. pull them off an earlier דייל slot to
+                                        # cover this ר"צ. User rule 2026-07-22.
+                                        if st.button(
+                                            "שבץ במקום",
+                                            key=f"move_{_fnum}_{_missing_role}_{_ft['name']}",
+                                            width="stretch",
+                                        ):
+                                            st.session_state["schedule_df"] = force_assign_worker(
+                                                _sched_diag, _fslot_idx[0], _ft["name"], _diag_emps_df,
+                                                keep_prior=False,
+                                            )
+                                            for _k in ["labeled_df", "workload_df",
+                                                       "continuity_df", "output_df",
+                                                       "_ar_highlighted"]:
+                                                st.session_state.pop(_k, None)
+                                            st.success(
+                                                f"✅ {_ft['name']} הועבר/ה ל-{_missing_role} "
+                                                f"בטיסה {_fnum} במקום השיבוץ הקודם. "
+                                                f"שאר משימותיו/ה עודכנו."
+                                            )
+                                            st.rerun()
+
+                            # ── "הכרח שיבוץ" גם למי שנדחה על "הפרדת טרמינלים" —
+                            # LAST RESORT בלבד (user rule 2026-07-22: "רק במידה ואין
+                            # שום אופציה אחרת"). מוצג רק כש-_force_targets (למעלה)
+                            # ריק — אין אף מועמד/ת "כבר משובץ"/"זמין". העובד/ת
+                            # משובץ/ת לטיסה זו למרות שהוא/היא נמצא/ת בטרמינל האחר
+                            # לפי מיפוי הזמינות שלו/ה כרגע — כלומר זה מעכב את מעבר/ה
+                            # לטרמינל השני, לא דוחה טיסה קונקרטית אחרת (force_assign_
+                            # worker לא מוצא כאן משימה חופפת אמיתית לפנות, כי מדובר
+                            # רק בחלון-זמינות תיאורטי, לא שיבוץ בפועל).
+                            if not _force_targets and len(_fslot_idx):
+                                _term_targets = [
+                                    _d for _d in _diag_results
+                                    if "הפרדת טרמינלים" in str(_d.get("reason", ""))
+                                ]
+                                if _term_targets:
+                                    st.caption(
+                                        "⚠️ מוצא אחרון — אין אף מועמד/ת זמינ/ה או במקום אחר; "
+                                        "הכפתור הבא ישבץ עובד/ת שנמצא/ת כרגע בטרמינל האחר, "
+                                        "ובכך יעכב את מעבר/ה בין הטרמינלים:"
+                                    )
+                                    for _tt in _term_targets:
+                                        _tc1, _tc2 = st.columns([4, 1])
+                                        with _tc1:
+                                            st.markdown(
+                                                f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
+                                                f"<b>{safe_html(_tt['name'])}</b> "
+                                                f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_tt['reason'])}</span></div>",
+                                                unsafe_allow_html=True,
+                                            )
+                                        with _tc2:
+                                            if st.button(
+                                                "הכרח שיבוץ",
+                                                key=f"force_term_{_fnum}_{_missing_role}_{_tt['name']}",
+                                                width="stretch",
+                                            ):
+                                                st.session_state["schedule_df"] = force_assign_worker(
+                                                    _sched_diag, _fslot_idx[0], _tt["name"], _diag_emps_df,
+                                                    keep_prior=True,
+                                                    reason_tag="הכרח שיבוץ - מעכב מעבר בין טרמינלים",
+                                                )
+                                                _tdh = set(st.session_state.get("_transfer_delay_highlighted", set()))
+                                                _tdh.add(_fslot_idx[0])
+                                                st.session_state["_transfer_delay_highlighted"] = _tdh
+                                                for _k in ["labeled_df", "workload_df",
+                                                           "continuity_df", "output_df",
+                                                           "_ar_highlighted"]:
+                                                    st.session_state.pop(_k, None)
+                                                st.success(
+                                                    f"✅ {_tt['name']} שובצ/ה בהכרח ל-{_missing_role} "
+                                                    f"בטיסה {_fnum} (מוצא אחרון) — מעבר/ה בין "
+                                                    f"הטרמינלים יתעכב בהתאם."
+                                                )
+                                                st.rerun()
+
+                            # ── "הכרח שיבוץ" גם למי שנדחה על "משמרת לא מכסה" אבל יש
+                            # לו/ה מעבר-טרמינל מתוכנן (user rule 2026-07-25, מוצג
+                            # תמיד — גם כשקיימים מועמדי-_force_targets אחרים, לא
+                            # רק כמוצא אחרון: "יש להציג אותה באופציה"). שונה
+                            # מהקטגוריה הקודמת: כאן העובד/ת לא ב"טרמינל הלא נכון"
+                            # — היא בטרמינל הנכון, אבל חלון הזמינות שלה נחתך מוקדם
+                            # מדי בגלל חוצץ ההפסקה+מעבר שנשמר לפני המעבר בפועל (ר'
+                            # project_terminal1.md — "T1->T3 transfer buffer").
+                            # מציעים לה את הטיסה הזו במחיר עיכוב המעבר לטרמינל
+                            # השני (במקום לצאת בזמן להפסקה+מעבר, היא ממשיכה לעבוד
+                            # ומגיעה מאוחר יותר). מזוהה ע"י: יש לעובד/ת שדה "מעבר
+                            # טרמינל" לא ריק ב-employees_df (כלומר היא בעלת מעבר
+                            # מתוכנן היום), והסיבה שהוצגה היא "משמרת ... לא מכסה"
+                            # (לא הפרדת טרמינלים — היא כבר בטרמינל הנכון).
+                            if len(_fslot_idx):
+                                _transfer_names = set()
+                                if "מעבר טרמינל" in _diag_emps_df.columns:
+                                    _tr_col = _diag_emps_df["מעבר טרמינל"].astype(str).str.strip()
+                                    _transfer_names = set(
+                                        _diag_emps_df.loc[_tr_col.ne(""), "שם"].astype(str).str.strip()
+                                    )
+                                _shift_short_targets = [
+                                    _d for _d in _diag_results
+                                    if str(_d.get("reason", "")).startswith("משמרת")
+                                    and str(_d.get("name", "")).strip() in _transfer_names
+                                ]
+                                if _shift_short_targets:
+                                    st.caption(
+                                        "⚠️ מוצא אחרון — העובד/ת בטרמינל הנכון אך חלון "
+                                        "הזמינות שלה קצר מדי בגלל חוצץ המעבר לטרמינל השני; "
+                                        "הכפתור הבא ישבץ אותה כאן ויעכב את המעבר שלה:"
+                                    )
+                                    for _st_t in _shift_short_targets:
+                                        _sc1, _sc2 = st.columns([4, 1])
+                                        with _sc1:
+                                            st.markdown(
+                                                f"<div style='direction:rtl;padding-top:7px;font-size:13px;'>"
+                                                f"<b>{safe_html(_st_t['name'])}</b> "
+                                                f"<span style='color:rgba(var(--ink-rgb),.74);'>— {safe_html(_st_t['reason'])}</span></div>",
+                                                unsafe_allow_html=True,
+                                            )
+                                        with _sc2:
+                                            if st.button(
+                                                "הכרח שיבוץ",
+                                                key=f"force_shortshift_{_fnum}_{_missing_role}_{_st_t['name']}",
+                                                width="stretch",
+                                            ):
+                                                st.session_state["schedule_df"] = force_assign_worker(
+                                                    _sched_diag, _fslot_idx[0], _st_t["name"], _diag_emps_df,
+                                                    keep_prior=True,
+                                                    reason_tag="הכרח שיבוץ - מעכב מעבר בין טרמינלים",
+                                                )
+                                                _tdh = set(st.session_state.get("_transfer_delay_highlighted", set()))
+                                                _tdh.add(_fslot_idx[0])
+                                                st.session_state["_transfer_delay_highlighted"] = _tdh
+                                                for _k in ["labeled_df", "workload_df",
+                                                           "continuity_df", "output_df",
+                                                           "_ar_highlighted"]:
+                                                    st.session_state.pop(_k, None)
+                                                st.success(
+                                                    f"✅ {_st_t['name']} שובצ/ה בהכרח ל-{_missing_role} "
+                                                    f"בטיסה {_fnum} (מוצא אחרון) — מעבר/ה בין "
+                                                    f"הטרמינלים יתעכב בהתאם."
+                                                )
+                                                st.rerun()
+
+                            # Near-miss candidates: qualified, conflict-free workers
+                            # whose shift ends just short (≤30 min) of the task end —
+                            # assignable only if they agree to extend. Uses the
+                            # conflict-safe get_extendable_candidates_for_swap (NOT
+                            # the raw "❓" diagnostic reasons, which don't check for
+                            # a scheduling conflict and could offer a double-booked
+                            # worker). Offered here because the normal swap flow
+                            # hard-excludes anyone outside their shift hours (user
+                            # rule 2026-07-13: "יש לשאול את המפקחים... האם הם מוכנים
+                            # למשוך את משמרתם... הצג אותם כאופציה לשיבוץ אבל ציין כי
+                            # זה תלוי באישור העובד").
+                            _slot_mask_nm = (
+                                (_sched_diag["טיסה"].astype(str) == str(_fnum)) &
+                                (_sched_diag["תפקיד בסיס"].astype(str) == str(_missing_role)) &
+                                (_sched_diag["עובד"].astype(str).str.contains("❌", na=False))
+                            )
+                            _slot_idx_nm = _sched_diag[_slot_mask_nm].index
+                            _near_miss = (
+                                get_extendable_candidates_for_swap(
+                                    _sched_diag, _diag_emps_df, str(_fnum),
+                                    str(_missing_role), _slot_idx_nm[0]
+                                ) if len(_slot_idx_nm) else []
+                            )
+                            if _near_miss:
+                                _nm_labels = [
+                                    f"{n}  (משובצ/ת ל{d} — נדרש אישור)" if d
+                                    else f"{n}  (פער {g} דק׳ מעבר לסיום המשמרת)"
+                                    for (n, g, d) in _near_miss
+                                ]
+                                st.caption(
+                                    "⏱️ שיבוץ בכפוף לאישור — עובד/ת שצריכ/ה להישאר "
+                                    "מעבר לסיום המשמרת, או שמשובצ/ת לתפקיד אחר "
+                                    "שיש למשוך אותו/ה ממנו:"
+                                )
+                                _nm_c1, _nm_c2 = st.columns([3, 1])
+                                _nm_key = f"nm_pick_{_fnum}_{_missing_role}"
+                                with _nm_c1:
+                                    _nm_choice_label = st.selectbox(
+                                        "", _nm_labels, key=_nm_key,
+                                        label_visibility="collapsed",
+                                    )
+                                with _nm_c2:
+                                    if st.button(
+                                        "שבץ בכפוף לאישור",
+                                        key=f"nm_assign_{_fnum}_{_missing_role}",
+                                        width="stretch",
+                                    ):
+                                        _nm_choice = _near_miss[_nm_labels.index(_nm_choice_label)][0]
+                                        if len(_slot_idx_nm):
+                                            st.session_state["schedule_df"] = do_swap(
+                                                _sched_diag, _slot_idx_nm[0], _nm_choice, "unassign"
+                                            )
+                                            for _k in ["labeled_df", "workload_df",
+                                                       "continuity_df", "output_df",
+                                                       "_ar_highlighted"]:
+                                                st.session_state.pop(_k, None)
+                                            st.success(
+                                                f"✅ {_nm_choice} שובצ/ה ל-{_missing_role} בטיסה {_fnum} "
+                                                f"— יש לוודא אישור להארכת המשמרת בפועל."
+                                            )
+                                            st.rerun()
+                        st.markdown("---")
+
+        _render_schedule_tab()
         # ── Tab: פנויים באולם ─────────────────────────────────────────────────
     if active_main_tab == TAB_AVAILABLE:
         st.markdown(

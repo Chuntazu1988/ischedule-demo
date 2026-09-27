@@ -277,7 +277,10 @@ html, body, .stApp, .stApp button, .stApp input, .stApp textarea, .stApp select,
 div[role="dialog"] { background: var(--card) !important; color: var(--ink) !important; border: 1px solid var(--glass-line) !important; border-radius: 20px !important; }
 div[role="dialog"] * { color: var(--ink); }
 [data-baseweb="popover"] > div, [data-baseweb="menu"], ul[role="listbox"] { background: var(--card) !important; color: var(--ink) !important; border-radius: 12px !important; }
-[data-baseweb="menu"] li, ul[role="listbox"] li { color: var(--ink) !important; }
+/* selectbox/multiselect dropdown options: right-to-left, right-aligned — these
+   render in a portal outside our rtl containers, so they don't inherit it */
+[data-baseweb="menu"], ul[role="listbox"] { direction: rtl; }
+[data-baseweb="menu"] li, ul[role="listbox"] li { color: var(--ink) !important; text-align: right; }
 [data-baseweb="menu"] li:hover, ul[role="listbox"] li:hover, ul[role="listbox"] li[aria-selected="true"] { background: rgba(var(--acc-rgb),.16) !important; }
 
 /* accessibility: a clearly visible keyboard focus ring everywhere */
@@ -1162,6 +1165,7 @@ body { background: var(--bg); }
     margin-bottom: 10px;
     border-bottom: 1px solid rgba(var(--ink-rgb),.1);
     padding-bottom: 8px;
+    text-align: right;
 }
 
 .swap-popup-label {

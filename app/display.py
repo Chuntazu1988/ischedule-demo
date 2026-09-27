@@ -2667,7 +2667,10 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                     arrow = "▲" if st.session_state[popup_key] else "▼"
                     if st.button(arrow, key=f"arrow_{uid}", help="החלף עובד"):
                         st.session_state[popup_key] = not st.session_state[popup_key]
-                        st.rerun()
+                        # local popup toggle only — no shared data changes, so this
+                        # doesn't need to re-run the whole page (it's always called
+                        # from inside the schedule tab's @st.fragment)
+                        st.rerun(scope="fragment")
 
                 if st.session_state[popup_key]:
                     candidates = get_qualified_candidates_for_swap(
@@ -2774,7 +2777,7 @@ def render_flight_card_with_swap(row, schedule_df, employees_df, highlighted_tas
                         with bc2:
                             if st.button("✖ ביטול", key=f"swap_cancel_{uid}", width="stretch"):
                                 st.session_state[popup_key] = False
-                                st.rerun()
+                                st.rerun(scope="fragment")
 
                         # Near-miss options shown BELOW the normal ones, clearly
                         # marked as conditional on the employee agreeing to extend.

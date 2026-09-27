@@ -201,6 +201,12 @@ def polish_schedule(schedule_df, employees_df, max_rounds=40, late_shift_from=No
         return a, (b - a) % 1440 or 1440
 
     restricted = {nm: S._is_restricted_worker(row) for nm, row in emp_map.items()}
+    # Terminal 1 has very few flight waves a day (~3), so a T1 worker going down for
+    # one wave, back to the counters for ~2h, then down again for the next wave is the
+    # NORMAL shape of the day there — not the "extra round trip" the trip cost penalizes
+    # for T3 (user rule 2026-09-27: "בטרמינל 1... במידת הצורך אפשר להוריד עובד לטיסה,
+    # להחזיר אותו לדלפקים לשעתיים ואז שוב להחזיר אותו לטיסה נוספת").
+    t1_workers = {nm for nm, row in emp_map.items() if clean_text(str(row.get("טרמינל", ""))) == "1"}
     group_of = {}
     static = {}       # per worker: (shift bounds, break, refresh, long shift, night rule)
     windows = {}      # per worker: absolute minute windows the worker may be on shift
@@ -288,7 +294,8 @@ def polish_schedule(schedule_df, employees_df, max_rounds=40, late_shift_from=No
         comp["single"] = ((W_SINGLE_RESTRICTED if restricted.get(name)
                            else (W_SINGLE_LATE_START if late_starter else W_SINGLE))
                           if len(items) == 1 else 0.0)
-        comp["trip"] = 0.0 if is_runner else W_TRIP * sum(1 for g in gaps if g >= TRIP_GAP)
+        comp["trip"] = (0.0 if (is_runner or name in t1_workers)
+                        else W_TRIP * sum(1 for g in gaps if g >= TRIP_GAP))
         comp["crowd"] = sum((CROWD_UNDER - g) * W_CROWD for g in gaps if g < CROWD_UNDER)
         m = group_mean.get(group_of.get(name))
         comp["group"] = W_GRP * (len(items) - m) ** 2 if (m is not None and W_GRP) else 0.0

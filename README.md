@@ -64,19 +64,29 @@ built range is shown "המשך יבוא" instead of a false end-of-day.
 
 | Tab | Purpose |
 |---|---|
-| 🛠️ סידור עבודה | The assignment itself, per flight, with manual swap |
-| 📋 זרימת עבודה | Per-worker timeline: flights, breaks, walks to the gate, terminal moves |
+| 🔧 סידור עבודה | The assignment itself, per flight, with manual swap |
+| 📑 זרימת עבודה | Per-worker breakdown: flights, breaks, walks to the gate, terminal moves |
+| 📈 ציר זמן | A visual timeline — every worker's tasks as bars on a shared time axis, grouped or sorted by role, name or workload, zoomable to an hour range, with free-window highlighting and click-through to the flight card |
 | ⏱️ מרכז בקרה | Who is working now, shift hours, terminal, arrivals, removals |
-| 🚨 לא משובצים / הפסקות | Unfilled slots and break tracking |
+| 🚨 לא משובצים | Unfilled slots and break tracking |
 | 🟡 פנויים באולם | Who is free right now |
-| 🗂️ היסטוריה | Past schedules, including each shift's own version of the day |
+| 🧑‍✈️ ניהול עובדים | Employee roster and profiles |
 | 👤 ניהול משתמשים | Accounts and roles |
+| 🗂️ היסטוריה | Past schedules, including each shift's own version of the day |
 
 There is also a separate Gantt view (`streamlit_app_gantt.py`).
 
 Assignments can be overridden by hand at any point — swapping a worker, moving someone
 between terminals, or typing a replacement name. Overrides are applied as asked, with any
 certification gap, shift conflict or double-booking reported alongside.
+
+## Interface
+
+Three grey-and-pastel glass themes (light / mid / charcoal) switch live, with no reload and
+no loss of state. A coverage meter next to the stats row shows how complete the schedule is
+at a glance, and a pre-send check catches gaps before a schedule is published. `Ctrl+K` opens
+a quick-jump palette to search tabs and flights by name instead of scrolling, and `Alt+1`–`9`
+jump straight to a tab.
 
 ## Running it
 
