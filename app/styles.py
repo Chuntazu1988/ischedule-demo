@@ -801,12 +801,23 @@ div[data-testid="stFormSubmitButton"] button[kind^="primary"]:hover {
 .tl-key i.tl-gap-key { background: repeating-linear-gradient(135deg, rgba(var(--acc-rgb),.45) 0 3px, rgba(var(--acc-rgb),.1) 3px 6px);
   border: 1.5px dashed rgb(var(--acc-rgb)); }
 .tl-gap { overflow: hidden; }
-.tl-gap-brk { border-style: solid; }
-.tl-gap .tl-brk { position: absolute; right: 0; top: 0; bottom: 0; background: rgba(var(--acc-rgb),.45); border-inline-start: 2px solid rgb(var(--acc-strong-rgb, var(--acc-rgb))); z-index: 0; }
+/* the break/refresh portion of a gap: its own solid box, separate from the
+   (hatched, clickable) free-time box that follows it */
+.tl-brk-box { position: absolute; top: 8px; bottom: 8px; border-radius: 6px; display: flex; align-items: center;
+  justify-content: center; font-size: 11px; font-weight: 800; color: var(--acc-strong);
+  background: rgba(var(--acc-rgb),.35); border: 1.5px solid rgb(var(--acc-rgb)); z-index: 0; overflow: hidden; white-space: nowrap; }
 .tl-gap span { position: relative; z-index: 1; }
 .tl-group { text-align: right; direction: rtl; min-width: 900px; padding: 7px 14px; font-weight: 800; font-size: 13px; background: rgba(var(--acc-rgb),.10);
   border-bottom: 1px solid rgba(var(--acc-rgb),.35); position: sticky; right: 0; }
 .tl-bar[data-fl] { cursor: pointer; }
+.tl-gap[data-gap] { cursor: pointer; }
+/* hidden trigger buttons: only ever clicked programmatically from the timeline */
+[class*="st-key-tlprev_"], [class*="st-key-tldragbtn_"], [class*="st-key-tldropbtn_"] { display: none !important; }
+.tl-bar[draggable] { cursor: grab; }
+.tl-track.tl-dragover { background: rgba(var(--acc-rgb),.12); outline: 2px dashed rgb(var(--acc-rgb)); outline-offset: -2px; }
+/* gap-assign panels: right-aligned, same idea as the swap popup */
+[class*="st-key-gap_"] [data-testid="stExpander"] summary { direction: rtl; text-align: right; }
+[class*="st-key-gap_"] [data-testid="stExpander"] summary p { text-align: right; width: 100%; }
 .tl-bar:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(var(--shadow-rgb),.3); z-index: 5; }
 /* coverage meter under the stats row */
 .cov { direction: rtl; margin: 0 0 14px; padding: 12px 16px; border-radius: 14px;
@@ -844,6 +855,104 @@ div[data-testid="stFormSubmitButton"] button[kind^="primary"]:hover {
 }
 [data-testid="stMetricLabel"] p { font-size: 13px !important; color: rgba(var(--ink-rgb),.8) !important; }
 [data-testid="stMetricValue"] > div { font-family: 'Chakra Petch', sans-serif; font-weight: 700; font-size: 30px; color: var(--ink); }
+/* control-center stat cards: RTL, right-aligned, role-colour edge + icon chip */
+.cc-card { direction: rtl; text-align: right; display: flex; flex-direction: column; gap: 3px;
+    background: var(--glass); border: 1px solid var(--glass-line);
+    border-right: 5px solid rgb(var(--cc-tone, var(--acc-rgb))); border-radius: 14px;
+    padding: 12px 14px 10px; min-height: 104px; box-shadow: 0 4px 14px rgba(var(--shadow-rgb),.08);
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.cc-card .cc-top { display: flex; align-items: center; justify-content: flex-start; gap: 8px;
+    font-size: 13px; font-weight: 700; color: rgba(var(--ink-rgb),.88); }
+.cc-card .cc-ico { width: 28px; height: 28px; border-radius: 9px; flex-shrink: 0;
+    display: inline-flex; align-items: center; justify-content: center; font-size: 15px;
+    background: rgba(var(--cc-tone, var(--acc-rgb)), .18); border: 1px solid rgba(var(--cc-tone, var(--acc-rgb)), .5); }
+.cc-card .cc-val { font-family: 'Chakra Petch', sans-serif; font-weight: 700; font-size: 34px;
+    line-height: 1.1; color: var(--ink); }
+.cc-card .cc-sub { font-size: 11.5px; color: rgba(var(--ink-rgb),.72); line-height: 1.3; }
+.cc-grid { direction: rtl; display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 10px; margin: 4px 0 10px; }
+.cc-chips { direction: rtl; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 12px; }
+.cc-chips-lbl { font-size: 12.5px; font-weight: 700; color: rgba(var(--ink-rgb),.85); }
+.cc-chip { font-size: 12.5px; padding: 3px 11px; border-radius: 999px; color: var(--ink);
+    background: rgba(var(--r-insp),.14); border: 1px solid rgba(var(--r-insp),.5); }
+.cc-chip b { font-family: 'Chakra Petch', sans-serif; margin-inline-start: 4px; }
+/* "מי עובד היום" roster: section header per segment + a grid of worker cards */
+.wd-sec { direction: rtl; display: flex; align-items: center; gap: 10px; margin: 18px 0 8px;
+    font-size: 16px; font-weight: 800; color: var(--ink); padding-right: 10px;
+    border-right: 4px solid rgb(var(--acc-rgb)); }
+.wd-sec b { font-family: 'Chakra Petch', sans-serif; font-size: 13px; font-weight: 700;
+    padding: 1px 10px; border-radius: 999px; background: rgba(var(--acc-rgb),.16);
+    border: 1px solid rgba(var(--acc-rgb),.45); }
+.wd-grid { direction: rtl; display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 9px; }
+.wd-card { direction: rtl; text-align: right; display: flex; flex-direction: column; gap: 4px;
+    background: var(--glass); border: 1px solid var(--glass-line);
+    border-right: 5px solid rgb(var(--cc-tone, var(--acc-rgb))); border-radius: 12px;
+    padding: 9px 12px 8px; box-shadow: 0 3px 10px rgba(var(--shadow-rgb),.07); }
+.wd-card .wd-name { font-size: 14px; font-weight: 800; color: var(--ink); line-height: 1.25; }
+.wd-card .wd-hours { direction: ltr; unicode-bidi: isolate; align-self: flex-end;
+    font-family: 'Chakra Petch', sans-serif; font-size: 13px; color: rgba(var(--ink-rgb),.8); }
+.wd-card .wd-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.wd-chip { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; color: var(--ink);
+    background: rgba(var(--ink-rgb),.06); border: 1px solid rgba(var(--ink-rgb),.25); }
+.wd-chip.wd-ok { background: rgba(var(--r-guard),.16); border-color: rgba(var(--r-guard),.55); }
+.wd-chip.wd-wait { color: rgba(var(--ink-rgb),.7); border-style: dashed; }
+.wd-chip.wd-off-chip { background: rgba(var(--r-insp),.16); border-color: rgba(var(--r-insp),.6); font-weight: 700; }
+/* break-management rows: one glass card per worker (the action buttons sit beside it) */
+.bk-card { direction: rtl; text-align: right; display: flex; flex-direction: column; gap: 5px;
+    background: var(--glass); border: 1px solid var(--glass-line);
+    border-right: 5px solid rgb(var(--cc-tone, var(--acc-rgb))); border-radius: 12px;
+    padding: 9px 14px; box-shadow: 0 3px 10px rgba(var(--shadow-rgb),.07); }
+.bk-card .bk-main { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.bk-card .bk-name { font-size: 15px; font-weight: 800; color: var(--ink); margin-inline-end: 6px; }
+.bk-card .bk-chip { font-size: 12px; padding: 2px 10px; border-radius: 999px; color: var(--ink);
+    background: rgba(var(--ink-rgb),.06); border: 1px solid rgba(var(--ink-rgb),.25); }
+.bk-card .bk-chip.bk-dead { background: rgba(var(--r-insp),.16); border-color: rgba(var(--r-insp),.6); font-weight: 700; }
+.bk-card .bk-reason { font-size: 12px; color: rgba(var(--ink-rgb),.74); line-height: 1.4; }
+/* terminal-1 / transfer workers: orange tint + chip (never colour alone) */
+.wd-card.wd-t1 { background: linear-gradient(0deg, rgba(var(--t1-rgb),.15), rgba(var(--t1-rgb),.15)), var(--glass);
+    border-color: rgba(var(--t1-rgb),.6); }
+.wd-chip.wd-t1-chip { background: rgba(var(--t1-rgb),.2); border-color: rgb(var(--t1-rgb)); font-weight: 700; }
+.wd-card.wd-off { opacity: .62; border-right-style: dashed; }
+.wd-card.wd-off .wd-name { text-decoration: line-through; }
+/* workflow tab: each employee row is a glass card; the right edge shows the briefing
+   state (○ grey / ✓ amber / ✓✓ green) and the same state is spelled out as text */
+[data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] .wf-chips) {
+    background: var(--glass); border: 1px solid var(--glass-line);
+    border-right: 5px solid rgba(var(--ink-rgb),.35); border-radius: 12px;
+    padding: 8px 12px 14px; margin-bottom: 8px; align-items: center;
+    box-shadow: 0 3px 10px rgba(var(--shadow-rgb),.07); }
+[data-testid="stHorizontalBlock"]:has(.wf-st1) { border-right-color: rgb(var(--r-tl)); }
+[data-testid="stHorizontalBlock"]:has(.wf-st2) { border-right-color: rgb(var(--r-guard)); }
+.wf-st { direction: rtl; text-align: right; margin: 4px 0 2px auto; font-size: 11.5px; font-weight: 700;
+    display: block; width: fit-content; padding: 1px 9px; border-radius: 999px; color: var(--ink);
+    background: rgba(var(--ink-rgb),.06); border: 1px dashed rgba(var(--ink-rgb),.35); }
+.wf-st1 { background: rgba(var(--r-tl),.16); border: 1px solid rgba(var(--r-tl),.6); }
+.wf-st2 { background: rgba(var(--r-guard),.16); border: 1px solid rgba(var(--r-guard),.6); }
+/* workflow-tab filters as pills */
+[class*="st-key-wf_role_filter"] label[data-baseweb="radio"], [class*="st-key-wf_term_filter"] label[data-baseweb="radio"] {
+    padding: 4px 14px; border-radius: 999px; border: 1px solid rgba(var(--ink-rgb),.3);
+    background: var(--glass); margin-inline-start: 6px; }
+[class*="st-key-wf_role_filter"] label[data-baseweb="radio"]:has(input:checked), [class*="st-key-wf_term_filter"] label[data-baseweb="radio"]:has(input:checked) {
+    background: rgba(var(--acc-rgb),.2); border-color: rgb(var(--acc-rgb)); font-weight: 800; }
+/* work-schedule tab: search / filter controls live in one glass card */
+.st-key-sch_ctrl, .st-key-un_ctrl, .st-key-tl_ctrl { background: var(--glass); border: 1px solid var(--glass-line); border-radius: 14px;
+    padding: 12px 16px 10px; margin: 6px 0 14px; box-shadow: 0 4px 14px rgba(var(--shadow-rgb),.08);
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+.st-key-sch_ctrl input { direction: rtl; text-align: right; }
+.st-key-schedule_term_filter label[data-baseweb="radio"] { padding: 4px 14px; border-radius: 999px;
+    border: 1px solid rgba(var(--ink-rgb),.3); background: var(--glass); margin-inline-start: 6px; }
+.st-key-schedule_term_filter label[data-baseweb="radio"]:has(input:checked) {
+    background: rgba(var(--acc-rgb),.2); border-color: rgb(var(--acc-rgb)); font-weight: 800; }
+[class*="st-key-cc_"] { margin-bottom: 10px; }
+[class*="st-key-cc_"] [data-testid="stPopover"] { margin-top: 4px; }
+[class*="st-key-cc_"] [data-testid="stPopover"] button { direction: rtl; min-height: 32px; font-size: 12.5px;
+    border-radius: 10px; justify-content: center; }
+[data-testid="stPopoverBody"] .cc-pop-title { font-weight: 800; font-size: 14px; text-align: right;
+    padding: 0 10px 6px 0; margin-bottom: 6px; border-right: 4px solid rgb(var(--acc-rgb)); }
+[data-testid="stPopoverBody"] .cc-pop-list { direction: rtl; text-align: right; margin: 0; width: 100%;
+    display: block; padding: 0 18px 0 0; list-style: disc; font-size: 13.5px; line-height: 1.9; }
+[data-testid="stPopoverBody"] .cc-pop-list li { text-align: right; }
+[data-testid="stPopoverBody"] [data-testid="stMarkdownContainer"] { width: 100%; text-align: right; }
 /* section heading inside a screen */
 .sec-title { direction: rtl; text-align: right; font-size: 18px; font-weight: 800; color: var(--ink);
     margin: 26px 0 12px; padding: 2px 10px 2px 0; border-right: 4px solid rgb(var(--acc-rgb)); }
@@ -1412,7 +1521,7 @@ def theme_sync_html(want: str) -> str:
     }
     // keyboard: Alt+1..9 switch tabs, Ctrl+K opens a quick-jump palette (tabs + flights)
     {
-      const ORDER = ['schedule', 'workflow', 'timeline', 'dashboard', 'unassigned', 'available', 'users', 'employees', 'archive'];
+      const ORDER = ['schedule', 'workflow', 'timeline', 'dashboard', 'unassigned', 'special_posts', 'users', 'employees', 'archive'];
       const navBtn = (k) => D.querySelector('.st-key-nav_tab_' + k + ' button');
       const typing = () => { const a = D.activeElement; return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable); };
       let box = null, sel = 0, items = [];
@@ -1428,6 +1537,20 @@ def theme_sync_html(want: str) -> str:
             const card = el.closest('[class*="st-key-fc_"]');
             const det = card && card.querySelector('details');
             if (det && !det.open) { const sm = det.querySelector('summary'); if (sm) sm.click(); }
+          }
+        }, 150);
+      }
+      function openGap(id) {
+        let tries = 0;
+        const t = setInterval(() => {
+          const el = D.getElementById(id);
+          if (el || ++tries > 40) {
+            clearInterval(t);
+            if (!el) return;
+            const card = el.closest('[class*="st-key-gap_"]');
+            const det = card && card.querySelector('details');
+            if (det && !det.open) { const sm = det.querySelector('summary'); if (sm) sm.click(); }
+            (card || el).scrollIntoView({ behavior: 'smooth', block: 'center' });
           }
         }, 150);
       }
@@ -1468,12 +1591,57 @@ def theme_sync_html(want: str) -> str:
         });
         box.addEventListener('mousedown', (e) => { if (e.target === box) close(); });
       }
-      // timeline bar click -> open that flight's card on the schedule tab
+      // timeline bar click -> preview that flight in place (no tab switch, so the
+      // timeline's scroll position and filters stay put) by clicking the matching
+      // hidden Streamlit button rendered for it (st-key-tlprev_<id>)
+      // exact class-token match — a substring match on the id (e.g. "LY32" inside
+      // "LY321", or task "1" inside "10") would otherwise grab the wrong hidden button
+      function exactBtn(prefix, idPart) {
+        const want = prefix + idPart;
+        const box = [...D.querySelectorAll('[class*="' + prefix + '"]')]
+          .find((el) => el.className.split(' ').includes(want));
+        return box && box.querySelector('button');
+      }
       on(D, 'click', (e) => {
         const bar = e.target.closest && e.target.closest('.tl-bar[data-fl]');
         if (!bar) return;
-        const b = navBtn('schedule'); if (b) b.click();
-        openFlight('fl-' + bar.getAttribute('data-fl'));
+        const btn = exactBtn('st-key-tlprev_', bar.getAttribute('data-fl'));
+        if (btn) btn.click();
+      }, true);
+      // drag a task bar onto another worker's row -> confirm-and-check dialog
+      // (see the long comment above the hidden tldragbtn_/tldropbtn_ buttons
+      // in streamlit_app.py for why this is two separate button clicks)
+      on(D, 'dragstart', (e) => {
+        const bar = e.target.closest && e.target.closest('.tl-bar[data-task]');
+        if (!bar) return;
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', bar.getAttribute('data-task'));
+        const btn = exactBtn('st-key-tldragbtn_', bar.getAttribute('data-task'));
+        if (btn) btn.click();
+      }, true);
+      on(D, 'dragover', (e) => {
+        const track = e.target.closest && e.target.closest('.tl-track[data-w]');
+        if (!track) return;
+        e.preventDefault();
+        track.classList.add('tl-dragover');
+      }, true);
+      on(D, 'dragleave', (e) => {
+        const track = e.target.closest && e.target.closest('.tl-track[data-w]');
+        if (track) track.classList.remove('tl-dragover');
+      }, true);
+      on(D, 'drop', (e) => {
+        const track = e.target.closest && e.target.closest('.tl-track[data-w]');
+        if (!track) return;
+        e.preventDefault();
+        track.classList.remove('tl-dragover');
+        const btn = exactBtn('st-key-tldropbtn_', track.getAttribute('data-w'));
+        if (btn) btn.click();
+      }, true);
+      // timeline free-window click -> open the "what can I assign here" panel, same tab
+      on(D, 'click', (e) => {
+        const gap = e.target.closest && e.target.closest('.tl-gap[data-gap]');
+        if (!gap) return;
+        openGap('gapanchor-' + gap.getAttribute('data-gap'));
       }, true);
       on(D, 'keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); openPalette(); return; }

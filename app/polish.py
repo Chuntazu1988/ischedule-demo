@@ -33,7 +33,7 @@ from utils.helpers import clean_text, is_time_text, time_to_minutes, to_datetime
 _GAP_OK = S._GAP_OK
 
 # ── weights (all "minutes of pain") ──────────────────────────────────────────
-W_DEAD = 1.0          # per idle minute between two flights that is not owed as break
+W_DEAD = 20.0         # per idle minute between two flights that is not owed as break (1 -> 10 -> 20 on 2026-10-04: user chose minimal gaps over flight balance; on the real 04.10 schedule idle minutes 295 -> 205 and LY221 moves to נעמה)
 W_SINGLE = 45.0       # a worker brought down for exactly one flight
 W_SINGLE_LATE_START = 12.0  # ...and so is an early-shift worker who has been idle for 4h+ and whose
                             # FIRST task this is: "להוריד עובד ממשמרת עד 11/12:30/13:30 לטיסה הזאת
@@ -41,21 +41,38 @@ W_SINGLE_LATE_START = 12.0  # ...and so is an early-shift worker who has been id
 LATE_START_AFTER = 240
 W_SINGLE_RESTRICTED = 4.0   # ...but a ילד עובדים / פורש is the right person for a lone flight
                             # (user 2026-09-25: "להעדיף ילד עובדים על טיסה בודדת")
-W_TL = 40.0           # ר"צ-flight imbalance: delta = 2 * W_TL * (receiver - giver + 1)
+W_TL = 15.0           # ר"צ-flight imbalance: delta = 2 * W_TL * (receiver - giver + 1) (40 -> 15 on 2026-10-04: minimal gaps win over balance)
 W_NOBREAK = 90.0      # >= 3h of work and no between-flight gap that fits the break
 W_LATE_BREAK = 0.7    # per minute of continuous work beyond LATE_BREAK_AFTER
 W_EDGE = 400.0        # task at the very start / end of the worker's shift
 W_CROWD = 2.0         # per minute a gap between two tasks is shorter than CROWD_UNDER
 CROWD_UNDER = 15
-W_GRP = 12.0          # workers on the SAME shift should carry a similar number of flights
+W_GRP = 15.0          # workers on the SAME shift should carry a similar number of flights (12 -> 30 on 2026-10-04: with W_UNDER=60,
+                      # early workers with <=1 flight 12 -> 11 and mid gaps 1190 -> 1140 min on the real 04.10 night build)
 W_TRIP = 45.0         # a gap of TRIP_GAP+ minutes between two tasks = one more trip down to the hall
 TRIP_GAP = 80         # user 2026-09-25: after a gap this big the attendant is better back at the counters
-W_UNDER = 25.0        # per task a worker on a 7h+ early shift is short of UNDER_TARGET (user 2026-09-25: "לתת עוד טיסות")
+W_LONG = 6.0          # per idle minute of a gap beyond LONG_GAP_FREE, once the gap itself is LONG_GAP+ (any worker, T3)
+LONG_GAP = 90
+LONG_GAP_FREE = 75
+W_UNDER = 60.0        # per task a worker on a 7h+ early shift is short of UNDER_TARGET (user 2026-09-25: "לתת עוד טיסות")
+                      # 25 -> 100 -> 60 on 2026-10-04 (real 04.10 night build: six 02:00-11:00 workers had ONE flight in a
+                      # 9h shift while others held 3-4). 100 cost +19% mid-shift gaps, and the user chose small gaps over
+                      # more flights, so 60 (early workers with <=1 flight 13 -> 12, gaps +11%).
 UNDER_TARGET = 3
-W_RESTRICTED_TASK = 15.0    # a ילד עובדים / פורש working is cheap labour — favour giving them tasks
-RESTRICTED_TASK_CAP = 3
+W_RESTRICTED_TASK = 120.0   # a ילד עובדים / פורש working is cheap labour — favour giving them tasks
+                            # (user 2026-10-04, real 04.10 night build: "עדיף לשבץ ילדי עובדים לכמה שיותר
+                            # טיסות במהלך המשמרת — זה משחרר דייל רגיל לצ'ק אין בדלפקים". 15/3 left most of
+                            # them on ONE flight; measured on that build: 12 -> 19 restricted tasks, 58 -> 55
+                            # regular attendants on the floor, dead time down.)
+RESTRICTED_TASK_CAP = 5
+W_RUNNER_TASK = 40.0        # a ר"צ on the floor beats a plain attendant (user 2026-10-04, real 04.10 night
+                            # build: קטרינה, a ר"צ, had ONE flight — "לשבץ ר"צ גם כדייל, ולהשאיר דייל בדלפקים").
+                            # Measured: single-flight ר"צים 4 -> 2, plain dead time 805 -> 760 min; costs +2 plain
+                            # single-flight workers. 100/200 gave almost nothing more.
+RUNNER_TASK_CAP = 3
+W_TRAINEE_TASK = 100.0      # a ר"צ trainee with a task (cap 2) — never leave a trainee idle
 W_MOVE = 25.0         # churn: every slot that ends up with a different worker than before the pass
-W_LATE = 80.0         # NIGHT build only: a later-shift (day) worker pulled in for it (see late_shift_from)
+W_LATE = 200.0        # NIGHT build only: a later-shift (day) worker pulled in — PER TASK (user 2026-10-04: day-shift workers must come after the 02:00/03:30 workers; 80/worker never dislodged a 2-task day worker)
 LATE_BREAK_AFTER = 210
 SHIFT_END_BUFFER = 15  # a task must end at least this long before the shift does
 
@@ -65,7 +82,10 @@ _MOVE_ROLES = ("ראש צוות", "דייל", "מתאם תורים")
 # The end-of-shift repair also covers the security guard: 23.08 אפטר had agent#91
 # (12:30-00:30) guarding LY027 22:30-00:30 — exactly to her shift end — while a dozen
 # qualified workers had nothing (user rule 2026-09-25: a last task may not end at shift end).
-_REPAIR_ROLES = _MOVE_ROLES + ("שומר TSA",)
+# A ר"צ trainee slot too (user 2026-10-04, real 04.10 night build: TL-trainee#7, shift 22:00-06:00,
+# was paired to LY2521 05:20-06:00 — a flight ending exactly when her shift does). The slot goes
+# to another free ר"צ trainee, or is swapped with one (see the swap fallback below).
+_REPAIR_ROLES = _MOVE_ROLES + ("שומר TSA", "טרייני רצ")
 
 
 def _yn(row, col):
@@ -201,6 +221,7 @@ def polish_schedule(schedule_df, employees_df, max_rounds=40, late_shift_from=No
         return a, (b - a) % 1440 or 1440
 
     restricted = {nm: S._is_restricted_worker(row) for nm, row in emp_map.items()}
+    trainee_set = {nm for nm, row in emp_map.items() if _yn(row, "טרייני רצ")}
     # Terminal 1 has very few flight waves a day (~3), so a T1 worker going down for
     # one wave, back to the counters for ~2h, then down again for the next wave is the
     # NORMAL shape of the day there — not the "extra round trip" the trip cost penalizes
@@ -291,11 +312,13 @@ def polish_schedule(schedule_df, employees_df, max_rounds=40, late_shift_from=No
                         else _idle_waste(rb, long_shift, gaps)) * W_DEAD
         late_starter = (items[0][0] >= LATE_START_AFTER and length >= 7 * 60 and anchor < 5 * 60
                         and (anchor + length) % 1440 >= 11 * 60 and (anchor + length) % 1440 <= 14 * 60)
-        comp["single"] = ((W_SINGLE_RESTRICTED if restricted.get(name)
+        comp["single"] = ((W_SINGLE_RESTRICTED if (restricted.get(name) or name in trainee_set)
                            else (W_SINGLE_LATE_START if late_starter else W_SINGLE))
                           if len(items) == 1 else 0.0)
         comp["trip"] = (0.0 if (is_runner or name in t1_workers)
                         else W_TRIP * sum(1 for g in gaps if g >= TRIP_GAP))
+        comp["long"] = (0.0 if (name in t1_workers or night or any(t["_term"] == "1" for t in tasks))
+                        else W_LONG * sum(max(0, g - LONG_GAP_FREE) for g in gaps if g >= LONG_GAP))
         comp["crowd"] = sum((CROWD_UNDER - g) * W_CROWD for g in gaps if g < CROWD_UNDER)
         m = group_mean.get(group_of.get(name))
         comp["group"] = W_GRP * (len(items) - m) ** 2 if (m is not None and W_GRP) else 0.0
@@ -321,8 +344,16 @@ def polish_schedule(schedule_df, employees_df, max_rounds=40, late_shift_from=No
                          if length >= 7 * 60 and anchor < 5 * 60 and not late_starter else 0.0)
         comp["restricted"] = (-W_RESTRICTED_TASK * min(len(items), RESTRICTED_TASK_CAP)
                               if restricted.get(name) else 0.0)
-        comp["late"] = (W_LATE if (late_shift_from is not None
-                                   and late_shift_from <= anchor < 20 * 60) else 0.0)
+        comp["runner_tasks"] = (-W_RUNNER_TASK * min(len(items), RUNNER_TASK_CAP)
+                                if is_runner and not restricted.get(name) else 0.0)
+        # A ר"צ trainee should not end the night with nothing (real 04.10 build 33: TL-trainee#7 lost her
+        # only task to the second polish) — same kind of reward as a restricted worker, smaller.
+        comp["trainee_tasks"] = (-W_TRAINEE_TASK * min(len(items), 2) if name in trainee_set else 0.0)
+        # PER TASK, not per worker: a day-shift worker with two tasks never looked cheaper to
+        # replace one task at a time (the flat cost stayed until BOTH were gone), so single-slot
+        # hand-overs could not dislodge agent#92 / TL#26 on the real 04.10 night build.
+        comp["late"] = (W_LATE * len(items) if (late_shift_from is not None
+                                                and late_shift_from <= anchor < 20 * 60) else 0.0)
         comp["edge"] = sum(W_EDGE for a, b in items if 0 <= length - b < SHIFT_END_BUFFER)
         if items[0][0] < S._FRESH_START_MIN:
             comp["edge"] += W_EDGE
@@ -557,6 +588,7 @@ def repair_shift_end_edges(schedule_df, employees_df, buffer=SHIFT_END_BUFFER):
                        if clean_text(str(df.at[j, "תפקיד בסיס"])) == "טרייני רצ"
                        and "❌" not in str(df.at[j, "עובד"])}
     changed = 0
+    to_drop = []
     for i in list(df.index):
         who = clean_text(str(df.at[i, "עובד"]))
         role = clean_text(str(df.at[i, "תפקיד בסיס"]))
@@ -597,11 +629,215 @@ def repair_shift_end_edges(schedule_df, employees_df, buffer=SHIFT_END_BUFFER):
             key = (0 if len(mine) else 1, len(mine), -sl)
             if best is None or key < best[0]:
                 best = (key, c)
+        if best is None and role == "טרייני רצ":
+            # No free trainee: swap with one instead. Another ר"צ trainee T takes this slot and
+            # `who` takes over one of T's tasks (attendant or trainee slot) that ends early enough
+            # in `who`'s shift. If T has ONE attendant task overlapping this slot, that task is
+            # handed to a third worker first (real 04.10: TL-trainee#7's only task was LY2521
+            # 05:00-06:00; רוני could take it only after giving away her LY2371 attendant task).
+            def _mins(idx):
+                a_ = time_to_minutes(clean_text(str(df.at[idx, "התחלה"])))
+                b_ = time_to_minutes(clean_text(str(df.at[idx, "סיום"])))
+                return a_, (b_ if b_ > a_ else b_ + 1440)
+            i_s, i_e = _mins(i)
+
+            def _overlaps(idx):
+                s_, e_ = _mins(idx)
+                return any(s_ + ph < i_e + 5 and i_s < e_ + ph + 5 for ph in (-1440, 0, 1440))
+
+            for T in [n for n, rw in emp_map.items()
+                      if n != who and clean_text(str(rw.get("טרייני רצ", ""))) == "כן"]:
+                t_idx = [j for j in df.index if clean_text(str(df.at[j, "עובד"])) == T and j != i]
+                for j in list(t_idx):
+                    rj = clean_text(str(df.at[j, "תפקיד בסיס"]))
+                    fj = clean_text(str(df.at[j, "טיסה"]))
+                    if rj not in ("דייל", "טרייני רצ") or fj == flight:
+                        continue
+                    sl = _slack(who, df.at[j, "סיום"])
+                    if sl is None or sl < buffer:
+                        continue
+                    blockers = [k for k in t_idx if k != j and _overlaps(k)]
+                    if len(blockers) > 1 or any(
+                            clean_text(str(df.at[k, "תפקיד בסיס"])) not in ("דייל", "מתאם תורים")
+                            or clean_text(str(df.at[k, "טיסה"])) == flight for k in blockers):
+                        continue
+                    saved = {k: df.at[k, "עובד"] for k in [j] + blockers}
+                    df.at[j, "עובד"] = f"❌ חסר {rj}"
+                    for k in blockers:
+                        df.at[k, "עובד"] = "❌ חסר " + clean_text(str(df.at[k, "תפקיד בסיס"]))
+                    ok1 = T in [clean_text(c) for c in S.get_qualified_candidates_for_swap(
+                        df, employees_df, flight, role, i)]
+                    ok2 = who in [clean_text(c) for c in S.get_qualified_candidates_for_swap(
+                        df, employees_df, fj, rj, j)]
+                    repl = None
+                    if ok1 and ok2 and blockers:
+                        k = blockers[0]
+                        for c in [clean_text(c) for c in S.get_qualified_candidates_for_swap(
+                                df, employees_df, clean_text(str(df.at[k, "טיסה"])),
+                                clean_text(str(df.at[k, "תפקיד בסיס"])), k)]:
+                            rw = emp_map.get(c)
+                            if (rw is None or c in (who, T) or S._is_crew_manager(rw)
+                                    or S._is_restricted_worker(rw) or S._is_trainee_attendant(rw)
+                                    or S._is_instructor(rw)):
+                                continue
+                            slc = _slack(c, df.at[k, "סיום"])
+                            if slc is None or slc < buffer:
+                                continue
+                            load_c = len(df[df["עובד"].astype(str).str.strip() == c])
+                            if repl is None or load_c < repl[0]:
+                                repl = (load_c, c)
+                    if ok1 and ok2 and (not blockers or repl is not None):
+                        df.at[i, "עובד"] = T
+                        df.at[j, "עובד"] = who
+                        df.at[i, "סיבה"] = f"הוחלף/ה — משימה אחרונה לא מסתיימת בדיוק בסוף המשמרת (במקום {who})"
+                        df.at[j, "סיבה"] = f"הוחלף/ה — החלפה בין שתי טריינות ר\"צ (במקום {T})"
+                        if blockers:
+                            df.at[blockers[0], "עובד"] = repl[1]
+                            df.at[blockers[0], "סיבה"] = f"הוחלף/ה — פינוי {T} למשבצת טרייני (במקום {T})"
+                        changed += 1
+                        best = (None, T)
+                        break
+                    for k, w_ in saved.items():
+                        df.at[k, "עובד"] = w_
+                if best is not None:
+                    break
+            if best is not None:
+                continue
+            # Second option: `who` keeps whatever else she has (e.g. an attendant task earlier in the
+            # night) and ANOTHER trainee simply takes this shadow slot, after handing one overlapping
+            # attendant task to a third worker. Real 04.10 (build 33): רות had LY237 (attendant) +
+            # LY2521 (shadow, ends at her shift end); the three-way swap above is impossible because
+            # she already works LY237 — and dropping the slot left her with nothing after the next polish.
+            if len(df[df["עובד"].astype(str).str.strip() == who]) >= 1:         # slot i is vacated here
+                for T in [n for n, rw in emp_map.items()
+                          if n != who and clean_text(str(rw.get("טרייני רצ", ""))) == "כן"]:
+                    t_idx = [j for j in df.index if clean_text(str(df.at[j, "עובד"])) == T and j != i]
+                    if any(clean_text(str(df.at[j, "טיסה"])) == flight for j in t_idx):
+                        continue
+                    blockers = [k for k in t_idx if _overlaps(k)]
+                    if len(blockers) > 1 or any(
+                            clean_text(str(df.at[k, "תפקיד בסיס"])) not in ("דייל", "מתאם תורים")
+                            for k in blockers):
+                        continue
+                    saved = {k: df.at[k, "עובד"] for k in blockers}
+                    for k in blockers:
+                        df.at[k, "עובד"] = "❌ חסר " + clean_text(str(df.at[k, "תפקיד בסיס"]))
+                    ok1 = T in [clean_text(c) for c in S.get_qualified_candidates_for_swap(
+                        df, employees_df, flight, role, i)]
+                    repl = None
+                    if ok1 and blockers:
+                        k = blockers[0]
+                        for c in [clean_text(c) for c in S.get_qualified_candidates_for_swap(
+                                df, employees_df, clean_text(str(df.at[k, "טיסה"])),
+                                clean_text(str(df.at[k, "תפקיד בסיס"])), k)]:
+                            rw = emp_map.get(c)
+                            if (rw is None or c in (who, T) or S._is_crew_manager(rw)
+                                    or S._is_restricted_worker(rw) or S._is_trainee_attendant(rw)
+                                    or S._is_instructor(rw)):
+                                continue
+                            slc = _slack(c, df.at[k, "סיום"])
+                            if slc is None or slc < buffer:
+                                continue
+                            load_c = len(df[df["עובד"].astype(str).str.strip() == c])
+                            if repl is None or load_c < repl[0]:
+                                repl = (load_c, c)
+                    if ok1 and (not blockers or repl is not None):
+                        df.at[i, "עובד"] = T
+                        df.at[i, "סיבה"] = f"הוחלף/ה — משימה אחרונה לא מסתיימת בדיוק בסוף המשמרת (במקום {who})"
+                        if blockers:
+                            df.at[blockers[0], "עובד"] = repl[1]
+                            df.at[blockers[0], "סיבה"] = f"הוחלף/ה — פינוי {T} למשבצת טרייני (במקום {T})"
+                        changed += 1
+                        best = (None, T)
+                        break
+                    for k, w_ in saved.items():
+                        df.at[k, "עובד"] = w_
+                if best is not None:
+                    continue
+            # Last resort: the shadow slot is optional, so a trainee whose ONLY edge-of-shift
+            # task is this slot (and who has another task) simply does not shadow this flight.
+            if len(df[df["עובד"].astype(str).str.strip() == who]) >= 1:     # slot i is vacated here
+                df.at[i, "עובד"] = who
+                to_drop.append(i)
+                changed += 1
+                continue
         if best is None:
             df.at[i, "עובד"] = who
             continue
         df.at[i, "עובד"] = best[1]
         df.at[i, "סיבה"] = f"הוחלף/ה — משימה אחרונה לא מסתיימת בדיוק בסוף המשמרת (במקום {who})"
+        changed += 1
+    if to_drop:
+        df = df.drop(index=to_drop)
+    return df if changed else schedule_df
+
+
+def relieve_crew_managers(schedule_df, employees_df):
+    """A shift manager (מנהל כר"צ) rostered as ר"צ is a LAST RESORT (user 2026-10-04,
+    real 04.10: TL#55, an אחראי משמרת "bumped" to a whole ר"צ shift for lack of
+    staff): never used when anyone else can do the slot, and on as few flights as
+    possible. Every ר"צ slot a manager holds is handed to a regular ר"צ who
+    qualifies (get_qualified_candidates_for_swap — the swap UI's test, which already
+    keeps the ר"צ-trainee mentor rule), is not a manager, keeps >= SHIFT_END_BUFFER
+    minutes of shift after it and respects the 45-minute fresh-start rule; the
+    least-loaded such ר"צ gets it. A slot nobody else can take stays with the manager."""
+    df = schedule_df.copy()
+    try:
+        df = df.astype(object)
+    except Exception:
+        pass
+    emp_map = {clean_text(str(r.get("שם", ""))): r for _, r in employees_df.iterrows()}
+
+    def _bounds(row):
+        ss = clean_text(str(row.get("תחילת משמרת", "")))
+        se = clean_text(str(row.get("סוף משמרת", "")))
+        if not (is_time_text(ss) and is_time_text(se)):
+            return None
+        a, b = time_to_minutes(ss), time_to_minutes(se)
+        return a, ((b - a) % 1440 or 1440)
+
+    def _rel(row, t):
+        bd = _bounds(row)
+        v = to_datetime_time(t)
+        if bd is None or v is None:
+            return None
+        return (v.hour * 60 + v.minute - bd[0]) % 1440
+
+    changed = 0
+    for i in list(df.index):
+        who = clean_text(str(df.at[i, "עובד"]))
+        if (not who or "❌" in who or clean_text(str(df.at[i, "תפקיד בסיס"])) != "ראש צוות"
+                or who not in emp_map or not S._is_crew_manager(emp_map[who])):
+            continue
+        if "_נעול" in df.columns and df.at[i, "_נעול"] is True:
+            continue
+        flight = clean_text(str(df.at[i, "טיסה"]))
+        df.at[i, "עובד"] = "❌ חסר ראש צוות"
+        best = None
+        for c in [clean_text(c) for c in S.get_qualified_candidates_for_swap(
+                df, employees_df, flight, "ראש צוות", i)]:
+            row = emp_map.get(c)
+            if (row is None or c == who or S._is_crew_manager(row) or S._is_restricted_worker(row)
+                    or S._is_trainee_attendant(row) or S._is_instructor(row)
+                    or clean_text(str(row.get("טרייני רצ", ""))) == "כן"):
+                continue
+            bd = _bounds(row)
+            r_end = _rel(row, df.at[i, "סיום"])
+            if bd is None or r_end is None or bd[1] - (r_end or 1440) < SHIFT_END_BUFFER:
+                continue
+            rs = _rel(row, df.at[i, "התחלה"])
+            mine = df[df["עובד"].astype(str).str.strip() == c]
+            if rs is not None and rs < S._FRESH_START_MIN and not any(
+                    (_rel(row, x) or 0) < rs for x in mine["התחלה"]):
+                continue
+            key = len(mine)
+            if best is None or key < best[0]:
+                best = (key, c)
+        if best is None:
+            df.at[i, "עובד"] = who
+            continue
+        df.at[i, "עובד"] = best[1]
+        df.at[i, "סיבה"] = f"הוחלף/ה — אחראי משמרת משובץ כר\"צ רק כמוצא אחרון (במקום {who})"
         changed += 1
     return df if changed else schedule_df
 
@@ -741,20 +977,29 @@ def convert_attendant_trainees(schedule_df, employees_df, flights_df):
 # Roles worth freeing someone for, and the roles they may be freed FROM.
 _CRITICAL_ROLES = ("מפקח TSA", "ראש צוות")
 _RELEASABLE_ROLES = ("דייל", "מתאם תורים", "שומר TSA")
+# A טרייני ר"צ shadow task is purely opportunistic (added on top of a flight
+# that already has its own real ר"צ — see maximize_tl_trainee_coverage) — the
+# flight needs no replacement if it's dropped, unlike the roles above.
+_TL_TRAINEE_ROLES = ("טרייני רצ", "טרייני ר״צ", 'טרייני ר"צ')
 
 
 def fill_critical_by_release(schedule_df, employees_df):
     """Fill a still-missing מפקח TSA / ראש צוות slot by freeing a certified worker
-    from an overlapping דייל / מתאם תורים / שומר TSA task, which is handed to
-    someone else.
+    from an overlapping דייל / מתאם תורים / שומר TSA task (handed to someone
+    else) or a טרייני ר"צ shadow task (simply dropped — it was never a real
+    coverage requirement).
 
     The polish only moves filled slots and knows nothing about ❌ ones, so it
     happily parked the day's only in-shift inspector on a דייל slot and left an
     inspector slot unfillable next to it — real 23.08 after-segment: TSA-inspector#3
     on LY081 (דייל 21:15-22:20) while LY017's inspector slot (22:15, pier C —
-    the same pier as her LY027/LY025) stayed ❌ (user 2026-09-27). All-or-
-    nothing per slot: applied only when every released task gets a replacement,
-    so it never trades one hole for another."""
+    the same pier as her LY027/LY025) stayed ❌ (user 2026-09-27). Same pattern
+    with a trainee slot instead of a דייל one — real 11-12.08 night build: TL-trainee#9 (the only in-shift, available מפקח TSA) rode LY223 as טרייני ר"צ under
+    its own already-staffed ר"צ while LY009's inspector slot stayed ❌ (user
+    report 2026-09-30) — the trainee ride is optional, so it's dropped rather
+    than requiring a replacement trainee. All-or-nothing per slot otherwise:
+    applied only when every released non-trainee task gets a replacement, so
+    it never trades one hole for another."""
     df = schedule_df.copy()
     try:
         df = df.astype(object)
@@ -808,8 +1053,8 @@ def fill_critical_by_release(schedule_df, employees_df):
                 clash.append(j)
             if not clash:
                 continue              # a free worker would already be in the swap list below
-            if any(clean_text(str(df.at[j, "תפקיד בסיס"])) not in _RELEASABLE_ROLES or _locked(j)
-                   for j in clash):
+            if any(clean_text(str(df.at[j, "תפקיד בסיס"])) not in _RELEASABLE_ROLES + _TL_TRAINEE_ROLES
+                   or _locked(j) for j in clash):
                 continue
             options.append((len(clash), len(mine), name, clash))
         # A plainly free candidate first (e.g. freed by an earlier fill in this loop).
@@ -834,6 +1079,10 @@ def fill_critical_by_release(schedule_df, employees_df):
             for j in clash:
                 fj = clean_text(str(df.at[j, "טיסה"]))
                 rj = clean_text(str(df.at[j, "תפקיד בסיס"]))
+                if rj in _TL_TRAINEE_ROLES:
+                    # Purely opportunistic — dropping it needs no replacement.
+                    fills[j] = None
+                    continue
                 pick = None
                 _usa = any(clean_text(str(df.at[k, "יעד"])) in S.USA_TSA_DESTS
                            for k in df.index if clean_text(str(df.at[k, "טיסה"])) == fj) if "יעד" in df.columns else False
@@ -859,10 +1108,14 @@ def fill_critical_by_release(schedule_df, employees_df):
                 for j, w in saved.items():
                     df.at[j, "עובד"] = w
                 continue
+            _to_drop = [j for j, w in fills.items() if w is None]
+            if _to_drop:
+                df = df.drop(index=_to_drop)
             if "סיבה" in df.columns:
                 df.at[i, "סיבה"] = f"השלמת {role} חסר — שוחרר/ה ממשימה חופפת בתפקיד נמוך יותר"
-                for j in fills:
-                    df.at[j, "סיבה"] = f"הוחלף/ה כדי ש-{name} ימלא/תמלא {role} חסר"
+                for j, w in fills.items():
+                    if w is not None:
+                        df.at[j, "סיבה"] = f"הוחלף/ה כדי ש-{name} ימלא/תמלא {role} חסר"
             changed += 1
             break
     return df

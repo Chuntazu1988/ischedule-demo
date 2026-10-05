@@ -3132,6 +3132,16 @@ def build_schedule(flights_df, employees_df, pre_assignments=None):
                     gate = _terminal_val_t
             candidates = sort_candidates(candidates, assignments, role, start, end,
                                          task_terminal=get_terminal(gate))
+            # Trainees with the FEWEST shadow flights so far go first (stable, so the rest
+            # of sort_candidates' order is kept within a tie) — user 2026-10-04: one trainee
+            # had 4 shadow flights while two others had 1.
+            if isinstance(candidates, list) and len(candidates) > 1:
+                _tcnt = {}
+                for _a in assignments:
+                    if _a.get("תפקיד בסיס") == "טרייני רצ":
+                        _tcnt[_a["עובד"]] = _tcnt.get(_a["עובד"], 0) + 1
+                if _tcnt:
+                    candidates = sorted(candidates, key=lambda _n: _tcnt.get(_n, 0))
             selected = (
                 _try_select(candidates, assignments, role, start, end, gate, _by_name=_by_name, _emp_lookup=_emp_data) or
                 _try_select(candidates, assignments, role, start, end, gate,
@@ -5402,6 +5412,95 @@ def do_swap(schedule_df, task_idx, new_worker, displaced_action, displaced_targe
             df.at[first_slot, "עובד"] = old_worker
 
     return df
+
+
+SHIFT_EXCHANGE_COLS = (
+    "תחילת משמרת", "סוף משמרת", "טרמינל", "מעבר טרמינל",
+    "משמרת לילה הבאה", "משמרת קודמת", "שיוך משמרת",
+    "זמינות", "זמינות טרמינל", "זמינות מלאה", "upcoming_night",
+)
+
+
+def workers_certified_for_worker_roles(schedule_df, employees_df, worker):
+    """Names on the roster certified for EVERY role `worker` holds in the
+    schedule — a cheap pre-filter for the replacement picker."""
+    w = str(worker).strip()
+    # same role -> certification-column mapping as get_qualified_candidates_for_swap
+    col_of = {"ראש צוות": "ראש צוות", "דייל": "דייל", "מתאם תורים": "מתאם תורים",
+              "מפקח TSA": "מפקח TSA", "שומר TSA": "שומר TSA",
+              "טרייני רצ": "טרייני רצ", "טרייני ר״צ": "טרייני רצ"}
+    held = {str(r).strip() for r in schedule_df.loc[
+        schedule_df["עובד"].astype(str).str.strip() == w, "תפקיד בסיס"]}
+    ok = pd.Series(True, index=employees_df.index)
+    for role in held:
+        col = col_of.get(normalize_role_label(role), role)
+        if col in employees_df.columns:
+            ok &= employees_df[col].astype(str).str.strip() == "כן"
+    return [str(n).strip() for n in employees_df.loc[ok, "שם"]]
+
+
+def plan_worker_exchange(schedule_df, employees_df, worker_a, worker_b, mode="replace"):
+    """Hand a worker's WHOLE SHIFT (hours, availability windows, terminal and
+    terminal-transfer — SHIFT_EXCHANGE_COLS — plus every task in it) to another
+    worker.
+
+    mode="replace": worker_b (free today) takes worker_a's shift; worker_a's shift
+    columns are cleared, so worker_a no longer works today.
+    mode="swap": head-to-head — the two workers exchange shifts and tasks.
+
+    Because the shift moves with the tasks, the receiver's own hours are irrelevant:
+    each task is checked (get_qualified_candidates_for_swap) against a roster in
+    which the shift columns have already been exchanged, with all moving tasks
+    vacated first — so what remains is certification / terminal / role rules.
+
+    Returns (plan, new_sched, new_emps). plan rows: {idx, flight, role, start, end,
+    frm, to, ok}. new_sched moves EVERY task (the caller decides whether to allow
+    an override when some are not ok); new_emps has the shift columns exchanged."""
+    a, b = str(worker_a).strip(), str(worker_b).strip()
+    emps = employees_df.copy()
+    nm = emps["שם"].astype(str).str.strip()
+    ia, ib = emps.index[nm == a], emps.index[nm == b]
+    cols = [c for c in SHIFT_EXCHANGE_COLS if c in emps.columns]
+    if len(ia) and len(ib):
+        for c in cols:
+            emps[c] = emps[c].astype(object)
+        va = {c: emps.at[ia[0], c] for c in cols}
+        vb = {c: emps.at[ib[0], c] for c in cols}
+        for c in cols:
+            emps.at[ib[0], c] = va[c]
+            if mode == "swap":
+                emps.at[ia[0], c] = vb[c]
+            else:
+                emps.at[ia[0], c] = 0 if c == "upcoming_night" else ""
+
+    names = schedule_df["עובד"].astype(str).str.strip()
+    moves = [(i, b) for i in schedule_df.index[names == a]]
+    if mode == "swap":
+        moves += [(i, a) for i in schedule_df.index[names == b]]
+
+    def _tkey(i):
+        m = _ar_tm(schedule_df.at[i, "התחלה"])
+        return m if m is not None else 0
+    moves.sort(key=lambda m: _tkey(m[0]))
+
+    hypo = schedule_df.copy()
+    for i, _to in moves:
+        hypo.at[i, "עובד"] = "❌ (החלפה)"
+
+    plan, new_sched = [], schedule_df.copy()
+    for i, to in moves:
+        row = schedule_df.loc[i]
+        ok = to in get_qualified_candidates_for_swap(
+            hypo, emps, str(row.get("טיסה", "")), str(row.get("תפקיד בסיס", "")), i)
+        hypo.at[i, "עובד"] = to
+        new_sched.at[i, "עובד"] = to
+        plan.append({
+            "idx": i, "flight": str(row.get("טיסה", "")).strip(),
+            "role": normalize_role_label(str(row.get("תפקיד בסיס", ""))),
+            "start": str(row.get("התחלה", "")).strip(), "end": str(row.get("סיום", "")).strip(),
+            "frm": str(row.get("עובד", "")).strip(), "to": to, "ok": ok,
+        })
+    return plan, new_sched, emps
 
 
 def force_assign_worker(schedule_df, slot_idx, worker, employees_df, keep_prior=True,
@@ -8545,7 +8644,11 @@ def maximize_tl_trainee_coverage(schedule_df, employees_df, flights_df):
             gate = clean_text(flight.get("גייט", "")) or clean_text(str(flight.get("שלוחה", "")))
             term = get_terminal(gate)
             trainee_choice = None
-            for cand in sorted(trainee_pool, key=_load):
+            # Fewest trainee slots first, then least loaded — the trainees should end the
+            # day with a similar number of shadow flights (user 2026-10-04: TL-trainee#9 had 4 while
+            # רוני / רות had 1; ordering by load alone favoured the long 03:30-12:30 shift).
+            for cand in sorted(trainee_pool, key=lambda n: (
+                    sum(1 for t in by_name.get(n, []) if t["תפקיד בסיס"] == "טרייני רצ"), _load(n))):
                 if cand in used_on_flight:
                     continue
                 crow = emp_map[cand]

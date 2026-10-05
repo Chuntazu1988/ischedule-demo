@@ -73,7 +73,7 @@ def build_tasks(df):
     rows = []
     if df is None or df.empty:
         return rows
-    for _, r in df.iterrows():
+    for idx, r in df.iterrows():
         worker = str(r.get("עובד", "")).strip()
         if not worker or "❌" in worker:
             continue
@@ -81,6 +81,7 @@ def build_tasks(df):
         if s is None or e is None:
             continue
         rows.append({
+            "idx": idx,
             "worker": worker,
             "role": str(r.get("תפקיד בסיס", "")).strip(),
             "flight": str(r.get("טיסה", "")).strip(),
@@ -102,6 +103,44 @@ def build_tasks(df):
     return rows
 
 
+def crosses_midnight(df):
+    """Whether this schedule's tasks were unwrapped onto an overnight axis —
+    callers that independently unwrap other rows (e.g. unfilled slots) need
+    the same flag build_tasks used, or their minutes won't line up."""
+    tasks = build_tasks(df)
+    return any(t["s"] >= 1440 for t in tasks)
+
+
+def unfilled_in_window(df, crosses, gs, ge):
+    """Open (❌) slots in `df` fully contained in the unwrapped window [gs, ge] —
+    i.e. tasks a worker free for exactly that window could be assigned to."""
+    out = []
+    if df is None or df.empty:
+        return out
+    for idx, r in df.iterrows():
+        worker = str(r.get("עובד", "")).strip()
+        if "❌" not in worker:
+            continue
+        s, e = _to_min(r.get("התחלה")), _to_min(r.get("סיום"))
+        if s is None or e is None:
+            continue
+        if crosses and s < 12 * 60:
+            s += 1440
+            e += 1440
+        if e <= s:
+            e += 1440
+        if gs <= s and e <= ge:
+            out.append({
+                "idx": idx,
+                "role": str(r.get("תפקיד בסיס", "")).strip(),
+                "flight": str(r.get("טיסה", "")).strip(),
+                "dest": str(r.get("יעד", "")).strip(),
+                "s": s, "e": e,
+            })
+    out.sort(key=lambda t: t["s"])
+    return out
+
+
 def axis_bounds(df):
     """(lo, hi) minutes of the automatic axis (whole hours) for a schedule, or None."""
     tasks = build_tasks(df)
@@ -111,7 +150,13 @@ def axis_bounds(df):
 
 
 def timeline_html(df, role=None, query="", now_min=None, employees=None, sort="start", gap_min=0, view=None):
-    """The whole timeline as one HTML string ('' when there is nothing to show)."""
+    """Returns (html, gaps, flights, workers): html is the whole timeline as one
+    string ('' when there is nothing to show); gaps is [{id, worker, s, e}] for
+    every free window drawn (only when gap_min is set), for the caller to
+    render an assign-into-this-window action per gap; flights is [{id, flight}]
+    for every distinct flight with a bar drawn, for a per-flight preview
+    trigger; workers is the ordered worker names drawn, one per row (row's
+    position = its "data-w" in the HTML), for a per-row drag-and-drop target."""
     tasks = build_tasks(df)
     if role:
         tasks = [t for t in tasks if t["role"] == role]
@@ -119,7 +164,7 @@ def timeline_html(df, role=None, query="", now_min=None, employees=None, sort="s
     if q:
         tasks = [t for t in tasks if q in t["worker"]]
     if not tasks:
-        return ""
+        return "", [], [], []
 
     bands = shift_bands(employees, any(t["s"] >= 1440 for t in tasks))
     # the axis follows the TASKS; shift bands are clipped to it (a full 22:00-06:00
@@ -172,12 +217,14 @@ def timeline_html(df, role=None, query="", now_min=None, employees=None, sort="s
     if view:  # drop workers with nothing in the zoom window
         order = [w for w in order if any(x["e"] > lo and x["s"] < hi for x in by_worker[w])]
         if not order:
-            return ""
+            return "", [], [], []
 
     rows_html = []
     n_gap_workers = set()
+    gaps_out = []
+    flights_out = {}
     last_group = None
-    for w in order:
+    for wi, w in enumerate(order):
         if sort == "role":
             grp = _main_role(w)
             if grp != last_group:
@@ -200,8 +247,10 @@ def timeline_html(df, role=None, query="", now_min=None, employees=None, sort="s
                 f'{t["flight"]} {t["dest"]} · {_fmt(t["s"])}–{_fmt(t["e"])} · {t["role"]}'
                 + (f' · גייט {t["gate"]}' if t["gate"] else "")
             )
+            _fid = "".join(ch for ch in t["flight"] if ch.isalnum())
+            flights_out.setdefault(_fid, t["flight"])
             bars.append(
-                f'<div class="tl-bar" data-fl="{"".join(ch for ch in t["flight"] if ch.isalnum())}" '
+                f'<div class="tl-bar" draggable="true" data-fl="{_fid}" data-task="{t["idx"]}" '
                 f'style="right:{right:.3f}%;width:{width:.3f}%;'
                 f'background:rgba(var({token}),.22);border-color:rgb(var({token}));" title="{tip}">'
                 f'<span>{label}</span></div>'
@@ -228,35 +277,57 @@ def timeline_html(df, role=None, query="", now_min=None, employees=None, sort="s
                     continue
                 n_gap_workers.add(w)
                 brk = _break_in_gap(before, ge - gs, bands.get(w))
-                lbl = f"{(ge - gs) // 60}:{(ge - gs) % 60:02d}" if (ge - gs) >= 45 else ""
-                if brk:
-                    lbl = ("☕ " if brk[0] == "הפסקה" else "↻ ") + lbl
-                tip = f"פנוי {ge - gs} דק׳ · {_fmt(gs)}–{_fmt(ge)}"
-                if brk:
-                    tip += f" · כולל {brk[0]} {brk[1]} דק׳"
-                gaps_html += (
-                    f'<div class="tl-gap{" tl-gap-brk" if brk else ""}" style="right:{pos(max(gs, lo)):.3f}%;width:{pos(min(ge, hi)) - pos(max(gs, lo)):.3f}%" '
-                    f'title="{tip}"><span>{lbl}</span>'
-                    + (f'<b class="tl-brk" style="width:{brk[1] / (ge - gs) * 100:.1f}%" title="{brk[0]} {brk[1]} דק׳ (מיד אחרי המשימה)"></b>' if brk else "")
-                    + '</div>'
-                )
+                free_s = gs + (brk[1] if brk else 0)
+                gid = f"g{len(gaps_out)}_{gs}_{ge}"
+                gaps_out.append({
+                    "id": gid, "worker": w, "s": gs, "e": ge,
+                    # the break/refresh sits right at the START of the gap (right after
+                    # the previous task) — free_s is where this worker is ACTUALLY free,
+                    # i.e. past their break; callers must search [free_s, e], not [s, e]
+                    "break": brk, "free_s": free_s,
+                })
+                # the break/refresh portion: its own non-clickable box, not part of
+                # the assignable free window at all (drawn only if it isn't clipped
+                # entirely outside the visible [lo, hi] zoom range)
+                if brk and gs < hi and free_s > lo:
+                    _bs, _be = max(gs, lo), min(free_s, hi)
+                    gaps_html += (
+                        f'<div class="tl-brk-box" '
+                        f'style="right:{pos(_bs):.3f}%;width:{max(pos(_be) - pos(_bs), 0.4):.3f}%" '
+                        f'title="{brk[0]} {brk[1]} דק׳ · {_fmt(gs)}–{_fmt(free_s)}">'
+                        f'<span>{"☕" if brk[0] == "הפסקה" else "↻"} {brk[1]}\'</span></div>'
+                    )
+                # the actual free window — this is what's clickable and what
+                # unfilled_in_window searches (gap_min applies to the ORIGINAL
+                # gs-ge span, so a short residual free_s..ge can still show,
+                # possibly with no usable minutes — that's fine, it's informative)
+                if free_s < ge and free_s < hi and ge > lo:
+                    _fs, _fe = max(free_s, lo), min(ge, hi)
+                    _flen = ge - free_s
+                    lbl = f"{_flen // 60}:{_flen % 60:02d}" if _flen >= 45 else ""
+                    tip = f"פנוי {_flen} דק׳ · {_fmt(free_s)}–{_fmt(ge)} · לחיצה = מה אפשר לשבץ כאן"
+                    gaps_html += (
+                        f'<div class="tl-gap" data-gap="{gid}" '
+                        f'style="right:{pos(_fs):.3f}%;width:{max(pos(_fe) - pos(_fs), 0.4):.3f}%" '
+                        f'title="{tip}"><span>{lbl}</span></div>'
+                    )
         hrs = busy(w) / 60
         rows_html.append(
             f'<div class="tl-row"><div class="tl-name" title="{escape(w)} · {len(by_worker[w])} משימות · {hrs:.1f} שעות">'
             f'{escape(w)}<small>{len(by_worker[w])}</small></div>'
-            f'<div class="tl-track">{band}{gaps_html}{lines}{now_html}{"".join(bars)}</div></div>'
+            f'<div class="tl-track" data-w="{wi}">{band}{gaps_html}{lines}{now_html}{"".join(bars)}</div></div>'
         )
 
     gap_note = (
         f'<span class="tl-key"><i class="tl-gap-key"></i>חלון פנוי ({gap_min}+ דק׳) · {len(n_gap_workers)} עובדים</span>'
-        '<span class="tl-key">☕ = כולל הפסקה · ↻ = כולל רענון</span>'
+        '<span class="tl-key">☕ = משבצת הפסקה · ↻ = משבצת רענון (לא לשיבוץ)</span>'
         if gap_min else ""
     )
     legend = "".join(
         f'<span class="tl-key"><i style="background:rgba(var({tok}),.22);border-color:rgb(var({tok}))"></i>{escape(role_name)}</span>'
         for role_name, (tok, _) in _legend_roles(tasks)
     )
-    return (
+    html = (
         '<div class="tl" dir="rtl">'
         f'<div class="tl-legend">{legend}{gap_note}<span class="tl-key"><i class="tl-now-key"></i>עכשיו</span></div>'
         '<div class="tl-scroll">'
@@ -264,6 +335,7 @@ def timeline_html(df, role=None, query="", now_min=None, employees=None, sort="s
         f'{"".join(rows_html)}'
         '</div></div>'
     )
+    return html, gaps_out, [{"id": fid, "flight": fl} for fid, fl in flights_out.items()], order
 
 
 def _break_in_gap(before, gap_len, band):
@@ -283,6 +355,11 @@ def _break_in_gap(before, gap_len, band):
         dur = 0
     dur = dur or (45 if kind == "הפסקה" else 20)
     return kind, min(dur, gap_len)
+
+
+def fmt_minutes(m):
+    """Public HH:MM formatter for callers rendering slot/gap times outside this module."""
+    return _fmt(m)
 
 
 def _legend_roles(tasks):

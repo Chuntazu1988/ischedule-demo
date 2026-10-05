@@ -2331,22 +2331,100 @@ def build_unassigned_agents(schedule_df, employees_df, shift_map):
             continue
         if name in assigned_workers:
             continue
+        # Shift managers (the daily roster's manager sheet) are not schedulable
+        # attendants even when they hold a ר"צ certification — user rule 2026-10-04.
+        if "מנהל" in str(emp.get("shift_sheet", "")):
+            continue
+        # A worker marked sick is off the roster, not "unassigned".
+        if str(emp.get("חולה", "")).strip().lower() in ("true", "כן", "1"):
+            continue
         is_agent = str(emp.get("דייל", "")).strip() == "כן"
         is_tl    = str(emp.get("ראש צוות", "")).strip() == "כן"
         if not is_agent and not is_tl:
             continue
         role = "ראש צוות" if is_tl else "דייל"
+        # Tonight's night shift: starts ≥ 20:00 and has not begun yet (same rule
+        # the "מי עובד היום" table uses) — kept as a flag so the view can tell it
+        # apart from last night's shift that is still running.
+        try:
+            _upcoming = int(emp.get("upcoming_night", 0) or 0) == 1
+        except (TypeError, ValueError):
+            _upcoming = False
+        _tonight = bool(_upcoming and time_to_minutes(shift_start) >= 20 * 60
+                        and not clean_text(str(emp.get("משמרת לילה הבאה", ""))))
         rows.append({
             "שם":           name,
             "תפקיד":        role,
             "משמרת":        f"{shift_start}-{shift_end}",
             "תחילת משמרת": shift_start,
             "סוף משמרת":   shift_end,
+            "_tonight":     _tonight,
         })
     if not rows:
-        return pd.DataFrame(columns=["שם", "תפקיד", "משמרת", "תחילת משמרת", "סוף משמרת"])
+        return pd.DataFrame(columns=["שם", "תפקיד", "משמרת", "תחילת משמרת", "סוף משמרת", "_tonight"])
     df = pd.DataFrame(rows)
     return df.sort_values(["תחילת משמרת", "שם"]).reset_index(drop=True)
+
+
+def unassigned_for_night_segment(unassigned_df):
+    """Night-segment build: only workers DEFINED as נייט are "unassigned" — a shift
+    that starts before 07:00 (up to the last early-morning shift), or last night's
+    shift that is still running (starts ≥ 20:00, not tonight's). Day and after-shift
+    workers are not part of this build. Returns (in_df, out_df). User rule 2026-10-04.
+    """
+    if unassigned_df is None or unassigned_df.empty:
+        return unassigned_df, unassigned_df
+    keep = []
+    for _, r in unassigned_df.iterrows():
+        m = time_to_minutes(r["תחילת משמרת"])
+        yesterday_night = m >= 20 * 60 and not bool(r.get("_tonight", False))
+        keep.append(m < 7 * 60 or yesterday_night)
+    mask = pd.Series(keep, index=unassigned_df.index)
+    return unassigned_df[mask], unassigned_df[~mask]
+
+
+_OP_DAY_PIVOT = 2 * 60   # the operational day runs 02:00 → 02:00
+
+
+def unassigned_in_schedule_window(unassigned_df, schedule_df):
+    """Split the unassigned list by the TIME RANGE the built schedule covers.
+
+    "Unassigned" used to mean "has no task anywhere in the built schedule" — so
+    with a night-only build every day/after-shift worker showed up although
+    their turn had not come (04.10: 109 people). Returns (in_window_df,
+    out_df, (start_hhmm, end_hhmm)); without a usable window nothing is split.
+    """
+    if unassigned_df is None or unassigned_df.empty or schedule_df is None or schedule_df.empty:
+        return unassigned_df, unassigned_df.iloc[0:0] if unassigned_df is not None else pd.DataFrame(), None
+
+    def _ax(t):
+        return (time_to_minutes(t) - _OP_DAY_PIVOT) % 1440
+
+    ws = we = None
+    live = schedule_df[~schedule_df["עובד"].astype(str).str.contains("❌", na=False)]
+    for _, r in live.iterrows():
+        a, b = clean_text(r.get("התחלה", "")), clean_text(r.get("סיום", ""))
+        if not is_time_text(a) or not is_time_text(b):
+            continue
+        s = _ax(a)
+        e = s + ((time_to_minutes(b) - time_to_minutes(a)) % 1440)
+        ws = s if ws is None else min(ws, s)
+        we = e if we is None else max(we, e)
+    if ws is None:
+        return unassigned_df, unassigned_df.iloc[0:0], None
+
+    keep = []
+    for _, r in unassigned_df.iterrows():
+        a, b = r["תחילת משמרת"], r["סוף משמרת"]
+        s = _ax(a)
+        dur = (time_to_minutes(b) - time_to_minutes(a)) % 1440 or 1440
+        # last night's shift (starts ≥ 20:00, already running) sits BEFORE this op day
+        if time_to_minutes(a) >= 20 * 60 and not bool(r.get("_tonight", False)):
+            s -= 1440
+        keep.append(s < we and (s + dur) > ws)
+    mask = pd.Series(keep, index=unassigned_df.index)
+    fmt = lambda x: f"{((x + _OP_DAY_PIVOT) % 1440) // 60:02d}:{((x + _OP_DAY_PIVOT) % 1440) % 60:02d}"
+    return unassigned_df[mask], unassigned_df[~mask], (fmt(ws), fmt(we))
 
 
 # =========================

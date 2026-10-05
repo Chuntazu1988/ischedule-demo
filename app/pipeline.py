@@ -9,7 +9,7 @@ display tables) stays in the app; this is pure DataFrame in / DataFrame out.
 
 from app import scheduler as S
 from app.polish import (polish_schedule, repair_shift_end_edges, convert_attendant_trainees,
-                        fill_critical_by_release, unify_evening_rounds)
+                        fill_critical_by_release, unify_evening_rounds, relieve_crew_managers)
 
 
 def is_empty_schedule(schedule_df):
@@ -89,6 +89,14 @@ def run_build_pipeline(flights_df, sched_emps, pre_assignments=None, late_shift_
     # night block goes down once: hand the movable side to someone with nothing
     # (user 2026-08-06 rule, extended to 14:00 starts on 2026-09-27).
     schedule_df = unify_evening_rounds(schedule_df, sched_emps)
+    # Second polish on the FINAL assignment: passes after the first one (the late inspector /
+    # ר"צ fills, the evening rounds) leave gaps the first polish never saw — on the real 04.10
+    # schedule it still cut idle time 295 -> 230 min (user 2026-10-04: minimise gaps).
+    schedule_df = polish_schedule(schedule_df, sched_emps, late_shift_from=late_shift_from)
+    schedule_df = repair_shift_end_edges(schedule_df, sched_emps)
     # Last: no first task in the first 45 min of a shift, on any terminal (user 2026-09-25).
     schedule_df = S.avoid_fresh_start_assignments(schedule_df, sched_emps, terminal=None)
+    # A shift manager rostered as ר"צ is the last resort: hand every slot someone else can take
+    # to a regular ר"צ (user 2026-10-04, TL#55).
+    schedule_df = relieve_crew_managers(schedule_df, sched_emps)
     return schedule_df

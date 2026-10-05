@@ -870,7 +870,38 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
             _day_core_first = _tf + 1
             _day_core_last  = _tf
 
-        def _zone_flags(row_i, start_hhmm):
+        # Sheets laid out as ONE header row of side-by-side shift columns (the
+        # "מנהלי משמרות" sheet: N | D | A | N) have no vertical day core to
+        # compare against — every name sits below the header row, so all of them
+        # looked like "tonight". There the COLUMN decides: the first night column
+        # is last night's shift (finishing this morning), a later one is tonight's.
+        # Only applies to a header row holding BOTH a daytime header and 2+ night
+        # headers, so vertically-stacked sheets are unaffected. (Real 04.10.2026:
+        # אוראל, in the first N column, was listed as working tonight.)
+        _hdr_row_night_cols = {}
+        for _ri in raw.index:
+            _nights, _has_day = [], False
+            for _cj in raw.columns:
+                _ct = clean_text(str(raw.at[_ri, _cj]))
+                _m = TIME_RANGE_RE.search(_ct)
+                # a bare range, or the manager sheet's 'של"נ 23:30-07:00 N' form
+                # (prefix של"נ/של"ן, trailing single-letter shift code)
+                _pre = _ct[:_m.start()].replace('"', '').replace("'", "").strip() if _m else ""
+                _post = _ct[_m.end():].strip() if _m else ""
+                if _m and (not _pre or (_pre in ("שלנ", "שלן") and _post in ("N", "D", "A"))):
+                    try:
+                        _hh = int(normalize_time_text(_m.group(1)).split(':')[0])
+                    except (ValueError, IndexError):
+                        continue
+                    if 5 <= _hh < 17:
+                        _has_day = True
+                    elif _hh >= 20:
+                        _nights.append(_cj)
+            if _has_day and len(_nights) >= 2:
+                for _k, _cj in enumerate(_nights):
+                    _hdr_row_night_cols[_cj] = (_k == 0, _k > 0)
+
+        def _zone_flags(row_i, start_hhmm, col=None):
             """Return (is_top_night, is_bottom_night) for a shift at row_i.
             Only NIGHT starts (≥20:00) can be either; evening/day → (False, False)."""
             try:
@@ -879,6 +910,8 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
                 return (False, False)
             if _h < 20:
                 return (False, False)
+            if col in _hdr_row_night_cols:
+                return _hdr_row_night_cols[col]
             return (row_i < _day_core_first, row_i > _day_core_last)
 
         for col in raw.columns:
@@ -1331,7 +1364,7 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
                     # tonight's upcoming night; a NIGHT shift above it is
                     # yesterday's overnight (page-1). Evening (17:00-19:59) and day
                     # starts are always TODAY → neither flag → scheduled normally.
-                    _is_top_night, _is_bottom_night = _zone_flags(row_i, current_start)
+                    _is_top_night, _is_bottom_night = _zone_flags(row_i, current_start, col)
                     _is_upcoming = _is_bottom_night
 
                     # is_page1 now means specifically "yesterday's overnight window"
@@ -1401,7 +1434,7 @@ def build_shift_map_from_excel(uploaded_file, terminal="3"):
                     # data: agent#22, 21:00-07:00 on page 1 AND page 3, came
                     # out upcoming_night=False and could not be offered to the
                     # אפטר team for the flights departing on 12.08).
-                    _new_top_night, _repeat_bottom_night = _zone_flags(row_i, _new_start)
+                    _new_top_night, _repeat_bottom_night = _zone_flags(row_i, _new_start, col)
                     if _repeat_bottom_night:
                         _ex["upcoming_night"] = True
                         # Keep the window itself too, even when the duplicate
@@ -1930,6 +1963,21 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
     # actually working today).
     _all_emp_name_keys = {name_key(n) for n in df["שם"].astype(str)}
 
+    # Shift-manager roster entries are written by FIRST NAME ALONE ("ניר",
+    # "תאיר"). Such an entry may only ever mean a shift manager: among the
+    # employees flagged מנהל משמרת / מנהל כר"צ, and unique among THEM — a plain
+    # worker who happens to share the first name (restricted-agent#8 vs worker#13, TL#56
+    # vs the CM תאיר) must never absorb it (user rule 2026-10-04).
+    _mgr_name_keys = set()
+    _mgr_first_counts: dict = {}
+    for _n, _r in zip(df["שם"].astype(str), df.to_dict("records")):
+        if any(clean_text(str(_r.get(_c, ""))) == "כן" for _c in ("מנהל משמרת", 'מנהל כר"צ')):
+            _mgr_name_keys.add(name_key(_n))
+            _fw = _n.strip().split()
+            if _fw:
+                _fk = name_key(_fw[0])
+                _mgr_first_counts[_fk] = _mgr_first_counts.get(_fk, 0) + 1
+
     # First-name -> how many מנהל-כר"צ-CERTIFIED employees share it. Used
     # only to resolve a bare "תגבור" note written by first name alone in a
     # DIFFERENT sheet than the employee's own full-name entry (e.g. the
@@ -2025,7 +2073,12 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
             elif (
                 best_single is None and len(orig_parts) == 1 and shared == 1
                 and emp_words and name_key(emp_words[0]) in orig_parts
-                and _first_name_counts.get(name_key(emp_words[0]), 0) == 1
+                and (
+                    (name_key(emp_name) in _mgr_name_keys
+                     and _mgr_first_counts.get(name_key(emp_words[0]), 0) == 1)
+                    if "מנהלי משמרות" in str(entry.get("sheet", ""))
+                    else _first_name_counts.get(name_key(emp_words[0]), 0) == 1
+                )
             ):
                 best_single = entry
         return best or (best_near if _near_count == 1 else None) or best_single
@@ -2300,6 +2353,14 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
             # shift-time override only, no role grant.
             _tbw = entry.get("tagbor_bare_window")
             _is_crew_chief = clean_text(str(row.get('מנהל כר"צ', ""))) == "כן"
+            # A מנהל כר"צ listed under a "[HH:MM-HH:MM] תגבור רצ" SECTION HEADER
+            # is rostered as ר"צ reinforcement for exactly that window (the
+            # header sets entry["tl_trainee"] for everyone below it). Without
+            # this the manager was never "marked" and _manager_may_take barred
+            # them from every flight (real 04.10.2026: TL#55, pink
+            # "02:00-08:30 תגבור רצ", left two ר"צ slots open).
+            if not _tbw and _is_crew_chief and entry.get("tl_trainee"):
+                _tbw = (start, end)
             if not _tbw and _is_crew_chief:
                 # Her OWN entry has no bare-tagbor window, but a DIFFERENT
                 # sheet may carry it under her first name alone (e.g.
@@ -2684,6 +2745,30 @@ def apply_shift_map_to_employees(employees_df, shift_map_with_names):
                             if (_p1_tr_tail.get("to") and _p1_tr_tail.get("at") == _ktw[0]
                                     and _wt_un.get(_ktw) == _p1_tr_tail.get("to")):
                                 _p1_tail_windows.add(_ktw)
+                        # The page-1 shift's own transfer (T3→T1 at 01:00) has
+                        # already happened by the time the restricted tail starts
+                        # ("01:30") — the worker is at the destination terminal for
+                        # that whole tail, exactly like the page-1-only branch above
+                        # retags it. Left at T3 (the default), the tail kept her
+                        # eligible for T3 flights at 04:00 and put her on a T1 flight
+                        # ten minutes after one (real 11.08 data: TL#25 — page-1
+                        # 21:00-07:00 with the T1 file's 01:00 arrival, AND tonight's
+                        # 22:00-08:30 on page 2). Same evidence as that branch: the
+                        # transfer was inferred from THIS primary window, its
+                        # destination window is visibly present, or the note sits
+                        # closer to the primary occurrence.
+                        if (_p1_tr_tail.get("to") and _p1_tr_tail.get("at")
+                                and (_p1_tr_tail.get("_inferred") or _row_evidence_p1
+                                     or any(_ktw[0] == _p1_tr_tail.get("at")
+                                            and _wt_un.get(_ktw) == _p1_tr_tail.get("to")
+                                            for _ktw in _keep_t1))):
+                            try:
+                                _tr_h, _tr_m = str(_p1_tr_tail["at"]).split(":")[:2]
+                                _tr_at_m = int(_tr_h) * 60 + int(_tr_m)
+                                if (90 - _tr_at_m) % 1440 < 12 * 60:   # tail starts 01:30
+                                    entry.setdefault("window_terminals", {})[("01:30", _p1_end)] = _p1_tr_tail["to"]
+                            except (ValueError, IndexError):
+                                pass
             except (ValueError, IndexError, AttributeError):
                 pass
 
@@ -3619,20 +3704,38 @@ def parse_fids_combined(fids_file_objects):
                     ["std", "scheduled", "scheduleddeparture", "departure",
                      "המראה", "etd", "time"],
                 )
+                # A flight delayed across the 03:00 boundary ("01:00" scheduled,
+                # "07:00E" estimated) really departs in the later operational
+                # day, so the day assignment must use the ESTIMATED time when the
+                # estimate column carries one (real 04.10.2026: ELY025 01:00 →
+                # 07:00E was dropped from the board). Same "E" marker as
+                # flights_from_fids' ETD.
+                _etd_src_f = fids_find_src(
+                    fids_df.columns, ["actualdeparture", "actual departure", "etdl", "etdz"])
+
+                def _eff_hm(row):
+                    if _etd_src_f:
+                        _e = str(row.get(_etd_src_f, ""))
+                        if re.search(r"\d{1,2}:\d{2}\s*E\s*$", _e, re.IGNORECASE):
+                            _t = _time_hm(_e)
+                            if _t:
+                                return _t
+                    return _time_hm(row.get(_dep_src_f, ""))
+
                 if _file_idx == 0 and _dep_src_f:
                     # Today's FIDS: keep flights from 03:00 onward.
                     # Overnight flights (00:00-02:59) in today's file belong to the
                     # PREVIOUS operational day and are excluded.
-                    fids_df = fids_df[fids_df[_dep_src_f].apply(
-                        lambda v: (_time_hm(v) or (0, 0)) >= (3, 0)
+                    fids_df = fids_df[fids_df.apply(
+                        lambda r: (_eff_hm(r) or (0, 0)) >= (3, 0), axis=1
                     )]
                 elif _file_idx == 1 and _dep_src_f:
                     # Tomorrow's FIDS: keep ONLY overnight flights (< 03:00).
                     # These are the tail-end of today's operational day (e.g. ELY005 01:10).
                     # Daytime flights (04:00+) in tomorrow's FIDS belong to the NEXT
                     # operational day and must be excluded to avoid duplicate enrichment.
-                    fids_df = fids_df[fids_df[_dep_src_f].apply(
-                        lambda v: (_time_hm(v) or (99, 0)) < (3, 0)
+                    fids_df = fids_df[fids_df.apply(
+                        lambda r: (_eff_hm(r) or (99, 0)) < (3, 0), axis=1
                     )]
 
                 fids_df["_fids_src"] = _file_idx
@@ -3746,12 +3849,22 @@ def flights_from_fids(combined):
     if not rows:
         return None
     board = pd.DataFrame(rows)
+    # A flight scheduled in the small hours but delayed into the day (ETD 03:00+)
+    # sorts by its estimated time, not at the end of the night (ELY025 01:00→07:00E).
+    def _sort_time(r):
+        _d, _e = str(r["המראה"]), str(r["ETD"])
+        _dm = re.search(r"(\d{1,2}):", _d); _em = re.search(r"(\d{1,2}):", _e)
+        if _dm and _em and int(_dm.group(1)) < 3 and int(_em.group(1)) >= 3:
+            return _e
+        return _d
+    board["_sort_t"] = board.apply(_sort_time, axis=1)
     # מיון לפי המראה עם ציר 02:00 — טיסות הלילה (00:xx-01:xx) בסוף היום התפעולי
     def _dep_key(v):
         m = re.search(r"(\d{1,2}):(\d{2})", str(v))
         if not m:
             return 9999
         return (int(m.group(1)) * 60 + int(m.group(2)) - 120) % 1440
-    return board.sort_values(by="המראה", key=lambda c: c.apply(_dep_key)).reset_index(drop=True)
+    return (board.sort_values(by="_sort_t", key=lambda c: c.apply(_dep_key))
+            .drop(columns="_sort_t").reset_index(drop=True))
 
 

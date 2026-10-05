@@ -32,6 +32,8 @@ from app.display import (
     build_counter_continuity_rows,
     build_available_in_hall,
     build_unassigned_agents,
+    unassigned_in_schedule_window,
+    unassigned_for_night_segment,
     render_flight_card_with_swap,
     to_excel_bytes,
     build_peak_analysis,
@@ -1424,6 +1426,81 @@ def _confirm_force_typed_assign_dialog():
             st.rerun()
 
 
+# Terminal classification helpers — module level so other tabs (e.g. לא משובצים)
+# can colour terminal-1 / transfer workers with the exact same rule.
+def _avail_windows_sorted(row, shift=None):
+    """
+    [(start_minutes, window_text, terminal), ...] בסדר יום תפעולי.
+
+    shift=None → כל החלונות. shift=0/1 → רק חלונות המשמרת הזאת, לפי
+    עמודת "שיוך משמרת" (0 = המשמרת הראשית, 1 = הלילה שמתחיל הערב).
+    """
+    _wins = [w.strip() for w in clean_text(str(row.get("זמינות", ""))).split(",") if w.strip()]
+    _terms = [t.strip() for t in clean_text(str(row.get("זמינות טרמינל", ""))).split(",")]
+    _shifts = [t.strip() for t in clean_text(str(row.get("שיוך משמרת", ""))).split(",")]
+    _out = []
+    for _i, _w in enumerate(_wins):
+        if "-" not in _w:
+            continue
+        _s = _w.split("-", 1)[0].strip()
+        if not is_time_text(_s):
+            continue
+        if shift is not None and _shifts and any(_shifts):
+            _sh = _shifts[_i] if _i < len(_shifts) and _shifts[_i] else "0"
+            if _sh != str(shift):
+                continue
+        _t = _terms[_i] if _i < len(_terms) and _terms[_i] else "3"
+        _out.append(((time_to_minutes(_s) - 3 * 60) % 1440, _w, "1" if _t == "1" else "3"))
+    return sorted(_out)
+
+def _terminal_label_for(row, shift=None):
+    """
+    סדר העדיפויות (אושר מול נתוני 11.08):
+
+    1. חלונות הזמינות, כשהם מכילים שני טרמינלים — אז העובד/ת מופיע/ה בשני
+       הסידורים והחלונות עצמם מספרים את הכיוון. queue-coord#1/agent#34/agent#55/
+       agent#58: 09:30-17:30 בטרמינל 1 ואז 14:00-17:30 בטרמינל 3 → 1+3.
+    2. אחרת הערת המעבר, כי לרוב עובדי המעבר אין חלון זמינות לצד הראשון של
+       המשמרת כלל — agent#22: כל חלונותיה בטרמינל 1, וההערה
+       "המשך מש' בטרמינל 1 החל מ01:00" היא מה שמגלה שלפני כן היא בטרמינל 3.
+    3. אחרת טרמינל הבסיס.
+    """
+    _seq = []
+    for _, _w, _t in _avail_windows_sorted(row, shift):
+        if not _seq or _seq[-1] != _t:
+            _seq.append(_t)
+    if len(_seq) >= 2 and _seq[0] != _seq[-1]:
+        return f"{_seq[0]}+{_seq[-1]}"
+    if len(_seq) >= 3:
+        # יצא-וחזר באותו יום תפעולי (TL#41: ט3 הלילה → ט1 ב-01:00 →
+        # ט3 שוב בבוקר, כי הבוקר שייך למשמרת של אתמול). "3+3" חסר משמעות,
+        # אז ההערה קובעת את הכיוון.
+        _tr_rt = clean_text(str(row.get("מעבר טרמינל", "")))
+        if "@" in _tr_rt:
+            _to_rt = "1" if _tr_rt.split("@", 1)[0].strip() == "1" else "3"
+            return f'{"3" if _to_rt == "1" else "1"}+{_to_rt}'
+
+    _tr = clean_text(str(row.get("מעבר טרמינל", "")))
+    if "@" in _tr:
+        _to = "1" if _tr.split("@", 1)[0].strip() == "1" else "3"
+        # הערת המעבר שייכת למשמרת אחת בלבד. כשלעובד/ת יש שתי משמרות
+        # (התיוג ב"שיוך משמרת"), אסור להחיל אותה על המשמרת שהחלונות שלה
+        # אינם מגיעים לטרמינל היעד — TL#41 עובר לט1 רק בלילה שמתחיל
+        # היום, ומשמרת אתמול שלו כולה ט3 (הערת המשתמשת 2026-08-21:
+        # "בפועל מופיע שבשתי המשמרות הוא עובר לטרמינל 1").
+        _tags = [t.strip() for t in clean_text(str(row.get("שיוך משמרת", ""))).split(",")]
+        _two_shifts = "1" in _tags
+        if not (shift is not None and _two_shifts and _to not in {t for _, _w, t in _avail_windows_sorted(row, shift)}):
+            # הערה ללא שעה ("worker#5 -טרמינל 1") = כל המשמרת בטרמינל היעד,
+            # לא מעבר באמצעה (restricted-agent#3: 22:00-01:30, כולה ט1).
+            if not _tr.split("@", 1)[1].strip():
+                return _to
+            return f'{"3" if _to == "1" else "1"}+{_to}'
+    if _seq:
+        return _seq[0]
+    return "1" if clean_text(str(row.get("טרמינל", ""))) == "1" else "3"
+
+
 def _render_who_works_today():
     """מציג את רשימת העובדים הרשומים להיום עם אפשרות הורדה ממשמרת."""
 
@@ -1488,78 +1565,6 @@ def _render_who_works_today():
     # ניתנת לעריכה ידנית — כך אפשר להעביר עובד/ת בין הטרמינלים כדי לכסות
     # חוסר (סיק), והבנייה הבאה תכבד את השינוי.
     _TERMINAL_OPTIONS = ["3", "1", "3+1", "1+3"]
-
-    def _avail_windows_sorted(row, shift=None):
-        """
-        [(start_minutes, window_text, terminal), ...] בסדר יום תפעולי.
-
-        shift=None → כל החלונות. shift=0/1 → רק חלונות המשמרת הזאת, לפי
-        עמודת "שיוך משמרת" (0 = המשמרת הראשית, 1 = הלילה שמתחיל הערב).
-        """
-        _wins = [w.strip() for w in clean_text(str(row.get("זמינות", ""))).split(",") if w.strip()]
-        _terms = [t.strip() for t in clean_text(str(row.get("זמינות טרמינל", ""))).split(",")]
-        _shifts = [t.strip() for t in clean_text(str(row.get("שיוך משמרת", ""))).split(",")]
-        _out = []
-        for _i, _w in enumerate(_wins):
-            if "-" not in _w:
-                continue
-            _s = _w.split("-", 1)[0].strip()
-            if not is_time_text(_s):
-                continue
-            if shift is not None and _shifts and any(_shifts):
-                _sh = _shifts[_i] if _i < len(_shifts) and _shifts[_i] else "0"
-                if _sh != str(shift):
-                    continue
-            _t = _terms[_i] if _i < len(_terms) and _terms[_i] else "3"
-            _out.append(((time_to_minutes(_s) - 3 * 60) % 1440, _w, "1" if _t == "1" else "3"))
-        return sorted(_out)
-
-    def _terminal_label_for(row, shift=None):
-        """
-        סדר העדיפויות (אושר מול נתוני 11.08):
-
-        1. חלונות הזמינות, כשהם מכילים שני טרמינלים — אז העובד/ת מופיע/ה בשני
-           הסידורים והחלונות עצמם מספרים את הכיוון. queue-coord#1/agent#34/agent#55/
-           agent#58: 09:30-17:30 בטרמינל 1 ואז 14:00-17:30 בטרמינל 3 → 1+3.
-        2. אחרת הערת המעבר, כי לרוב עובדי המעבר אין חלון זמינות לצד הראשון של
-           המשמרת כלל — agent#22: כל חלונותיה בטרמינל 1, וההערה
-           "המשך מש' בטרמינל 1 החל מ01:00" היא מה שמגלה שלפני כן היא בטרמינל 3.
-        3. אחרת טרמינל הבסיס.
-        """
-        _seq = []
-        for _, _w, _t in _avail_windows_sorted(row, shift):
-            if not _seq or _seq[-1] != _t:
-                _seq.append(_t)
-        if len(_seq) >= 2 and _seq[0] != _seq[-1]:
-            return f"{_seq[0]}+{_seq[-1]}"
-        if len(_seq) >= 3:
-            # יצא-וחזר באותו יום תפעולי (TL#41: ט3 הלילה → ט1 ב-01:00 →
-            # ט3 שוב בבוקר, כי הבוקר שייך למשמרת של אתמול). "3+3" חסר משמעות,
-            # אז ההערה קובעת את הכיוון.
-            _tr_rt = clean_text(str(row.get("מעבר טרמינל", "")))
-            if "@" in _tr_rt:
-                _to_rt = "1" if _tr_rt.split("@", 1)[0].strip() == "1" else "3"
-                return f'{"3" if _to_rt == "1" else "1"}+{_to_rt}'
-
-        _tr = clean_text(str(row.get("מעבר טרמינל", "")))
-        if "@" in _tr:
-            _to = "1" if _tr.split("@", 1)[0].strip() == "1" else "3"
-            # הערת המעבר שייכת למשמרת אחת בלבד. כשלעובד/ת יש שתי משמרות
-            # (התיוג ב"שיוך משמרת"), אסור להחיל אותה על המשמרת שהחלונות שלה
-            # אינם מגיעים לטרמינל היעד — TL#41 עובר לט1 רק בלילה שמתחיל
-            # היום, ומשמרת אתמול שלו כולה ט3 (הערת המשתמשת 2026-08-21:
-            # "בפועל מופיע שבשתי המשמרות הוא עובר לטרמינל 1").
-            _tags = [t.strip() for t in clean_text(str(row.get("שיוך משמרת", ""))).split(",")]
-            _two_shifts = "1" in _tags
-            if not (shift is not None and _two_shifts and _to not in {t for _, _w, t in _avail_windows_sorted(row, shift)}):
-                # הערה ללא שעה ("worker#5 -טרמינל 1") = כל המשמרת בטרמינל היעד,
-                # לא מעבר באמצעה (restricted-agent#3: 22:00-01:30, כולה ט1).
-                if not _tr.split("@", 1)[1].strip():
-                    return _to
-                return f'{"3" if _to == "1" else "1"}+{_to}'
-        if _seq:
-            return _seq[0]
-        return "1" if clean_text(str(row.get("טרמינל", ""))) == "1" else "3"
 
     def _transfer_time_for(row, shift=None):
         """
@@ -1842,7 +1847,7 @@ def _render_who_works_today():
     )
 
     # הורדה column: ➕ = active, reason text = removed
-    _REMOVAL_OPTIONS = ["➕", "Sick", "סיק במשפחה", "סיק במשמרת", "כח אדם"]
+    _REMOVAL_OPTIONS = ["➕", "Sick", "סיק במשפחה", "סיק במשמרת", "כח אדם", "להלה"]
     _display_df.insert(
         0,
         "הורדה ממשמרת",
@@ -1900,51 +1905,215 @@ def _render_who_works_today():
             if _col in _display_df.columns:
                 _display_df.iat[_ridx, _display_df.columns.get_loc(_col)] = _val
 
-    _edited = st.data_editor(
-        _display_df,
-        width="stretch",
-        num_rows="fixed",
-        hide_index=True,
-        key="shift_hours_editor",
-        column_config={
-            "הורדה ממשמרת": st.column_config.SelectboxColumn(
-                "הורדה ממשמרת",
-                options=_REMOVAL_OPTIONS,
-                default="➕",
-                width="small",
-                help="לחץ להורדת עובד ממשמרת",
-            ),
-            "הגיע/ה למשמרת": st.column_config.TextColumn(
-                "הגיע/ה למשמרת", disabled=True, width="small",
-                help="מסומן ע\"י העובד/ת במסך האישי שלו/ה",
-            ),
-            "שם": st.column_config.TextColumn("שם", disabled=True, width="medium"),
-            "תחילת משמרת": st.column_config.TextColumn(
-                "תחילת משמרת", width="small", help="פורמט HH:MM"
-            ),
-            "סוף משמרת": st.column_config.TextColumn(
-                "סוף משמרת", width="small", help="פורמט HH:MM"
-            ),
-            "טרמינל": st.column_config.SelectboxColumn(
-                "טרמינל",
-                options=_TERMINAL_OPTIONS,
-                width="small",
-                help='3 / 1 = כל המשמרת באותו טרמינל. 3+1 = מתחיל/ה ב-3 ועובר/ת ל-1 '
-                     'במהלך המשמרת, 1+3 = להפך. ניתן לשנות ידנית כדי להעביר '
-                     'עובד/ת בין הטרמינלים ולכסות חוסר.',
-            ),
-            "החלף ב־": st.column_config.TextColumn(
-                "החלף ב־", width="medium",
-                help="הקלד/י שם של עובד/ת אחר/ת כדי להעביר אליו/ה את כל המשימות "
-                     "של השורה הזאת. השם חייב להופיע בקובץ העובדים.",
-            ),
-            "שעת מעבר": st.column_config.TextColumn(
-                "שעת מעבר", width="small",
-                help='שעת המעבר בין הטרמינלים (HH:MM) — רלוונטי רק ל-3+1 / 1+3. '
-                     'ניתן לשנות ידנית; השעה חייבת ליפול בתוך המשמרת.',
-            ),
-        },
-    )
+    # ── Summary strip above the table (user rule 2026-10-04): at-a-glance counts
+    # for who is on today's roster, by start-hour bucket / terminal / arrival, and
+    # why people were taken off the shift. Read-only — the editor below is unchanged.
+    # Worker → segment (user rule 2026-10-04):
+    #   נייט  — up to the last early-morning shift: starts before 06:40, plus last
+    #           night's shifts (start ≥ 20:00 dated BEFORE today — already on the floor)
+    #   דיי   — first day shift from 06:40 through the latest evening shift (< 20:00)
+    #   אפטר  — tonight's night shifts: start ≥ 20:00 dated today
+    _today_ddmm = app_now().strftime("%d.%m")
+
+    def _seg_of(_row):
+        _t = clean_text(str(_row.get("תחילת משמרת", "")))
+        if not is_time_text(_t):
+            return "ללא שעה"
+        _m = time_to_minutes(_t)
+        if _m < 6 * 60 + 40:
+            return "נייט"
+        if _m < 20 * 60:
+            return "דיי"
+        return "אפטר" if clean_text(str(_row.get("תאריך", ""))) == _today_ddmm else "נייט"
+
+    _sum_total = len(_display_df)
+    _sum_arrived = int(_display_df["הגיע/ה למשמרת"].astype(str).str.startswith("✅").sum())
+    _term_counts = _display_df["טרמינל"].astype(str).value_counts() if "טרמינל" in _display_df.columns else {}
+    _bucket_counts = _display_df.apply(_seg_of, axis=1).value_counts() if "תחילת משמרת" in _display_df.columns else {}
+    _rm = st.session_state.get("removed_employees", {})
+    _rm_counts = {}
+    for _rsn in _rm.values():
+        _rm_counts[str(_rsn)] = _rm_counts.get(str(_rsn), 0) + 1
+
+    def _sum_card(_ico, _lbl, _val, _sub="", _tone="--acc-rgb"):
+        return (
+            f'<div class="cc-card" style="--cc-tone:var({_tone})">'
+            f'<div class="cc-top"><span class="cc-ico">{_ico}</span><span>{safe_html(_lbl)}</span></div>'
+            f'<div class="cc-val">{safe_html(str(_val))}</div>'
+            f'<div class="cc-sub">{safe_html(_sub) if _sub else "&nbsp;"}</div></div>'
+        )
+
+    _t3 = int(_term_counts.get("3", 0)) if len(_term_counts) else 0
+    _t1 = int(_term_counts.get("1", 0)) if len(_term_counts) else 0
+    _tx = _sum_total - _t3 - _t1
+    _bk = " · ".join(f"{k} {int(v)}" for k, v in dict(_bucket_counts).items()) if len(_bucket_counts) else ""
+    _bk_all = _display_df.apply(_seg_of, axis=1) if "תחילת משמרת" in _display_df.columns else None
+    _arr_mask = _display_df["הגיע/ה למשמרת"].astype(str).str.startswith("✅")
+    _arr_by_seg = ""
+    if _bk_all is not None:
+        _arr_by_seg = " · ".join(
+            f"{_sg} {int((_arr_mask & (_bk_all == _sg)).sum())}/{int((_bk_all == _sg).sum())}"
+            for _sg in ("נייט", "דיי", "אפטר") if int((_bk_all == _sg).sum())
+        )
+    def _wtd_toggle():
+        _on = not st.session_state.get("wtd_show_names", False)
+        st.session_state["wtd_show_names"] = _on
+        if _on:
+            st.session_state["wtd_mode"] = "הגיעו"   # open on who actually arrived
+
+    _show_names = st.session_state.get("wtd_show_names", False)
+    _k1, _k2, _k3, _k4 = st.columns(4)[::-1]   # Hebrew: first card on the right
+    with _k1:
+        st.markdown(_sum_card("👥", "עובדים היום", _sum_total, _bk, "--r-agent"), unsafe_allow_html=True)
+    with _k2:
+        st.markdown(_sum_card("✅", "הגיעו למשמרת", _sum_arrived, _arr_by_seg or f"מתוך {_sum_total}", "--r-guard"),
+                    unsafe_allow_html=True)
+        st.button("🙈 הסתר שמות" if _show_names else "👁 הצג שמות — מי הגיע/ה",
+                  key="wtd_toggle", on_click=_wtd_toggle, width="stretch")
+    with _k3:
+        st.markdown(_sum_card("🏢", "בטרמינל 3", _t3,
+                              f"טרמינל 1: {_t1}" + (f" · מעבר בין טרמינלים: {_tx}" if _tx else ""), "--r-train"),
+                    unsafe_allow_html=True)
+    with _k4:
+        st.markdown(_sum_card("🚫", "הורדו ממשמרת", len(_rm), "", "--r-insp"), unsafe_allow_html=True)
+    if _rm_counts:
+        st.markdown(
+            '<div class="cc-chips" dir="rtl"><span class="cc-chips-lbl">סיבות הורדה:</span>'
+            + "".join(f'<span class="cc-chip">{safe_html(k)} <b>{v}</b></span>' for k, v in _rm_counts.items())
+            + '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Display order only (RTL reading order, right → left): the name sits at the
+    # right edge, then arrival / shift hours / terminal / transfer, then the
+    # actions. The editor lays columns out left → right, so the list is the
+    # reverse. Edits are tracked by column NAME, so reordering is safe.
+    _rtl_order = ["שם", "הגיע/ה למשמרת", "תחילת משמרת", "סוף משמרת", "טרמינל",
+                  "שעת מעבר", "הורדה ממשמרת", "החלף ב־", "תאריך"]
+    _col_order = [c for c in reversed(_rtl_order) if c in _display_df.columns]
+
+    # ── Rich read-only roster (user rule 2026-10-04: the flat table looked plain next
+    # to the rest of the site). Filled right after the editor below, from its
+    # CURRENT values, so edits show up immediately. The editor itself is kept —
+    # unchanged — inside the expander: all edit/sync logic still runs on render.
+    _rich_ph = st.container()
+    with st.expander("✏️ עריכה: שעות, טרמינל והורדות ממשמרת"):
+        _edited = st.data_editor(
+            _display_df,
+            width="stretch",
+            num_rows="fixed",
+            hide_index=True,
+            column_order=_col_order,
+            key="shift_hours_editor",
+            column_config={
+                "הורדה ממשמרת": st.column_config.SelectboxColumn(
+                    "הורדה ממשמרת",
+                    options=_REMOVAL_OPTIONS,
+                    default="➕",
+                    width="small",
+                    help="לחץ להורדת עובד ממשמרת",
+                ),
+                "הגיע/ה למשמרת": st.column_config.TextColumn(
+                    "הגיע/ה למשמרת", disabled=True, width="small",
+                    help="מסומן ע\"י העובד/ת במסך האישי שלו/ה",
+                ),
+                "שם": st.column_config.TextColumn("שם", disabled=True, width="medium"),
+                "תחילת משמרת": st.column_config.TextColumn(
+                    "תחילת משמרת", width="small", help="פורמט HH:MM"
+                ),
+                "סוף משמרת": st.column_config.TextColumn(
+                    "סוף משמרת", width="small", help="פורמט HH:MM"
+                ),
+                "טרמינל": st.column_config.SelectboxColumn(
+                    "טרמינל",
+                    options=_TERMINAL_OPTIONS,
+                    width="small",
+                    help='3 / 1 = כל המשמרת באותו טרמינל. 3+1 = מתחיל/ה ב-3 ועובר/ת ל-1 '
+                         'במהלך המשמרת, 1+3 = להפך. ניתן לשנות ידנית כדי להעביר '
+                         'עובד/ת בין הטרמינלים ולכסות חוסר.',
+                ),
+                "החלף ב־": st.column_config.TextColumn(
+                    "החלף ב־", width="medium",
+                    help="הקלד/י שם של עובד/ת אחר/ת כדי להעביר אליו/ה את כל המשימות "
+                         "של השורה הזאת. השם חייב להופיע בקובץ העובדים.",
+                ),
+                "שעת מעבר": st.column_config.TextColumn(
+                    "שעת מעבר", width="small",
+                    help='שעת המעבר בין הטרמינלים (HH:MM) — רלוונטי רק ל-3+1 / 1+3. '
+                         'ניתן לשנות ידנית; השעה חייבת ליפול בתוך המשמרת.',
+                ),
+            },
+        )
+
+    def _render_rich_roster(_df):
+        _fc1, _fc2 = st.columns([3, 2])
+        with _fc2:
+            _mode = st.radio(
+                "הצג", ["כולם", "הגיעו", "לא הגיעו", "הורדו"], horizontal=True,
+                key="wtd_mode", label_visibility="collapsed",
+            )
+        with _fc1:
+            _q = clean_text(st.text_input(
+                "חיפוש עובד", key="wtd_search", placeholder="🔍 חיפוש עובד לפי שם",
+                label_visibility="collapsed",
+            ))
+        _runs = []   # [(bucket, [cards...])] — a new run whenever the bucket changes
+        for _, _r in _df.iterrows():
+            _nm = clean_text(str(_r.get("שם", "")))
+            _reason = str(_r.get("הורדה ממשמרת", "➕")).strip()
+            _removed_row = bool(_reason) and _reason != "➕"
+            _arr = str(_r.get("הגיע/ה למשמרת", "—"))
+            _arrived = _arr.startswith("✅")
+            if _q and _q not in _nm:
+                continue
+            if _mode == "הגיעו" and not _arrived:
+                continue
+            if _mode == "לא הגיעו" and _arrived:
+                continue
+            if _mode == "הורדו" and not _removed_row:
+                continue
+            _ss, _se = str(_r.get("תחילת משמרת", "")).strip(), str(_r.get("סוף משמרת", "")).strip()
+            _term = str(_r.get("טרמינל", "")).strip()
+            _tat = str(_r.get("שעת מעבר", "")).strip()
+            _tat_html = (f' <span dir="ltr" style="unicode-bidi:isolate">{safe_html(_tat)}</span>' if _tat else "")
+            if _term == "3+1":
+                _tchip = f'🏢 ט3 ← ט1{_tat_html}'
+            elif _term == "1+3":
+                _tchip = f'🏢 ט1 ← ט3{_tat_html}'
+            else:
+                _tchip = f'🏢 ט{safe_html(_term or "3")}'
+            _tone = "--t1-rgb" if _term.startswith("1") else "--r-agent"
+            _chips = f'<span class="wd-chip">{_tchip}</span>'
+            _chips += (f'<span class="wd-chip wd-ok">✅ {safe_html(_arr[2:].strip())}</span>' if _arrived
+                       else '<span class="wd-chip wd-wait">⏳ טרם הגיע/ה</span>')
+            if _removed_row:
+                _chips += f'<span class="wd-chip wd-off-chip">🚫 {safe_html(_reason)}</span>'
+            _hours = (f'<span class="wd-hours">{safe_html(_ss)}–{safe_html(_se)}</span>'
+                      if _ss and _se else '<span class="wd-hours">—</span>')
+            _card = (
+                f'<div class="wd-card{" wd-off" if _removed_row else ""}" style="--cc-tone:var({_tone})">'
+                f'<div class="wd-name">{safe_html(_nm)}</div>{_hours}'
+                f'<div class="wd-chips">{_chips}</div></div>'
+            )
+            _b = _seg_of(_r)
+            if not _runs or _runs[-1][0] != _b:
+                _runs.append((_b, []))
+            _runs[-1][1].append(_card)
+        if not _runs:
+            st.info("עדיין אף עובד/ת לא סימנ/ה הגעה למשמרת." if _mode == "הגיעו" and not _q
+                    else "אין עובדים שתואמים לסינון.")
+            return
+        _titles = {"נייט": "🌙 נייט", "דיי": "☀️ דיי", "אפטר": "🌃 אפטר", "ללא שעה": "⏳ ללא שעה"}
+        _html = ""
+        for _b, _cards in _runs:
+            _t = _titles.get(_b, _b)
+            _html += (f'<div class="wd-sec"><span>{_t}</span><b>{len(_cards)}</b></div>'
+                      f'<div class="wd-grid">{"".join(_cards)}</div>')
+        st.markdown(_html, unsafe_allow_html=True)
+
+    if _show_names:
+        with _rich_ph:
+            _render_rich_roster(_edited if _edited is not None else _display_df)
 
     # Sync edits → removal state + shift times in employees_df AND
     # employees_snap. Writing only to the local employees_df (as this used
@@ -3499,7 +3668,8 @@ def _run_build_schedule(flights_df, emps_df, locked_df=None, extra_flights_df=No
     if locked_df is not None and not locked_df.empty:
         _pre = _to_native_df(locked_df).copy()
         _pre[LOCKED_COL] = True
-    _late_from = 8 * 60 if st.session_state.get("_building_segment") == "night" else None
+    # 06:30: a 06:40/07:00 day shift is a day-shift worker too (user 2026-10-04, agent#92 07:00-16:00 flew while idle 02:00 workers existed)
+    _late_from = 6 * 60 + 30 if st.session_state.get("_building_segment") == "night" else None
     # Look-ahead (user 2026-09-27): reserve, for the segments after this one, the
     # scarce workers (מפקח TSA / ראש צוות) they will need, so this segment cannot
     # park them on a lesser task at the same time — real 23.08: TSA-inspector#3. Advisory:
@@ -3780,7 +3950,7 @@ def _confirm_new_schedule_dialog():
                 "_segments_built", "_segment_built_until", "show_segment_form",
                 "_segment_snapshots", "_segment_current", "_view_segment",
                 "_manual_emp_edits",
-                "special_tl_instructions", "_unmet_tl_instructions",
+                "special_tl_instructions", "_unmet_tl_instructions", "special_posts",
             ]:
                 st.session_state.pop(_k, None)
             session_checkpoint.clear_checkpoint()
@@ -3788,6 +3958,101 @@ def _confirm_new_schedule_dialog():
             st.toast("✅ הסידור הקודם נשמר בלשונית \"היסטוריה\" — אפשר להתחיל סידור חדש.", icon="⭐")
             st.rerun()
     with _c_cancel:
+        if st.button("ביטול", width="stretch"):
+            st.rerun()
+
+
+@st.dialog("תצוגה מקדימה של הטיסה")
+def _flight_preview_dialog(_rows):
+    """Read-only summary of one flight's roster — opened from the timeline tab
+    (a bar click) without switching to the schedule tab, so the timeline's own
+    scroll position and filters stay exactly where they were."""
+    _r0 = _rows.iloc[0]
+    _fnum = str(_r0.get("טיסה", "")).strip()
+    _dest = str(_r0.get("יעד", "")).strip()
+    _dep = str(_r0.get("המראה", "")).strip()
+    _gate = str(_r0.get("גייט", "")).strip()
+    st.markdown(
+        f'<div dir="rtl" style="text-align:right;font-weight:800;font-size:16px;'
+        f'border-bottom:1px solid rgba(var(--ink-rgb),.12);padding-bottom:8px;margin-bottom:8px;">'
+        f'✈️ {safe_html(_fnum)} ← {safe_html(_dest)}'
+        f'<span style="font-weight:400;color:rgba(var(--ink-rgb),.8);font-size:13px;">'
+        f' · שעה {safe_html(_dep)}' + (f' · גייט {safe_html(_gate)}' if _gate and _gate != "nan" else "") +
+        '</span></div>',
+        unsafe_allow_html=True,
+    )
+    for _, _t in _rows.sort_values("התחלה").iterrows():
+        _role = normalize_role_label(str(_t.get("תפקיד בסיס", "")))
+        _worker = str(_t.get("עובד", "")).strip()
+        _missing = "❌" in _worker
+        _s, _e = str(_t.get("התחלה", "")).strip(), str(_t.get("סיום", "")).strip()
+        st.markdown(
+            f'<div dir="rtl" style="text-align:right;padding:5px 0;display:flex;'
+            f'justify-content:space-between;gap:10px;border-bottom:1px dashed rgba(var(--ink-rgb),.08);">'
+            f'<span>{"⚠️ " if _missing else ""}<b>{safe_html(_role)}</b> — '
+            f'{"לא משובצת" if _missing else safe_html(_worker)}</span>'
+            f'<span style="color:rgba(var(--ink-rgb),.74);white-space:nowrap;">{safe_html(_s)}–{safe_html(_e)}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    st.caption("תצוגה לקריאה בלבד · לביצוע החלפה עברי ללשונית \"סידור עבודה\" ופתחי את הכרטיס שם")
+    if st.button("סגירה", width="stretch"):
+        st.rerun()
+
+
+@st.dialog("העברת משימה")
+def _drag_move_dialog(_task_idx, _target_worker):
+    """Opened by dropping a timeline bar onto another worker's row. Always goes
+    through the same qualification check the swap popup and the gap-assign
+    panel use — a drop never silently reassigns anything on its own."""
+    from app.scheduler import get_qualified_candidates_for_swap, do_swap
+    _sched = st.session_state["schedule_df"]
+    _row = _sched.loc[_task_idx]
+    _flight = str(_row.get("טיסה", "")).strip()
+    _role_base = str(_row.get("תפקיד בסיס", ""))
+    _role = normalize_role_label(_role_base)
+    _cur_worker = str(_row.get("עובד", "")).strip()
+    _s, _e = str(_row.get("התחלה", "")).strip(), str(_row.get("סיום", "")).strip()
+
+    st.markdown(
+        f'<div dir="rtl" style="text-align:right;">'
+        f'<b>{safe_html(_flight)}</b> · {safe_html(_role)} · {safe_html(_s)}–{safe_html(_e)}<br>'
+        f'מ־<b>{safe_html(_cur_worker)}</b> אל <b>{safe_html(_target_worker)}</b>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if _target_worker == _cur_worker:
+        st.info("זה/ו כבר משובץ/ת למשימה הזאת.")
+        if st.button("סגירה", width="stretch"):
+            st.rerun()
+        return
+
+    _cands = get_qualified_candidates_for_swap(
+        _sched, st.session_state["employees_snap"], _flight, _role_base, _task_idx
+    )
+    if _target_worker not in _cands:
+        st.warning(
+            f"⚠️ {safe_html(_target_worker)} לא מופיע/ה ברשימת המחליפים המוסמכים והפנויים למשימה הזאת "
+            f"— ייתכן שאינו/ה מוסמך/ת לתפקיד, או שיש לו/ה משימה חופפת. "
+            f"ההעברה לא בוצעה."
+        )
+        if st.button("סגירה", width="stretch"):
+            st.rerun()
+        return
+
+    st.success(f"✅ {safe_html(_target_worker)} מוסמך/ת ופנוי/ה למשימה הזאת.")
+    _c1, _c2 = st.columns(2)[::-1]
+    with _c1:
+        if st.button("✅ אשר העברה", width="stretch", type="primary"):
+            _updated = do_swap(_sched, _task_idx, _target_worker, "unassign")
+            st.session_state["schedule_df"] = _updated
+            for _k in ["labeled_df", "workload_df", "continuity_df", "output_df", "_ar_highlighted"]:
+                st.session_state.pop(_k, None)
+            st.session_state.pop("_tl_drag_task_idx", None)
+            st.toast(f"✅ {_flight} הועברה ל-{_target_worker}", icon="✅")
+            st.rerun()
+    with _c2:
         if st.button("ביטול", width="stretch"):
             st.rerun()
 
@@ -4127,20 +4392,20 @@ if st.session_state.get("show_time_form", False):
 TAB_SCHEDULE = "schedule"
 TAB_DASHBOARD = "dashboard"
 TAB_UNASSIGNED = "unassigned"
-TAB_AVAILABLE = "available"
 TAB_WORKFLOW = "workflow"
 TAB_USERS = "users"
 TAB_EMPLOYEES = "employees"
 TAB_ARCHIVE = "archive"
 TAB_TIMELINE = "timeline"
+TAB_SPECIAL = "special_posts"
 
 FULL_TAB_LABELS = {
     TAB_SCHEDULE: "🔧 סידור עבודה",
     TAB_WORKFLOW: "📑 זרימת עבודה",
     TAB_TIMELINE: "📈 ציר זמן",
+    TAB_SPECIAL: "📍 עמדות מיוחדות",
     TAB_DASHBOARD: "⏱️ מרכז בקרה",
     TAB_UNASSIGNED: "🚨 לא משובצים",
-    TAB_AVAILABLE: "🟡 פנויים באולם",
     TAB_USERS: "👤 ניהול משתמשים",
     TAB_EMPLOYEES: "🧑‍✈️ ניהול עובדים",
     TAB_ARCHIVE: "🗂️ היסטוריה",
@@ -4572,7 +4837,8 @@ if "schedule_df" in st.session_state:
     if "shift_map_ref" not in st.session_state:
         st.session_state["shift_map_ref"] = _build_full_shift_map_ref()
 
-    if "unassigned_df" not in st.session_state:
+    if ("unassigned_df" not in st.session_state
+            or "_tonight" not in st.session_state["unassigned_df"].columns):
         st.session_state["unassigned_df"] = build_unassigned_agents(
             live_schedule,
             live_employees,
@@ -4581,6 +4847,11 @@ if "schedule_df" in st.session_state:
     available_df = st.session_state["available_df"]
     shift_map_ref = st.session_state["shift_map_ref"]
     unassigned_df = st.session_state["unassigned_df"]
+    # Workers taken off the shift AFTER the build still sit in employees_snap —
+    # they must not show up as "unassigned" or be offered for breaks.
+    _removed_now = {clean_text(n) for n in st.session_state.get("removed_employees", {})}
+    if _removed_now and unassigned_df is not None and not unassigned_df.empty and "שם" in unassigned_df.columns:
+        unassigned_df = unassigned_df[~unassigned_df["שם"].map(clean_text).isin(_removed_now)].reset_index(drop=True)
     total_flights = (
         live_flights["טיסה"].nunique()
         if "טיסה" in live_flights.columns
@@ -4612,7 +4883,8 @@ if "schedule_df" in st.session_state:
     # (including ניהול משתמשים) once a schedule exists.
     TAB_LABELS = FULL_TAB_LABELS
 
-    if "active_main_tab" not in st.session_state:
+    # a restored session may still point at the removed "available" tab
+    if st.session_state.get("active_main_tab") not in TAB_LABELS:
         st.session_state["active_main_tab"] = TAB_SCHEDULE
     active_main_tab = st.session_state["active_main_tab"]
 
@@ -4726,54 +4998,176 @@ if "schedule_df" in st.session_state:
                         st.session_state.pop(_k, None)
                     st.rerun()
 
-        # חשב כרגע באולם
-        _lounge_roles = {"דייל", "ראש צוות", "מתאם תורים", 'ר"צ'}
-        _now_min_db = app_now().hour * 60 + app_now().minute
+        # ── Static classification (per build) — everything below is limited to
+        # names that appear in TODAY's daily schedule (employees_class_df["sheet"]
+        # is empty for anyone the daily file doesn't list). User rule 2026-10-04.
+        def _cc_yes(df, col):
+            if col not in df.columns:
+                return pd.Series(False, index=df.index)
+            return df[col].astype(str).str.strip().isin(["כן", "TRUE", "True", "1"])
 
-        _flight_times = {}
-        for _, _fr in live_flights.iterrows():
-            _fnum = str(_fr.get("טיסה", "")).strip()
-            try:
-                _bh, _bm2 = str(_fr.get("בורדינג", "")).split(":")[:2]
-                _bm = int(_bh) * 60 + int(_bm2)
-            except Exception:
-                continue
-            if _fnum:
-                _flight_times[_fnum] = _bm
+        _cc_today = employees_class_df[employees_class_df["sheet"] != ""].drop_duplicates("_name_key")
+        _cc_hulya_keys = {name_key(n) for n in _seen_hulya_orig}
+        _cc_trainer_keys = {name_key(n) for n in _seen_trainer_orig}
 
-        _in_lounge_count = 0
-        for _, _row in live_schedule.iterrows():
-            _worker = str(_row.get("עובד", "")).strip()
-            if not _worker or "❌" in _worker:
-                continue
-            if str(_row.get("תפקיד בסיס", "")).strip() not in _lounge_roles:
-                continue
-            try:
-                _sh, _sm = str(_row.get("התחלה", "")).split(":")[:2]
-                _eh, _em = str(_row.get("סיום", "")).split(":")[:2]
-                _start_m = int(_sh) * 60 + int(_sm)
-                _end_m   = int(_eh) * 60 + int(_em)
-            except Exception:
-                continue
-            if not (_start_m <= _now_min_db <= _end_m):
-                continue
-            _bm = _flight_times.get(str(_row.get("טיסה", "")).strip())
-            if _bm is None or _now_min_db < _bm:
-                continue
-            _in_lounge_count += 1
+        # סה"כ עובדים: regular check-in stewards + ש"ש only (no חוליה / מתדרכות)
+        _cc_total_df = _cc_today[
+            _cc_today["sheet"].isin(active_sheets)
+            & ~_cc_today["_name_key"].isin(_cc_hulya_keys | _cc_trainer_keys)
+        ]
+        _cc_total = len(_cc_total_df)
 
-        _on_break_now = sum(
-            1 for b in st.session_state.get("break_log", {}).values()
-            if b.get("start") and not b.get("end") and b.get("active", True)
+        # מתדרכות גיבוי ר"צ: briefers holding the ר"צ certification
+        _cc_tr_df = _cc_today[
+            _cc_today["_name_key"].isin(_cc_trainer_keys) & _cc_yes(_cc_today, "ראש צוות")
+        ]
+        _cc_tr_names = sorted(_cc_tr_df["שם"].astype(str).tolist())
+
+        # מנהלים כר"צ: shift managers holding the מנהל כר"צ certification
+        # The manager sheet usually lists FIRST names only ("אוראל", "נטע - עד 14:00"),
+        # which never match the full roster name — so match by first name among
+        # employees flagged מנהל משמרת, and only accept an unambiguous match.
+        _cc_mg_pool = employees_class_df[_cc_yes(employees_class_df, "מנהל משמרת")]
+        _cc_mg_names = []
+        _cc_mg_seen = set()
+        for _mk2, _mi2 in shift_map_ref.items():
+            if "מנהל" not in str(_mi2.get("sheet", "")):
+                continue
+            _mo = str(_mi2.get("original", _mk2)).strip()
+            if not _mo or _mo in _cc_mg_seen:
+                continue
+            _cc_mg_seen.add(_mo)
+            _tok = re.split(r"[\s\-–]", _mo)[0]
+            _full = _cc_mg_pool[_cc_mg_pool["_name_key"] == name_key(_mo)]
+            _cand = _full if len(_full) else _cc_mg_pool[
+                _cc_mg_pool["שם"].astype(str).str.split().str[0] == _tok
+            ].drop_duplicates("_name_key")
+            if len(_cand) == 1 and _cc_yes(_cand, 'מנהל כר"צ').iloc[0]:
+                _cc_mg_names.append(str(_cand.iloc[0]["שם"]))
+        _cc_mg_names = sorted(set(_cc_mg_names))
+
+        # לא נספרים: other departments' workers holding the מפקח TSA certification
+        _cc_ex_df = _cc_today[
+            _cc_today["sheet"].isin(excluded_sheets) & _cc_yes(_cc_today, "מפקח TSA")
+        ]
+        _cc_ex_names = sorted(_cc_ex_df["שם"].astype(str).tolist())
+
+        _cc_flights_total = total_flights
+        _cc_flights_missing = int(total_missing)
+        _cc_tasks_missing = int(
+            live_schedule["עובד"].astype(str).str.contains("❌", na=False).sum()
         )
+        _cc_assigned = total_assigned
+        _cc_unassigned = total_unassigned
+        _cc_published = publish_state.is_published(st.session_state.get("_build_id"))
 
-        _removed_count = len(st.session_state.get("removed_employees", {}))
+        def _cc_card(key, icon, label, value, sub="", tone="--acc-rgb", names=None, pop_title=""):
+            """Right-aligned (RTL) stat card; role-colour accent on the right edge plus
+            an icon, so the tone is never the only cue. `names` adds a list popover."""
+            with st.container(key=f"cc_{key}"):
+                st.markdown(
+                    f'<div class="cc-card" style="--cc-tone:var({tone})">'
+                    f'<div class="cc-top"><span class="cc-ico">{icon}</span>'
+                    f'<span>{safe_html(label)}</span></div>'
+                    f'<div class="cc-val">{safe_html(str(value))}</div>'
+                    f'<div class="cc-sub">{safe_html(sub) if sub else "&nbsp;"}</div></div>',
+                    unsafe_allow_html=True,
+                )
+                if names:
+                    with st.popover(f"👁 רשימה ({len(names)})", width="stretch"):
+                        st.markdown(
+                            f'<div dir="rtl" class="cc-pop-title">{safe_html(pop_title or label)}</div>'
+                            + '<ul dir="rtl" class="cc-pop-list">'
+                            + "".join(f"<li>{safe_html(str(n))}</li>" for n in names)
+                            + "</ul>",
+                            unsafe_allow_html=True,
+                        )
 
-        st.markdown('<div class="sec-title">🟢 עכשיו במשמרת</div>', unsafe_allow_html=True)
-        c1, c2, c3 = st.columns(3)[::-1]  # Hebrew: first item on the right
-        c1.metric("☕ בהפסקה", _on_break_now)
-        c2.metric("🚫 הורדו ממשמרת", _removed_count)
-        c3.metric("🛂 כרגע באולם", _in_lounge_count)
+        @st.fragment(run_every="15s")
+        def _render_control_center_live():
+            # Re-runs every 15s so "now" counters follow the clock and the
+            # break / hall state set in other tabs.
+            _now = app_now()
+            _now_m = _now.hour * 60 + _now.minute
+
+            _removed = set(st.session_state.get("removed_employees", {}).keys())
+            _on_break = sorted(
+                clean_text(n)
+                for n, b in st.session_state.get("break_log", {}).items()
+                if b.get("start") and not b.get("end") and b.get("active", True)
+                and clean_text(n) not in _removed
+            )
+            _on_break_keys = {name_key(n) for n in _on_break}
+
+            _flying = live_schedule[
+                ~live_schedule["עובד"].astype(str).str.contains("❌", na=False)
+            ]
+            def _hm_min(v):
+                try:
+                    _h, _m = str(v).split(":")[:2]
+                    return int(_h) * 60 + int(_m)
+                except Exception:
+                    return None
+
+            _busy = set()
+            for _, _r in _flying.iterrows():
+                _s, _e = _hm_min(_r.get("התחלה")), _hm_min(_r.get("סיום"))
+                if _s is not None and _e is not None and _s <= _now_m <= _e:
+                    _busy.add(str(_r.get("עובד")).strip())
+            _busy_keys = {name_key(clean_text(n)) for n in _busy}
+
+            # בין טיסות = marked ✓✓ in the workflow tab (sent to the hall) and
+            # right now neither on a flight task nor on break nor removed.
+            _in_hall = set()
+            for _rid, _bi in st.session_state.get("wf_briefing", {}).items():
+                if _bi.get("state") != 2:
+                    continue
+                _nm = clean_text(str(_rid).split("␟")[0])
+                _k = name_key(_nm)
+                if _nm in _removed or _k in _on_break_keys or _k in _busy_keys:
+                    continue
+                _in_hall.add(_nm)
+            _in_hall = sorted(_in_hall)
+
+            st.markdown('<div class="sec-title">🟢 עכשיו במשמרת</div>', unsafe_allow_html=True)
+            c1, c2, c3, c4 = st.columns(4)[::-1]  # Hebrew: first item on the right
+            with c1:
+                _cc_card("hall", "🛂", "בין טיסות", len(_in_hall), "באולם · לא בטיסה ולא בהפסקה",
+                         "--r-guard", _in_hall, "בין טיסות — באולם, לא בטיסה ולא בהפסקה")
+            with c2:
+                _cc_card("break", "☕", "בהפסקה", len(_on_break), "הפסקה פעילה כרגע",
+                         "--r-tl", _on_break, "בהפסקה כרגע")
+            with c3:
+                _cc_card("flying", "✈️", "בטיסה כרגע", len(_busy), "במשימת טיסה פעילה",
+                         "--r-agent")
+            with c4:
+                _cc_card("removed", "🚫", "הורדו ממשמרת", len(_removed), "לא ישובצו",
+                         "--r-insp", sorted(_removed), "הורדו ממשמרת")
+
+        st.markdown('<div class="sec-title">📋 סיכום מצב הסידור</div>', unsafe_allow_html=True)
+        _cov = 100 * (_cc_flights_total - _cc_flights_missing) // max(_cc_flights_total, 1)
+        _s1, _s2, _s3, _s4 = st.columns(4)[::-1]
+        with _s1:
+            _cc_card("s_flights", "✈️", "טיסות בסידור", _cc_flights_total, "בסידור המוצג", "--r-agent")
+        with _s2:
+            _cc_card("s_flmiss", "⚠️", "טיסות עם חוסרים", _cc_flights_missing, "דורשות שיבוץ", "--r-insp")
+        with _s3:
+            _cc_card("s_taskmiss", "❌", "משימות ללא עובד", _cc_tasks_missing, "משבצות ריקות", "--r-insp")
+        with _s4:
+            _cc_card("s_cov", "📈", "כיסוי טיסות", f"{_cov}%", "טיסות ללא חוסרים", "--r-guard")
+        _s5, _s6, _s7, _s8 = st.columns(4)[::-1]
+        with _s5:
+            _cc_card("s_assigned", "👥", "עובדים משובצים", _cc_assigned, "עם משימה אחת לפחות", "--r-train")
+        with _s6:
+            _cc_card("s_unassigned", "🕓", "עובדים לא משובצים", _cc_unassigned, "זמינים לשיבוץ", "--r-tl")
+        with _s7:
+            _cc_card("s_tasks", "🧾", "סה״כ משימות", len(live_schedule), "בסידור המוצג", "--r-agent")
+        with _s8:
+            _cc_card("s_pub", "📣" if _cc_published else "📝", "סטטוס פרסום",
+                     "מפורסם" if _cc_published else "טיוטה",
+                     "עובדים רואים את הסידור" if _cc_published else "טרם שוגר לעובדים", "--r-guard")
+
+        _render_control_center_live()
 
         st.markdown(
             '<div class="sec-title">👥 סיווג עובדים לשיבוץ</div>',
@@ -4781,34 +5175,23 @@ if "schedule_df" in st.session_state:
         )
 
         e1, e2, e3, e4, e5, e6 = st.columns(6)[::-1]
-        e1.metric("פעילים לשיבוץ", active_schedulable_count)
-        e2.metric("בידוק חוליה", hulya_count)
-
+        with e1:
+            _cc_card("c_total", "🧮", 'סה"כ עובדים', _cc_total, "דיילי צ׳ק אין + ש״ש",
+                     "--r-agent", sorted(_cc_total_df["שם"].astype(str).tolist()),
+                     "סה״כ עובדים (דיילי צ׳ק אין + ש״ש)")
+        with e2:
+            _cc_card("c_hulya", "🛃", "בידוק חוליה", hulya_count, "כבר עושים את תפקידם", "--r-train")
         with e3:
-            st.metric("מתדרכות גיבוי ר״צ", trainer_backup_count)
-            if trainer_backup_count:
-                with st.popover("👁 רשימה", width="stretch"):
-                    st.markdown("**מתדרכות גיבוי ר״צ:**")
-                    for _n in sorted(_trainer_names):
-                        st.markdown(f"• {_n}")
-
+            _cc_card("c_trainer", "🎓", "מתדרכות גיבוי ר״צ", len(_cc_tr_names), "עם הסמכת ר״צ",
+                     "--r-tl", _cc_tr_names, "מתדרכות עם הסמכת ר״צ")
         with e4:
-            st.metric('מנהלים כר"צ', mgr_backup_rz_count)
-            if mgr_backup_rz_count:
-                with st.popover("👁 רשימה", width="stretch"):
-                    st.markdown('**מנהלים לתגבור ר"צ:**')
-                    for _n in sorted(_mgr_names):
-                        st.markdown(f"• {_n}")
-
-        e5.metric("שירות שלום", shalom_count)
-
+            _cc_card("c_mgr", "🧑‍💼", 'מנהלים כר"צ', len(_cc_mg_names), 'עם הסמכת מנהל כר"צ',
+                     "--r-tl", _cc_mg_names, 'מנהלים עם הסמכת מנהל כר"צ')
+        with e5:
+            _cc_card("c_shalom", "🤝", "שירות שלום", shalom_count, "מהסידור היומי", "--r-guard")
         with e6:
-            st.metric("לא נספרים", excluded_count)
-            if excluded_count:
-                with st.popover("👁 רשימה", width="stretch"):
-                    st.markdown("**לא נספרים בשיבוץ:**")
-                    for _n in _excluded_names:
-                        st.markdown(f"• {_n}")
+            _cc_card("c_excl", "🛡️", "לא נספרים", len(_cc_ex_names), "מפקחי TSA ממחלקות אחרות",
+                     "--r-insp", _cc_ex_names, "מפקחי TSA ממחלקות אחרות")
 
         st.markdown('<div class="sec-title">📊 ניתוח פיקים</div>', unsafe_allow_html=True)
         _peak_data = build_peak_analysis(live_flights)
@@ -4887,26 +5270,49 @@ if "schedule_df" in st.session_state:
                     ' לחצו על "שגר סידור" בתחתית העמוד כדי לפרסם אותו.</div>',
                     unsafe_allow_html=True,
                 )
+            # ── Summary strip (user rule 2026-10-04) — over the full, unfiltered view ──
+            _sc_total = len(display_df)
+            _sc_short = int(display_df.astype(str).apply(
+                lambda _r: _r.str.contains("❌", na=False).any(), axis=1).sum())
+            _sc_t1 = int((display_df["טרמינל"] == "1").sum()) if "טרמינל" in display_df.columns else 0
+            def _sc_card(_ico, _lbl, _val, _sub, _tone):
+                return (
+                    f'<div class="cc-card" style="--cc-tone:var({_tone})">'
+                    f'<div class="cc-top"><span class="cc-ico">{_ico}</span><span>{_lbl}</span></div>'
+                    f'<div class="cc-val">{_val}</div><div class="cc-sub">{_sub}</div></div>'
+                )
             st.markdown(
-                '<div style="text-align:right;direction:rtl;font-weight:700;'
-                'font-size:14px;color:rgba(var(--ink-rgb),.74);padding:2px 0 0 0;">🔎 חיפוש לפי טיסה / יעד / עובד</div>',
+                '<div class="cc-grid">'
+                + _sc_card("✈️", "טיסות בסידור", _sc_total, "בסידור המוצג", "--r-agent")
+                + _sc_card("✅", "מאוישות במלואן", _sc_total - _sc_short, "ללא משבצת ריקה", "--r-guard")
+                + _sc_card("⚠️", "עם חוסרים", _sc_short, "דורשות שיבוץ", "--r-insp")
+                + (_sc_card("🏢", "בטרמינל 1", _sc_t1, f"טרמינל 3: {_sc_total - _sc_t1}", "--r-train")
+                   if _sc_t1 else "")
+                + '</div>',
                 unsafe_allow_html=True,
             )
-            search = st.text_input("חיפוש", label_visibility="collapsed")
-            only_missing = st.toggle("הצג רק טיסות עם חוסר", key="only_missing_chk")
-            # ── מסנן טרמינל — הפרדה ברורה בין סידור T3 לסידור T1 ─────────────────
-            if "טרמינל" in display_df.columns and (display_df["טרמינל"] == "1").any():
-                _term_view = st.radio(
-                    "תצוגת טרמינל",
-                    ["הכל", "טרמינל 3", "טרמינל 1"],
-                    horizontal=True,
-                    key="schedule_term_filter",
-                    label_visibility="collapsed",
+            with st.container(key="sch_ctrl"):
+                st.markdown(
+                    '<div style="text-align:right;direction:rtl;font-weight:700;'
+                    'font-size:14px;color:rgba(var(--ink-rgb),.74);padding:2px 0 0 0;">🔎 חיפוש לפי טיסה / יעד / עובד</div>',
+                    unsafe_allow_html=True,
                 )
-                if _term_view == "טרמינל 3":
-                    display_df = display_df[display_df["טרמינל"] != "1"]
-                elif _term_view == "טרמינל 1":
-                    display_df = display_df[display_df["טרמינל"] == "1"]
+                search = st.text_input("חיפוש", label_visibility="collapsed",
+                                       placeholder="הקלד טיסה, יעד או שם עובד…")
+                only_missing = st.toggle("הצג רק טיסות עם חוסר", key="only_missing_chk")
+                # ── מסנן טרמינל — הפרדה ברורה בין סידור T3 לסידור T1 ─────────────────
+                if "טרמינל" in display_df.columns and (display_df["טרמינל"] == "1").any():
+                    _term_view = st.radio(
+                        "תצוגת טרמינל",
+                        ["הכל", "טרמינל 3", "טרמינל 1"],
+                        horizontal=True,
+                        key="schedule_term_filter",
+                        label_visibility="collapsed",
+                    )
+                    if _term_view == "טרמינל 3":
+                        display_df = display_df[display_df["טרמינל"] != "1"]
+                    elif _term_view == "טרמינל 1":
+                        display_df = display_df[display_df["טרמינל"] == "1"]
             # ── כותרת המשמרת + מעבר לסידורים הקודמים של אותו יום ─────────────────
             # מופיעה רק כשהסידור נבנה לפי משמרות (נייט/דיי/אפטר).
             _cur_seg = st.session_state.get("_segment_current")
@@ -5455,88 +5861,191 @@ if "schedule_df" in st.session_state:
                         st.markdown("---")
 
         _render_schedule_tab()
-        # ── Tab: פנויים באולם ─────────────────────────────────────────────────
-    if active_main_tab == TAB_AVAILABLE:
-        st.markdown(
-            "<h3 style='text-align:right;border-bottom:2px solid rgba(var(--ink-rgb),0.15);padding-bottom:8px;margin-bottom:16px;'>🟡 עובדים פנויים באולם היציאה</h3>",
-            unsafe_allow_html=True,
-        )
-        available_df = build_available_in_hall(
-            live_schedule, live_employees, live_flights
-        )
-        if available_df.empty:
-            st.success("אין עובדים פנויים כרגע באולם היציאה 🎉")
-        else:
-            total_free = available_df["עובד"].nunique()
-            long_gaps = available_df[available_df["פנות (דק׳)"] >= 60]["עובד"].nunique()
-            sc1, sc2 = st.columns(2)[::-1]  # first item on the right
-            sc1.metric("עובדים פנויים באולם", total_free)
-            sc2.metric("מתוכם פנויים שעה+", long_gaps)
-            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-            roles = ["הכל"] + sorted(
-                available_df["תפקיד עיקרי"].dropna().unique().tolist()
+    ## — Tab: עמדות מיוחדות ───────────────────────────────────────────────────
+    if active_main_tab == TAB_SPECIAL:
+        @st.fragment
+        def _render_special_posts_tab():
+            from app import special_posts as _sp
+            st.markdown(
+                """<style>
+                .sp-title{direction:rtl;text-align:right;font-size:1.5rem;font-weight:800;
+                  border-bottom:2px solid rgba(var(--ink-rgb),.15);padding-bottom:8px;margin-bottom:6px;}
+                .sp-sub{direction:rtl;text-align:right;font-size:13px;color:rgba(var(--ink-rgb),.7);margin-bottom:10px;}
+                .st-key-sp_all_workers{direction:rtl;}
+                .st-key-sp_all_workers label{justify-content:flex-start;}
+                [class*="st-key-sp_card_"]{direction:rtl;text-align:right;border-radius:16px !important;
+                  border:1px solid rgba(var(--ink-rgb),.14) !important;border-right:5px solid rgba(var(--acc-rgb),.85) !important;
+                  background:rgba(255,255,255,.55);padding:6px 6px 2px;margin-bottom:6px;}
+                [class*="st-key-sp_card_"][class*="_empty"]{border-right:5px dashed rgba(var(--ink-rgb),.35) !important;}
+                [class*="st-key-sp_card_"] [data-testid="stMarkdownContainer"]{text-align:right;}
+                [class*="st-key-sp_card_"] [data-testid="stHorizontalBlock"]{direction:ltr;align-items:center;gap:.4rem;}
+                [class*="st-key-sp_card_"] [data-testid="stColumn"]{direction:rtl;}
+                [data-testid="stPopoverBody"]{direction:rtl;text-align:right;}
+                [data-testid="stPopoverBody"] label{justify-content:flex-start;}
+                .sp-head{display:flex;align-items:center;gap:10px;direction:rtl;}
+                .sp-ico{font-size:22px;width:40px;height:40px;border-radius:12px;display:flex;align-items:center;
+                  justify-content:center;background:rgba(var(--acc-rgb),.16);flex:none;}
+                .sp-name{font-weight:800;font-size:17px;line-height:1.2;}
+                .sp-desc{font-size:12.5px;color:rgba(var(--ink-rgb),.68);margin-top:2px;}
+                .sp-chips{margin-inline-end:auto;display:flex;gap:6px;flex-wrap:wrap;}
+                .sp-chip{font-size:11.5px;font-weight:700;border-radius:999px;padding:2px 10px;
+                  background:rgba(var(--ink-rgb),.08);white-space:nowrap;}
+                .sp-chip.on{background:rgba(var(--acc-rgb),.2);}
+                .sp-empty{direction:rtl;text-align:center;padding:12px;border-radius:10px;margin:8px 0;
+                  border:1.5px dashed rgba(var(--ink-rgb),.3);color:rgba(var(--ink-rgb),.75);font-weight:700;}
+                .sp-worker{direction:rtl;text-align:right;padding:8px 10px;border-radius:10px;margin-top:8px;
+                  background:rgba(var(--acc-rgb),.1);}
+                .sp-wname{font-weight:800;font-size:15px;}
+                .sp-wtag{font-size:11px;font-weight:700;border-radius:999px;padding:1px 8px;margin-inline-start:6px;
+                  background:rgba(var(--ink-rgb),.1);}
+                .sp-timer{font-size:13px;margin-top:2px;}
+                .sp-timer b{font-size:15px;}
+                </style>""",
+                unsafe_allow_html=True,
             )
-            selected_role = st.selectbox(
-                "סינון לפי תפקיד", roles, key="avail_role_filter"
+            st.markdown(
+                '<div class="sp-title">📍 עמדות מיוחדות</div>'
+                "<div class=\"sp-sub\">איוש ידני של עמדות אזור הצ'ק אין · לכל משימה מוצגים שעת תחילה וטיימר</div>",
+                unsafe_allow_html=True,
             )
-            filtered = (
-                available_df
-                if selected_role == "הכל"
-                else available_df[available_df["תפקיד עיקרי"] == selected_role]
-            )
-            for _, r in filtered.iterrows():
-                # short gap (between flights) = lavender, long / free-till-end = blue (the old
-                # yellow-vs-green pair was hard to tell apart with colour blindness; the text
-                # under each card also states which kind it is)
-                _short_gap = r["פנות (דק׳)"] < 60
-                gap_color = "rgba(var(--r-tl),.16)" if _short_gap else "rgba(var(--r-guard),.16)"
-                gap_border = "rgb(var(--r-tl))" if _short_gap else "rgb(var(--r-guard))"
-                st.markdown(
-                    f'<div style="direction:rtl;background:{gap_color};border-right:5px solid {gap_border};'
-                    f'border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:14px;">'
-                    f'<strong>{safe_html(r["עובד"])}</strong> · {safe_html(r["תפקיד עיקרי"])} · משמרת: {safe_html(r["משמרת"])}<br>'
-                    f'🕒 פנוי: <strong>{safe_html(r["פנוי מ"])} – {safe_html(r["פנוי עד"])}</strong>'
-                    f' ({r["פנות (דק׳)"]} דק׳) · הבא: {safe_html(r["משימה הבאה"])}<br>'
-                    f'<span style="color:rgba(var(--ink-rgb),.8);font-size:12px">{safe_html(r["הערה"])}</span></div>',
-                    unsafe_allow_html=True,
-                )
+            _sp_state = _sp.ensure_state(st.session_state.get("special_posts"))
+            st.session_state["special_posts"] = _sp_state
+            _sp_now = app_now()
+            _sp_emps = st.session_state.get("employees_snap")
+            _sp_removed = set(st.session_state.get("removed_employees", {}).keys())
+            _sp_all = st.checkbox("הצג גם עובדים שלא במשמרת כרגע", key="sp_all_workers")
+
+            def _sp_opts(post_key):
+                _busy = _sp.occupied_names(_sp_state) | _sp_removed
+                return _sp.candidates(_sp_emps, post_key, _sp_now, exclude=_busy, only_on_shift=not _sp_all)
+
+            def _sp_kind(name):
+                try:
+                    _r = _sp_emps[_sp_emps["שם"].astype(str).str.strip() == name].iloc[0]
+                    return _sp.kind_label(_r)
+                except Exception:
+                    return ""
+
+            # [::-1]: the first card sits at the RIGHT edge (RTL reading order)
+            _sp_cols = st.columns(2)[::-1]
+            for _pi, _post in enumerate(_sp.POSTS):
+                _pk = _post["key"]
+                _assigned = _sp_state["posts"][_pk]
+                with _sp_cols[_pi % 2]:
+                    with st.container(key=f"sp_card_{_pk}" + ("" if _assigned else "_empty")):
+                        _need = f"נדרש/ת {_post['need']}" if _post["need"] else "לפי העומס"
+                        _state_chip = (f'<span class="sp-chip on">● {len(_assigned)} בעמדה</span>' if _assigned
+                                       else '<span class="sp-chip">○ ריקה</span>')
+                        st.markdown(
+                            f'<div class="sp-head"><div class="sp-ico">{_post["icon"]}</div>'
+                            f'<div><div class="sp-name">{_post["name"]}</div>'
+                            f'<div class="sp-desc">{_post["desc"]}</div></div>'
+                            f'<div class="sp-chips">{_state_chip}<span class="sp-chip">{_need}</span></div></div>',
+                            unsafe_allow_html=True,
+                        )
+                        if not _assigned:
+                            st.markdown('<div class="sp-empty">העמדה ריקה</div>', unsafe_allow_html=True)
+                        for _a in list(_assigned):
+                            _nm = _a["name"]
+                            _since = _a["start"][11:16]
+                            _el_s = _sp.elapsed_seconds(_a["start"], _sp_now)
+                            _tag = _sp_kind(_nm)
+                            # columns render left→right: finish | replace | info (info at the right edge)
+                            _c_fin, _c_rep, _c_info = st.columns([2, 2, 5])
+                            with _c_info:
+                                st.markdown(
+                                    f'<div class="sp-worker"><span class="sp-wname">{safe_html(_nm)}</span>'
+                                    + (f'<span class="sp-wtag">{_tag}</span>' if _tag else '')
+                                    + f'<div class="sp-timer">⏱️ <b class="sp-live" data-el="{_el_s}">{_sp.fmt_clock(_el_s)}</b> · משובץ/ת מ-{_since}</div></div>',
+                                    unsafe_allow_html=True,
+                                )
+                            with _c_rep:
+                                with st.popover("החלף", width="stretch"):
+                                    _ro = _sp_opts(_pk)
+                                    _pick = st.selectbox("עובד/ת במקום " + _nm, [n for n, _ in _ro],
+                                                         format_func=dict(_ro).get, index=None,
+                                                         key=f"sp_rep_{_pk}_{_nm}", placeholder="בחירה…")
+                                    if st.button("החלף", key=f"sp_repgo_{_pk}_{_nm}", disabled=not _pick):
+                                        _sp.replace(_sp_state, _pk, _nm, _pick, app_now())
+                                        st.rerun()
+                            with _c_fin:
+                                if st.button("סיים משימה", key=f"sp_fin_{_pk}_{_nm}", width="stretch"):
+                                    _sp.finish(_sp_state, _pk, _nm, app_now())
+                                    st.rerun()
+                        with st.popover("➕ הוסף עובד/ת", width="stretch"):
+                            _ao = _sp_opts(_pk)
+                            if _post["pref"] == "qualified":
+                                st.caption("דייל/ת מוסמך/ת בלבד (לא טרייני / ילד עובדים / פורש)")
+                            elif _ao:
+                                st.caption("ילדי עובדים / פורשים מופיעים ראשונים")
+                            _pick = st.selectbox("עובד/ת", [n for n, _ in _ao], format_func=dict(_ao).get,
+                                                 index=None, key=f"sp_add_{_pk}", placeholder="בחירה…")
+                            if st.button("שבץ", key=f"sp_addgo_{_pk}", disabled=not _pick):
+                                _sp.assign(_sp_state, _pk, _pick, app_now())
+                                st.rerun()
+
+            st.iframe(_sp.LIVE_TIMER_HTML, height=1)
+
+            if _sp_state["log"]:
+                with st.expander(f"📜 משימות שהסתיימו ({len(_sp_state['log'])})"):
+                    for _lg in reversed(_sp_state["log"]):
+                        _dur = _sp.fmt_elapsed(int((pd.Timestamp(_lg["end"]) - pd.Timestamp(_lg["start"])).total_seconds() // 60))
+                        st.markdown(
+                            f'<div dir="rtl" style="text-align:right;">{_sp.POSTS_BY_KEY[_lg["post"]]["name"]} — <b>{safe_html(_lg["name"])}</b>'
+                            f' · {_lg["start"][11:16]}–{_lg["end"][11:16]} ({_dur})</div>',
+                            unsafe_allow_html=True,
+                        )
+
+        _render_special_posts_tab()
 
     ## — Tab: ציר זמן ────────────────────────────────────────────────────────
     if active_main_tab == TAB_TIMELINE:
         @st.fragment
         def _render_timeline_tab():
-            from app.timeline import timeline_html, role_options, build_tasks, axis_bounds
+            from app.timeline import (
+                timeline_html, role_options, build_tasks, axis_bounds,
+                crosses_midnight, unfilled_in_window, fmt_minutes,
+            )
             st.markdown(
                 "<h3 style='text-align:right;border-bottom:2px solid rgba(var(--ink-rgb),0.15);"
                 "padding-bottom:8px;margin-bottom:16px;'>📈 ציר זמן</h3>",
                 unsafe_allow_html=True,
             )
-            _tl_src = live_schedule
+            # labeled_df = schedule_df + a few display-only columns (e.g. "המשך אזורי",
+            # the break/refresh annotation) computed by build_next_task_labels — the
+            # timeline needs that column for its break/refresh markers, which the raw
+            # schedule_df never has (that annotation lives only on the labeled copy).
+            _tl_labeled = st.session_state.get("labeled_df")
+            _tl_src = _tl_labeled if _tl_labeled is not None and not _tl_labeled.empty else live_schedule
             _tl_roles = role_options(_tl_src)
-            _tl_c_role, _tl_c_sort, _tl_c_gap, _tl_c_q = st.columns([2, 2, 2, 2])[::-1]
-            with _tl_c_gap:
-                _tl_gap_lbl = st.selectbox("הדגשת חלונות פנויים", ["כבוי", "30+ דקות", "60+ דקות", "90+ דקות"],
-                                           index=2, key="tl_gap")
-            with _tl_c_sort:
-                _tl_sort_lbl = st.selectbox("מיון", ["לפי שעת התחלה", "לפי שם", "לפי עומס", "לפי תפקיד (מקובצים)"], key="tl_sort")
-            with _tl_c_q:
-                _tl_q = st.text_input("חיפוש עובד", key="tl_query", placeholder="שם עובד…")
-            with _tl_c_role:
-                _tl_role = st.selectbox("תפקיד", ["הכל"] + _tl_roles, key="tl_role")
+            _tl_strip = st.container()   # summary strip — filled once the timeline is built
             _tl_view = None
-            _tl_b = axis_bounds(_tl_src)
-            if _tl_b:
-                _tl_hours = list(range(_tl_b[0], _tl_b[1] + 1, 60))
-                _tl_fmt = lambda m: f"{(m // 60) % 24:02d}:00"
-                _tl_c_sp, _tl_c_to, _tl_c_from = st.columns([4, 2, 2])  # RTL reading: from (right) then to
-                with _tl_c_from:
-                    _tl_from = st.selectbox("מתחילת שעה", _tl_hours, format_func=_tl_fmt, index=0, key="tl_from")
-                with _tl_c_to:
-                    _tl_to = st.selectbox("עד שעה", _tl_hours, format_func=_tl_fmt, index=len(_tl_hours) - 1, key="tl_to")
-                if (_tl_from, _tl_to) != (_tl_hours[0], _tl_hours[-1]) and _tl_to > _tl_from:
-                    _tl_view = (_tl_from, _tl_to)
+            _tl_b = None
+            with st.container(key="tl_ctrl"):
+                _tl_c_role, _tl_c_sort, _tl_c_gap, _tl_c_q = st.columns([2, 2, 2, 2])[::-1]
+                with _tl_c_gap:
+                    _tl_gap_lbl = st.selectbox("הדגשת חלונות פנויים", ["כבוי", "30+ דקות", "60+ דקות", "90+ דקות"],
+                                               index=2, key="tl_gap")
+                with _tl_c_sort:
+                    _tl_sort_lbl = st.selectbox("מיון", ["לפי שעת התחלה", "לפי שם", "לפי עומס", "לפי תפקיד (מקובצים)"], key="tl_sort")
+                with _tl_c_q:
+                    _tl_q = st.text_input("חיפוש עובד", key="tl_query", placeholder="שם עובד…")
+                with _tl_c_role:
+                    _tl_role = st.selectbox("תפקיד", ["הכל"] + _tl_roles, key="tl_role")
+                _tl_view = None
+                _tl_b = axis_bounds(_tl_src)
+                if _tl_b:
+                    _tl_hours = list(range(_tl_b[0], _tl_b[1] + 1, 60))
+                    _tl_fmt = lambda m: f"{(m // 60) % 24:02d}:00"
+                    _tl_c_sp, _tl_c_to, _tl_c_from = st.columns([4, 2, 2])  # RTL reading: from (right) then to
+                    with _tl_c_from:
+                        _tl_from = st.selectbox("מתחילת שעה", _tl_hours, format_func=_tl_fmt, index=0, key="tl_from")
+                    with _tl_c_to:
+                        _tl_to = st.selectbox("עד שעה", _tl_hours, format_func=_tl_fmt, index=len(_tl_hours) - 1, key="tl_to")
+                    if (_tl_from, _tl_to) != (_tl_hours[0], _tl_hours[-1]) and _tl_to > _tl_from:
+                        _tl_view = (_tl_from, _tl_to)
             _tl_now = app_now()
-            _tl_html = timeline_html(
+            _tl_html, _tl_gaps, _tl_flights, _tl_workers = timeline_html(
                 _tl_src, role=None if _tl_role == "הכל" else _tl_role,
                 query=_tl_q, now_min=_tl_now.hour * 60 + _tl_now.minute,
                 employees=st.session_state.get("employees_snap"),
@@ -5545,11 +6054,233 @@ if "schedule_df" in st.session_state:
                 gap_min={"כבוי": 0, "30+ דקות": 30, "60+ דקות": 60, "90+ דקות": 90}[_tl_gap_lbl],
                 view=_tl_view,
             )
+            def _tl_card(_ico, _lbl, _val, _sub, _tone):
+                return (
+                    f'<div class="cc-card" style="--cc-tone:var({_tone})">'
+                    f'<div class="cc-top"><span class="cc-ico">{_ico}</span><span>{_lbl}</span></div>'
+                    f'<div class="cc-val">{_val}</div><div class="cc-sub">{_sub}</div></div>'
+                )
+            with _tl_strip:
+                st.markdown(
+                    '<div class="cc-grid">'
+                    + _tl_card("👥", "עובדים בציר", len(_tl_workers), "לפי הסינון הנוכחי", "--r-agent")
+                    + _tl_card("✈️", "טיסות בציר", len(_tl_flights), "עם משימה מצוירת", "--r-guard")
+                    + _tl_card("⏳", "חלונות פנויים", len(_tl_gaps),
+                               _tl_gap_lbl if _tl_gap_lbl != "כבוי" else "ההדגשה כבויה", "--r-tl")
+                    + _tl_card("🕒", "עכשיו", f"{_tl_now.hour:02d}:{_tl_now.minute:02d}", "הקו המקווקו בציר", "--acc-rgb")
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
             if _tl_html:
                 st.markdown(_tl_html, unsafe_allow_html=True)
-                st.markdown('<div class="tl-help">' + "העבירי עכבר מעל משימה לפרטים, לחיצה עליה פותחת את כרטיס הטיסה · הרקע הבהיר בשורה = שעות המשמרת · המספר ליד השם = כמות המשימות · הקו המקווקו = עכשיו" + '</div>', unsafe_allow_html=True)
-            else:
-                st.info("אין משימות משובצות להצגה בסינון הזה.")
+                st.markdown('<div class="tl-help">' + "העבירי עכבר מעל משימה לפרטים, לחיצה עליה פותחת תצוגה מקדימה כאן (בלי לעזוב את ציר הזמן) · גרירת משימה לשורה של עובד/ת אחר/ת מציעה להעביר אליו/ה (בכפוף לאישור ולבדיקת הסמכה) · לחיצה על חלון פנוי מציעה מה אפשר לשבץ בו · הרקע הבהיר בשורה = שעות המשמרת · המספר ליד השם = כמות המשימות · הקו המקווקו = עכשיו" + '</div>', unsafe_allow_html=True)
+                # hidden per-flight buttons: the timeline's own click handler
+                # (theme_sync_html) finds the one matching a clicked bar's flight
+                # id and calls its native .click() — the same "programmatically
+                # click a real Streamlit control" trick already used for
+                # openFlight/openGap/the arrow toggle, which is reliable; a
+                # synthetic text_input commit (Enter+blur) is not.
+                for _tf in _tl_flights:
+                    with st.container(key=f"tlprev_{_tf['id']}"):
+                        if st.button("preview", key=f"tlprevbtn_{_tf['id']}"):
+                            _tl_rows = st.session_state["schedule_df"][
+                                st.session_state["schedule_df"]["טיסה"].astype(str).str.strip()
+                                == _tf["flight"]
+                            ]
+                            if not _tl_rows.empty:
+                                _flight_preview_dialog(_tl_rows)
+
+            # ── שיבוץ מתוך חלון פנוי ──────────────────────────────────────────
+            # One collapsed expander per free window currently drawn (gap_min > 0).
+            # Clicking the window in the HTML above opens the matching one here —
+            # see the "tl-gap" click handler in theme_sync_html(). Each row inside
+            # lists ❌ slots that fit fully inside the window AND that this exact
+            # worker qualifies for (get_qualified_candidates_for_swap already
+            # accounts for the worker's other commitments, so this is a safe,
+            # pre-filtered list, not a raw "anything in the time range").
+            if _tl_gaps and is_admin():
+                from app.scheduler import get_qualified_candidates_for_swap, do_swap
+                _tl_crosses = crosses_midnight(_tl_src)
+                for _g in _tl_gaps:
+                    with st.container(key=f"gap_{_g['id']}"):
+                        st.markdown(f'<span id="gapanchor-{_g["id"]}"></span>', unsafe_allow_html=True)
+                        with st.expander(
+                            f"🔧 {_g['worker']} פנוי/ה {fmt_minutes(_g['s'])}–{fmt_minutes(_g['e'])} —"
+                            f" מה אפשר לשבץ כאן?",
+                            expanded=False,
+                        ):
+                            if _g.get("break"):
+                                _brk_kind, _brk_len = _g["break"]
+                                st.caption(
+                                    f"⚠️ כולל {_brk_kind} של {_brk_len} דק׳ מיד בתחילת החלון — "
+                                    f"המשבצות שמוצגות כאן הן רק אחרי ה{_brk_kind} בפועל "
+                                    f"({fmt_minutes(_g['free_s'])}–{fmt_minutes(_g['e'])}), לא כוללות אותה."
+                                )
+                            _slots = unfilled_in_window(
+                                st.session_state["schedule_df"], _tl_crosses, _g["free_s"], _g["e"]
+                            )
+                            _shown = 0
+                            for _slot in _slots:
+                                _cands = get_qualified_candidates_for_swap(
+                                    st.session_state["schedule_df"], st.session_state["employees_snap"],
+                                    _slot["flight"], _slot["role"], _slot["idx"],
+                                )
+                                if _g["worker"] not in _cands:
+                                    continue
+                                _shown += 1
+                                _sc1, _sc2 = st.columns([1, 4])[::-1]
+                                with _sc1:
+                                    st.markdown(
+                                        f'<div dir="rtl" style="text-align:right;padding-top:6px;">'
+                                        f'<b>{safe_html(_slot["flight"])}</b> {safe_html(_slot["dest"])} · '
+                                        f'{safe_html(_slot["role"])} · {fmt_minutes(_slot["s"])}–{fmt_minutes(_slot["e"])}'
+                                        f'</div>',
+                                        unsafe_allow_html=True,
+                                    )
+                                with _sc2:
+                                    if st.button("✅ שבץ", key=f"gapassign_{_g['id']}_{_slot['idx']}", width="stretch"):
+                                        _updated = do_swap(
+                                            st.session_state["schedule_df"], _slot["idx"], _g["worker"], "unassign"
+                                        )
+                                        st.session_state["schedule_df"] = _updated
+                                        for _k in ["labeled_df", "workload_df", "continuity_df",
+                                                   "output_df", "_ar_highlighted"]:
+                                            st.session_state.pop(_k, None)
+                                        st.toast(f"✅ {_g['worker']} שובץ/ה ל-{_slot['flight']}", icon="✅")
+                                        st.rerun()
+                            if not _shown:
+                                st.caption("אין משבצת פתוחה שמתאימה לעובד/ת הזה/ו בחלון הזה.")
+
+            # ── גרירת משימה מעובד לעובד ───────────────────────────────────────
+            # Two-step bridge, both steps real Streamlit button clicks (the only
+            # reliable way to get a value from JS into this session — see the
+            # comment on the flight-preview buttons above):
+            #   1. dragstart on a bar clicks a hidden per-TASK button, which just
+            #      records which task is being dragged (no dialog yet) — this has
+            #      real time (the whole drag gesture) to complete before step 2,
+            #      so there's no race between the two clicks/reruns.
+            #   2. drop on a worker's row clicks a hidden per-ROW button, which
+            #      reads the task recorded in step 1 and opens a confirmation
+            #      dialog for THAT task + THIS worker (qualification checked
+            #      there, same as everywhere else — dropping never silently
+            #      reassigns anything).
+            if is_admin() and _tl_html:
+                for _tt in build_tasks(_tl_src):
+                    with st.container(key=f"tldragbtn_{_tt['idx']}"):
+                        if st.button("drag", key=f"tldragbtnb_{_tt['idx']}"):
+                            st.session_state["_tl_drag_task_idx"] = _tt["idx"]
+                for _wi, _ww in enumerate(_tl_workers):
+                    with st.container(key=f"tldropbtn_{_wi}"):
+                        if st.button("drop", key=f"tldropbtnb_{_wi}"):
+                            _di = st.session_state.get("_tl_drag_task_idx")
+                            if _di is not None and _di in st.session_state["schedule_df"].index:
+                                _drag_move_dialog(_di, _ww)
+
+            # ── החלפת עובד/ת שלמה ──────────────────────────────────────────────
+            if is_admin():
+                from app.scheduler import plan_worker_exchange, SHIFT_EXCHANGE_COLS, workers_certified_for_worker_roles
+                _ex_sched = st.session_state["schedule_df"]
+                _ex_emps = st.session_state.get("employees_snap", pd.DataFrame())
+                _ex_names = _ex_sched["עובד"].astype(str).str.strip()
+                _ex_busy = sorted({n for n in _ex_names if n and "❌" not in n})
+                _ex_roster = ([str(n).strip() for n in _ex_emps["שם"].tolist()]
+                              if "שם" in _ex_emps.columns else [])
+                # "doesn't work today at all": no tasks AND no shift hours, and active
+                _ex_off = set()
+                if "שם" in _ex_emps.columns:
+                    for _, _er in _ex_emps.iterrows():
+                        if (not is_time_text(clean_text(str(_er.get("תחילת משמרת", ""))))
+                                and clean_text(str(_er.get("פעיל/לא פעיל", "כן"))) != "לא"):
+                            _ex_off.add(str(_er["שם"]).strip())
+                _ex_free = sorted({n for n in _ex_roster if n and n in _ex_off and n not in set(_ex_busy)})
+                with st.expander("🔁 החלפת משמרת — במי שלא עובד/ת היום, או ראש בראש בין שני עובדים", expanded=False):
+                    _ex_mode = st.radio(
+                        "סוג החלפה",
+                        ["החלפה בעובד/ת פנוי/ה (שלא משובץ/ת היום)", "החלפת משמרות ראש בראש בין שני עובדים"],
+                        key="ex_mode", horizontal=True)
+                    _ex_is_swap = _ex_mode.startswith("החלפת משמרות")
+                    _ex_ca, _ex_cb = st.columns(2)[::-1]
+                    with _ex_ca:
+                        _ex_a = st.selectbox("עובד/ת שמוחלף/ת", [""] + _ex_busy, key="ex_a")
+                    with _ex_cb:
+                        _ex_b = st.selectbox(
+                            "עובד/ת שני/ה" if _ex_is_swap else "עובד/ת מחליף/ה",
+                            [""] + [n for n in (_ex_busy if _ex_is_swap else (
+                                [x for x in _ex_free if x in set(workers_certified_for_worker_roles(
+                                    _ex_sched, _ex_emps, _ex_a))] if _ex_a else _ex_free)) if n != _ex_a],
+                            key="ex_b",
+                            help=None if _ex_is_swap else "מוצגים רק עובדים שמוסמכים לכל התפקידים של המוחלף/ת")
+                    if _ex_a and _ex_b:
+                        _ex_plan, _ex_new, _ex_emps_new = plan_worker_exchange(
+                            _ex_sched, _ex_emps, _ex_a, _ex_b, "swap" if _ex_is_swap else "replace")
+                        _ex_ok = sum(1 for p in _ex_plan if p["ok"])
+                        _ex_snap_a = _ex_emps[_ex_emps["שם"].astype(str).str.strip() == _ex_a]
+                        _ex_snap_b = _ex_emps[_ex_emps["שם"].astype(str).str.strip() == _ex_b]
+                        _ex_sh = lambda r: (f'{clean_text(str(r.iloc[0].get("תחילת משמרת", "")))}–'
+                                            f'{clean_text(str(r.iloc[0].get("סוף משמרת", "")))}' if len(r) else "—")
+                        st.markdown(
+                            f'<div dir="rtl" style="text-align:right;">המשמרת של <b>{safe_html(_ex_a)}</b> '
+                            f'({_ex_sh(_ex_snap_a)}) תעבור ל־<b>{safe_html(_ex_b)}</b>'
+                            + (f' והמשמרת של <b>{safe_html(_ex_b)}</b> ({_ex_sh(_ex_snap_b)}) תעבור ל־<b>{safe_html(_ex_a)}</b>.'
+                               if _ex_is_swap else f' (שעות, טרמינל וחלונות זמינות — לא רק המשימות); {safe_html(_ex_a)} יוצא/ת מהמשמרת.')
+                            + '</div>', unsafe_allow_html=True)
+                        _ex_rows = [{
+                            "": "✅" if p["ok"] else "⛔", "טיסה": p["flight"], "תפקיד": p["role"],
+                            "שעות": f'{p["start"]}–{p["end"]}', "מ־": p["frm"], "אל": p["to"],
+                            "הערה": "" if p["ok"] else "לא מוסמך/ת לתפקיד, טרמינל לא מתאים או כפילות בטיסה",
+                        } for p in _ex_plan]
+                        if _ex_rows:
+                            st.dataframe(pd.DataFrame(_ex_rows), hide_index=True, width="stretch")
+                        _ex_reason = None
+                        if not _ex_is_swap:
+                            _ex_reason = st.selectbox(
+                                f"סיבת ההורדה של {_ex_a}",
+                                ["Sick", "סיק במשפחה", "סיק במשמרת", "כח אדם", "להלה"], key="ex_reason")
+                        _ex_force = False
+                        if not _ex_plan:
+                            st.info("אין משימות בשורות האלה — תעבור המשמרת בלבד.")
+                        elif _ex_ok == len(_ex_plan):
+                            st.success(f"✅ כל {_ex_ok} המשימות מתאימות למשמרת המועברת.")
+                        else:
+                            st.warning(f"⚠️ {len(_ex_plan) - _ex_ok} מתוך {len(_ex_plan)} משימות לא מתאימות.")
+                            _ex_force = st.checkbox("בצע/י בכל זאת (עקיפה ידנית)", key="ex_force")
+                        if (_ex_ok == len(_ex_plan) or _ex_force) and st.button(
+                                "✅ בצע/י החלפת משמרת", key="ex_apply", type="primary"):
+                            _sn = st.session_state["employees_snap"]
+                            _cols = [c for c in SHIFT_EXCHANGE_COLS if c in _ex_emps_new.columns]
+                            for _c in _cols:
+                                if _c not in _sn.columns:
+                                    _sn[_c] = ""
+                            for _nn in (_ex_a, _ex_b):
+                                _src = _ex_emps_new[_ex_emps_new["שם"].astype(str).str.strip() == _nn]
+                                _dst = _sn["שם"].astype(str).str.strip() == _nn
+                                if len(_src) and _dst.any():
+                                    for _c in _cols:
+                                        _sn.loc[_dst, _c] = _src.iloc[0][_c]
+                            # remember it across rebuilds, like other manual shift edits
+                            _fp_now = _upload_fingerprint(include_db=False)
+                            _store = st.session_state.get("_manual_emp_edits") or {}
+                            if _store.get("fp") != _fp_now:
+                                _store = {"fp": _fp_now, "rows": {}}
+                            for _nn in (_ex_a, _ex_b):
+                                _tm = _sn["שם"].astype(str).str.strip() == _nn
+                                if _tm.any():
+                                    _store["rows"][_nn] = {
+                                        _c: _sn.loc[_tm].iloc[0][_c] for _c in _MANUAL_EDIT_COLS if _c in _sn.columns}
+                            st.session_state["_manual_emp_edits"] = _store
+                            if _ex_reason:
+                                # same bookkeeping as the "הורדה ממשמרת" column
+                                st.session_state.setdefault("removed_employees", {})[_ex_a] = _ex_reason
+                                st.session_state.setdefault("_removal_times", {})[_ex_a] = app_now().strftime("%H:%M")
+                                st.session_state.setdefault("_removal_tasks", {})[_ex_a] = [
+                                    f'{p["flight"].replace("LY", "").strip()} ({p["role"]} {p["start"]}–{p["end"]})'
+                                    for p in _ex_plan if p["frm"] == _ex_a]
+                            st.session_state["schedule_df"] = _ex_new
+                            for _k in ["labeled_df", "workload_df", "continuity_df", "output_df", "_ar_highlighted"]:
+                                st.session_state.pop(_k, None)
+                            st.toast(f"✅ המשמרות הוחלפו בין {_ex_a} ל-{_ex_b}" if _ex_is_swap
+                                     else f"✅ {_ex_b} החליף/ה את {_ex_a} במשמרת", icon="✅")
+                            st.rerun()
 
         _render_timeline_tab()
 
@@ -6074,6 +6805,27 @@ if "schedule_df" in st.session_state:
                 </style>""", unsafe_allow_html=True)
 
                 SEP = '<span class="wf-sep">◂</span>'
+
+                # ── Summary strip (user rule 2026-10-04) ─────────────────────
+                _wf_states = [
+                    min(int(st.session_state["wf_briefing"].get(_k, {}).get("state", 0)), 2)
+                    for _k in _wf_groups
+                ]
+                def _wf_card(_ico, _lbl, _val, _sub, _tone):
+                    return (
+                        f'<div class="cc-card" style="--cc-tone:var({_tone})">'
+                        f'<div class="cc-top"><span class="cc-ico">{_ico}</span><span>{_lbl}</span></div>'
+                        f'<div class="cc-val">{_val}</div><div class="cc-sub">{_sub}</div></div>'
+                    )
+                st.markdown(
+                    '<div class="cc-grid">'
+                    + _wf_card("👥", "עובדים בתצוגה", len(_wf_states), "לפי הסינון הנוכחי", "--r-agent")
+                    + _wf_card("○", "ממתינים לבריפינג", _wf_states.count(0), "טרם קיבלו משימות", "--acc-rgb")
+                    + _wf_card("✓", "בבריפינג", _wf_states.count(1), "ממתינים לשליחה לאולם", "--r-tl")
+                    + _wf_card("✓✓", "באולם", _wf_states.count(2), "נשלחו לשער", "--r-guard")
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
 
                 # ── One row per employee ──────────────────────────────────────
                 for _row_id in sorted(_wf_groups.keys(), key=_emp_shift_key):
@@ -6895,7 +7647,9 @@ if "schedule_df" in st.session_state:
                             f'color:var(--ink);line-height:1.5">{_emp_name_html}</div>'
                             + (f'<div style="text-align:right;font-size:13px;color:rgba(var(--ink-rgb),.74);'
                                f'direction:ltr;unicode-bidi:embed">{safe_html(_shift_str)}</div>'
-                               if _shift_str else ""),
+                               if _shift_str else "")
+                            + f'<div class="wf-st wf-st{min(int(_bstate), 2)}">'
+                              f'{("○ ממתין לבריפינג", "✓ בבריפינג", "✓✓ באולם")[min(int(_bstate), 2)]}</div>',
                             unsafe_allow_html=True,
                         )
                     with _c_chips:
@@ -6948,8 +7702,6 @@ if "schedule_df" in st.session_state:
                                       on_click=_cb_cancel2,
                                       width="stretch")
 
-                    st.markdown('<hr style="margin:2px 0;border-color:rgba(var(--ink-rgb),.12)">',
-                                unsafe_allow_html=True)
 
                 if not _wf_groups:
                     st.info("לא נמצאו עובדים מתאימים.")
@@ -6987,62 +7739,36 @@ if "schedule_df" in st.session_state:
             key="unassigned_inner_view",
         )
 
-        def clear_unassigned_search():
-            st.session_state["unassigned_search"] = ""
-
-        def _time_to_minutes(time_text):
-            import re
-
-            time_text = str(time_text).strip()
-            match = re.search(r"(\d{1,2})[:.](\d{2})", time_text)
-
-            if not match:
-                return None
-
-            hour = int(match.group(1))
-            minute = int(match.group(2))
-
-            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-                return None
-
-            return hour * 60 + minute
-
-        def _row_shift_start_minutes(row):
-            possible_cols = [
-                "שעת התחלה",
-                "תחילת משמרת",
-                "משמרת התחלה",
-                "משמרת",
-            ]
-
-            for col in possible_cols:
-                if col in row.index:
-                    value = row.get(col, "")
-                    minutes = _time_to_minutes(value)
-
-                    if minutes is not None:
-                        return minutes
-
-            return None
-
-        def _is_in_time_range(value_minutes, start_minutes, end_minutes):
-            if value_minutes is None:
-                return False
-
-            # אם בחרנו אותה שעה, מציגים את כל היום
-            if start_minutes == end_minutes:
-                return True
-
-            # טווח רגיל, למשל 06:00 עד 14:00
-            if start_minutes < end_minutes:
-                return start_minutes <= value_minutes < end_minutes
-
-            # טווח שחוצה חצות, למשל 22:00 עד 06:00
-            return value_minutes >= start_minutes or value_minutes < end_minutes
-
         # חישוב רשימות הפסקה, ללא הצגה למסך בתוך הלולאה
         if unassigned_df is None:
             unassigned_df = pd.DataFrame()
+
+        def _brk_active(_info):
+            """Same rule as _bp_is_active_break below (kept in sync): a break is live
+            when flagged active, or has a start without an end — across the old
+            ts/end_ts keys and the newer start_dt/end_dt/active ones."""
+            if not isinstance(_info, dict):
+                return False
+            if _info.get("active") is True:
+                return True
+            if _info.get("ts") and not _info.get("end_ts"):
+                return True
+            return bool(_info.get("start_dt") and not _info.get("end_dt") and not _info.get("end_ts"))
+
+        # Everyone on break counts — ASSIGNED workers too, not only the unassigned
+        # ones the loop below iterates (the top card used to say 0 while the
+        # "עובדים בהפסקה כרגע" table listed someone).
+        for _bn, _binfo in st.session_state.get("break_log", {}).items():
+            if _brk_active(_binfo) and clean_text(_bn):
+                active_breaks.append(clean_text(_bn))
+
+        # Night-segment build: only night-defined workers are classified for breaks
+        # (same definition as the "לא משובצים" screen). Classification is skipped —
+        # NOT the loop iteration — so the last-row UI gate below still fires.
+        _bk_seg0 = st.session_state.get("_view_segment") or st.session_state.get("_segment_current")
+        _bk_night0 = None
+        if _bk_seg0 == "night" and not unassigned_df.empty:
+            _bk_night0 = set(unassigned_for_night_segment(unassigned_df)[0]["שם"])
 
         for _, r in unassigned_df.iterrows():
             try:
@@ -7054,212 +7780,33 @@ if "schedule_df" in st.session_state:
 
                 break_info = st.session_state.get("break_log", {}).get(emp_name, {})
 
-                on_break = bool(break_info.get("ts")) and not bool(break_info.get("end_ts"))
-                break_done = bool(break_info.get("ts")) and bool(break_info.get("end_ts"))
+                on_break = _brk_active(break_info)
+                break_done = (not on_break) and bool(break_info.get("ts") or break_info.get("start_dt"))                     and bool(break_info.get("end_ts") or break_info.get("end_dt"))
 
+                # No `continue` here: skipping the iteration would also skip the
+                # last-row UI gate below, so a last-listed worker who is on break
+                # (or finished one) used to make the whole break screen vanish.
                 if on_break:
                     active_breaks.append(emp_name)
-                    continue
+                elif break_done:
+                    pass
+                elif _bk_night0 is None or emp_name in _bk_night0:
+                    shift_start = shift_label.split("-")[0].strip()
+                    h, m = shift_start.split(":")
+                    shift_start_min = int(h) * 60 + int(m)
 
-                if break_done:
-                    continue
+                    now_min = datetime.now().hour * 60 + datetime.now().minute
+                    if now_min < shift_start_min:
+                        now_min += 1440
 
-                shift_start = shift_label.split("-")[0].strip()
-                h, m = shift_start.split(":")
-                shift_start_min = int(h) * 60 + int(m)
+                    worked_minutes = now_min - shift_start_min
 
-                now_min = datetime.now().hour * 60 + datetime.now().minute
-                if now_min < shift_start_min:
-                    now_min += 1440
-
-                worked_minutes = now_min - shift_start_min
-
-                if worked_minutes >= 360:
-                    late_breaks.append(emp_name)
-                elif worked_minutes >= 300:
-                    due_breaks.append(emp_name)
-
+                    if worked_minutes >= 360:
+                        late_breaks.append(emp_name)
+                    elif worked_minutes >= 300:
+                        due_breaks.append(emp_name)
             except Exception:
                 pass
-
-                # מסך עובדים לא משובצים בלבד
-                if "עובדים לא משובצים" in str(unassigned_inner_view):
-                    st.markdown("### 👥 עובדים לא משובצים")
-
-
-                    debug_rows = []
-
-                    for name in [
-                        "unassigned_df",
-                        "available_df",
-                        "live_schedule",
-                        "live_employees",
-                        "employees_df",
-                    ]:
-                        if name in locals():
-                            obj = locals()[name]
-                            if obj is None:
-                                debug_rows.append({"שם משתנה": name, "מצב": "None", "שורות": ""})
-                            elif hasattr(obj, "shape"):
-                                debug_rows.append({"שם משתנה": name, "מצב": "DataFrame", "שורות": obj.shape[0]})
-                            else:
-                                debug_rows.append({"שם משתנה": name, "מצב": type(obj).__name__, "שורות": ""})
-                        else:
-                            debug_rows.append({"שם משתנה": name, "מצב": "לא קיים", "שורות": ""})
-
-                    st.dataframe(pd.DataFrame(debug_rows), width="stretch", hide_index=True)
-                    
-                    def clear_unassigned_search():
-                        st.session_state["unassigned_search"] = ""
-
-                    search_col, clear_col = st.columns([4, 1])
-
-                    with search_col:
-                        unassigned_search = st.text_input(
-                            "🔎 חיפוש עובד",
-                            placeholder="הקלידי שם עובד / תפקיד / משמרת",
-                            key="unassigned_search",
-                        ).strip()
-
-                    with clear_col:
-                        st.markdown("<br>", unsafe_allow_html=True)
-                        st.button(
-                            "נקה חיפוש",
-                            key="clear_unassigned_search",
-                            width="stretch",
-                            on_click=clear_unassigned_search,
-                        )
-
-                unassigned_view_df = pd.DataFrame()
-
-                # ניסיון 1: לקחת מהמשתנה הרגיל
-                if "unassigned_df" in locals() and unassigned_df is not None and not unassigned_df.empty:
-                    unassigned_view_df = unassigned_df.copy()
-
-                # ניסיון 2: לקחת מה-session_state
-                elif (
-                    "unassigned_df" in st.session_state
-                    and st.session_state["unassigned_df"] is not None
-                    and not st.session_state["unassigned_df"].empty
-                ):
-                    unassigned_view_df = st.session_state["unassigned_df"].copy()
-
-                # ניסיון 3: fallback למסך עובדים זמינים, אם קיים
-                elif "available_df" in locals() and available_df is not None and not available_df.empty:
-                    unassigned_view_df = available_df.copy()
-
-                    if unassigned_search and not unassigned_view_df.empty:
-                        search_mask = unassigned_view_df.astype(str).apply(
-                            lambda row: row.str.contains(
-                                unassigned_search,
-                                case=False,
-                                na=False,
-                            ).any(),
-                            axis=1,
-                        )
-                        unassigned_view_df = unassigned_view_df[search_mask].copy()
-
-                    if unassigned_view_df.empty:
-                        st.info("אין כרגע עובדים לא משובצים להצגה.")
-                    else:
-                        display_cols = [
-                            c for c in [
-                                "שם",
-                                "משמרת",
-                                "תפקיד",
-                                "תפקיד עיקרי",
-                                "הערה",
-                                "סיבה",
-                            ]
-                            if c in unassigned_view_df.columns
-                        ]
-
-                        if display_cols:
-                            unassigned_view_df = unassigned_view_df[display_cols].copy()
-
-                        st.caption(f"סה״כ עובדים לא משובצים להצגה: {len(unassigned_view_df)}")
-
-                        st.dataframe(
-                            unassigned_view_df,
-                            width="stretch",
-                            hide_index=True,
-                        )
-
-                    st.stop()
-            # מסך ניהול הפסקות בלבד
-                if unassigned_inner_view == INNER_BREAKS:
-
-                    # כרטיסי דחיפות יוצגו אחרי בניית break_priority_df
-
-                    # הכרטיסים יוצגו אחרי בניית break_priority_rows,
-                    # כדי שהמספרים יתאימו למה שמופיע בטבלה.
-                    def _shift_to_minutes_from_text(shift_label):
-                        shift_label = str(shift_label).strip()
-
-                        if "-" not in shift_label:
-                            return None, None
-
-                        start_txt, end_txt = shift_label.split("-", 1)
-
-                        try:
-                            sh, sm = start_txt.strip().split(":")[:2]
-                            eh, em = end_txt.strip().split(":")[:2]
-
-                            start_min = int(sh) * 60 + int(sm)
-                            end_min = int(eh) * 60 + int(em)
-
-                            return start_min, end_min
-                        except Exception:
-                            return None, None
-
-                    def _is_now_inside_shift_label(shift_label, now_dt):
-                        start_min, end_min = _shift_to_minutes_from_text(shift_label)
-
-                        if start_min is None or end_min is None:
-                            return True
-
-                        now_min = now_dt.hour * 60 + now_dt.minute
-
-                        # משמרת רגילה, למשל 10:00-18:00
-                        if end_min >= start_min:
-                            return start_min <= now_min <= end_min
-
-                        # משמרת שחוצה חצות, למשל 20:30-04:00
-                        return now_min >= start_min or now_min <= end_min
-
-                    def _is_night_shift_label_20_to_04(shift_label):
-                        start_min, end_min = _shift_to_minutes_from_text(shift_label)
-
-                        if start_min is None or end_min is None:
-                            return False
-
-                        # משמרת לילה: מתחילה מ־20:00 והלאה,
-                        # חוצה חצות, ומסתיימת ב־04:00 או מאוחר יותר.
-                        return (
-                            start_min >= 20 * 60
-                            and end_min < start_min
-                            and end_min >= 4 * 60
-                        )
-
-                    def employee_shift_label(emp_name, unassigned_df):
-                        emp_name = clean_text(emp_name)
-
-                        if unassigned_df is None or unassigned_df.empty:
-                            return ""
-
-                        if "שם" not in unassigned_df.columns or "משמרת" not in unassigned_df.columns:
-                            return ""
-
-                        rows = unassigned_df[
-                            unassigned_df["שם"].astype(str).map(clean_text) == emp_name
-                        ]
-
-                        if rows.empty:
-                            return ""
-
-                        return clean_text(rows.iloc[0].get("משמרת", ""))
-
-                    break_priority_rows = []
 
             # Skip UI rendering for all but the last employee in the loop
             if _ != unassigned_df.index[-1]:
@@ -7436,36 +7983,6 @@ if "schedule_df" in st.session_state:
                 if display_cols:
                     break_priority_df = break_priority_df[display_cols]
 
-                if unassigned_inner_view == INNER_BREAKS:
-                    urgent_count = 0
-                    due_count = 0
-                    active_count = 0
-
-                    if "דחיפות" in break_priority_df.columns:
-                        urgent_count = break_priority_df["דחיפות"].astype(str).str.contains("חייבים", na=False).sum()
-                        due_count = break_priority_df["דחיפות"].astype(str).str.contains("60 דקות", na=False).sum()
-                        active_count = break_priority_df["דחיפות"].astype(str).str.contains("כרגע בהפסקה", na=False).sum()
-
-                    c1, c2, c3 = st.columns(3)
-
-                    with c1:
-                        st.error(f"🔴 עובדים דחופים להפסקה: {urgent_count}")
-
-                    with c2:
-                        st.warning(f"🟠 ב־60 דקות הקרובות: {due_count}")
-
-                    with c3:
-                        st.success(f"🟢 כרגע בהפסקה: {active_count}")
-
-                    st.markdown(f"#### 📑 עובדים לפי דחיפות הפסקה עכשיו ({len(break_priority_df)})")
-
-                    st.dataframe(
-                        break_priority_df,
-                        width="stretch",
-                        hide_index=True,
-                    )
-
-                    st.markdown("---")
                 # ============================================================
                 # מסך הפסקות נקי
                 # 1. חייבים לפני טיסה
@@ -7518,6 +8035,55 @@ if "schedule_df" in st.session_state:
                     except Exception:
                         return ""
 
+
+            if unassigned_inner_view == INNER_BREAKS:
+                urgent_count = 0
+                due_count = 0
+                active_count = 0
+
+                if "דחיפות" in break_priority_df.columns:
+                    urgent_count = break_priority_df["דחיפות"].astype(str).str.contains("חייבים", na=False).sum()
+                    due_count = break_priority_df["דחיפות"].astype(str).str.contains("60 דקות", na=False).sum()
+                    active_count = break_priority_df["דחיפות"].astype(str).str.contains("כרגע בהפסקה", na=False).sum()
+
+                def _bk_stat(_ico, _lbl, _val, _sub, _tone):
+                    return (
+                        f'<div class="cc-card" style="--cc-tone:var({_tone})">'
+                        f'<div class="cc-top"><span class="cc-ico">{_ico}</span><span>{_lbl}</span></div>'
+                        f'<div class="cc-val">{_val}</div><div class="cc-sub">{_sub}</div></div>'
+                    )
+                st.markdown(
+                    '<div class="cc-grid">'
+                    + _bk_stat("🔴", "דחופים להפסקה", int(urgent_count), "חייבים לצאת עכשיו", "--r-insp")
+                    + _bk_stat("🟠", "ב־60 הדקות הקרובות", int(due_count), "יזדקקו להפסקה בקרוב", "--r-tl")
+                    + _bk_stat("🟢", "כרגע בהפסקה", int(active_count), "הפסקה פעילה", "--r-guard")
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown(f'<div class="sec-title">📑 עובדים לפי דחיפות הפסקה עכשיו ({len(break_priority_df)})</div>',
+                            unsafe_allow_html=True)
+                if break_priority_df.empty:
+                    st.info("אין כרגע עובדים הדורשים הפסקה.")
+                else:
+                    _bp_cards = ""
+                    for _, _pr in break_priority_df.iterrows():
+                        _urg = str(_pr.get("דחיפות", ""))
+                        _tone = ("--r-insp" if "חייבים" in _urg else
+                                 "--r-guard" if "כרגע בהפסקה" in _urg else "--r-tl")
+                        _shift_txt = str(_pr.get("משמרת", "")).strip()
+                        _role_txt = str(_pr.get("תפקיד", "")).strip()
+                        _bp_cards += (
+                            f'<div class="wd-card" style="--cc-tone:var({_tone})">'
+                            f'<div class="wd-name">{safe_html(str(_pr.get("שם", "")))}</div>'
+                            + (f'<span class="wd-hours">{safe_html(_shift_txt)}</span>' if _shift_txt else "")
+                            + f'<div class="wd-chips"><span class="wd-chip wd-off-chip">{safe_html(_urg)}</span>'
+                            + (f'<span class="wd-chip">{safe_html(_role_txt)}</span>' if _role_txt else "")
+                            + '</div></div>'
+                        )
+                    st.markdown(f'<div class="wd-grid">{_bp_cards}</div>', unsafe_allow_html=True)
+
+                st.markdown("---")
 
             def _bp_now():
                 return app_now()
@@ -7680,25 +8246,66 @@ if "schedule_df" in st.session_state:
                 def clear_unassigned_search():
                     st.session_state["unassigned_search"] = ""
 
-                search_col, clear_col = st.columns([4, 1])
-                with search_col:
-                    unassigned_search = st.text_input(
-                        "🔎 חיפוש עובד",
-                        placeholder="הקלידי שם עובד / תפקיד / משמרת",
-                        key="unassigned_search",
-                    ).strip()
-                with clear_col:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    st.button(
-                        "נקה חיפוש",
-                        key="clear_unassigned_search",
-                        width="stretch",
-                        on_click=clear_unassigned_search,
-                    )
+                _un_strip = st.container()   # summary strip — filled once the list is known
 
                 unassigned_view_df = pd.DataFrame()
                 if unassigned_df is not None and not unassigned_df.empty:
                     unassigned_view_df = unassigned_df.copy()
+
+                # Only people whose shift overlaps the time range the built schedule
+                # covers are "unassigned"; the rest simply haven't had their turn yet
+                # (e.g. day/after workers while only the night segment is built).
+                _un_in, _un_out, _un_win = unassigned_in_schedule_window(
+                    unassigned_view_df, live_schedule)
+                # A night-segment build lists only workers defined as נייט.
+                _un_seg = (st.session_state.get("_view_segment")
+                           or st.session_state.get("_segment_current"))
+                _un_night = (_un_seg == "night")
+                if _un_night:
+                    _un_in, _un_out = unassigned_for_night_segment(unassigned_view_df)
+                    _un_win = None
+
+                with st.container(key="un_ctrl"):
+                    search_col, clear_col = st.columns([4, 1])
+                    with search_col:
+                        unassigned_search = st.text_input(
+                            "🔎 חיפוש עובד",
+                            placeholder="הקלידי שם עובד / תפקיד / משמרת",
+                            key="unassigned_search",
+                        ).strip()
+                    with clear_col:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        st.button(
+                            "נקה חיפוש",
+                            key="clear_unassigned_search",
+                            width="stretch",
+                            on_click=clear_unassigned_search,
+                        )
+                    _show_out = False
+                    if _un_night:
+                        st.markdown(
+                            '<div dir="rtl" style="text-align:right;font-size:13px;color:rgba(var(--ink-rgb),.74);">'
+                            '🌙 סידור נייט: מוצגים עובדי נייט בלבד — משמרת שמתחילה לפני '
+                            '<span dir="ltr" style="unicode-bidi:isolate">07:00</span>, '
+                            'או משמרת לילה מאתמול שעוד נמשכת. '
+                            f'עובדי דיי ואפטר (מחוץ לנייט): {len(_un_out)}.</div>',
+                            unsafe_allow_html=True,
+                        )
+                    elif _un_win is not None:
+                        _show_out = st.toggle(
+                            f"הצג גם עובדים מחוץ לטווח הסידור ({len(_un_out)})",
+                            key="unassigned_show_out_of_window",
+                        )
+                        st.markdown(
+                            f'<div dir="rtl" style="text-align:right;font-size:13px;color:rgba(var(--ink-rgb),.74);">'
+                            f'מוצגים עובדים שהמשמרת שלהם חופפת לטווח הסידור שנבנה '
+                            f'(<span dir="ltr" style="unicode-bidi:isolate">{_un_win[0]}–{_un_win[1]}</span>). '
+                            f'מחוץ לטווח: {len(_un_out)}.</div>',
+                            unsafe_allow_html=True,
+                        )
+                if (_un_win is not None and not _show_out) or _un_night:
+                    unassigned_view_df = _un_in.copy()
+                _un_out_names = set(_un_out["שם"]) if ((_un_win is not None or _un_night) and not _un_out.empty) else set()
 
                 if unassigned_search and not unassigned_view_df.empty:
                     search_mask = unassigned_view_df.astype(str).apply(
@@ -7707,33 +8314,68 @@ if "schedule_df" in st.session_state:
                     )
                     unassigned_view_df = unassigned_view_df[search_mask].copy()
 
+                # Terminal per worker (same rule as "מי עובד היום"): "1" = terminal 1,
+                # "3+1"/"1+3" = transfers between terminals, otherwise terminal 3.
+                _un_term = {}
+                try:
+                    for _, _er in live_employees.drop_duplicates("שם").iterrows():
+                        _un_term[clean_text(str(_er.get("שם", "")))] = _terminal_label_for(_er)
+                except Exception:
+                    _un_term = {}
+                _un_n_t1 = sum(1 for _n in unassigned_view_df["שם"]
+                               if _un_term.get(clean_text(str(_n)), "3") != "3") if len(unassigned_view_df) else 0
+                _un_total_all = 0 if unassigned_df is None else len(unassigned_df)
+                _un_n_view = len(unassigned_view_df)
+                _un_n_tl = int((unassigned_view_df["תפקיד"] == "ראש צוות").sum()) if _un_n_view else 0
+                def _un_card(_ico, _lbl, _val, _sub, _tone):
+                    return (
+                        f'<div class="cc-card" style="--cc-tone:var({_tone})">'
+                        f'<div class="cc-top"><span class="cc-ico">{_ico}</span><span>{_lbl}</span></div>'
+                        f'<div class="cc-val">{_val}</div><div class="cc-sub">{_sub}</div></div>'
+                    )
+                with _un_strip:
+                    st.markdown(
+                        '<div class="cc-grid">'
+                        + _un_card("👥", "לא משובצים בתצוגה", _un_n_view, "לפי החיפוש והטווח", "--r-agent")
+                        + _un_card("👑", "ראשי צוות", _un_n_tl, "מתוך התצוגה", "--r-tl")
+                        + _un_card("🧍", "דיילים", _un_n_view - _un_n_tl, "מתוך התצוגה", "--r-guard")
+                        + _un_card("🏢", "טרמינל 1 / מעבר", _un_n_t1, "מסומנים בכתום בכרטיסים", "--t1-rgb")
+                        + _un_card("⏳", "מחוץ לנייט" if _un_night else "מחוץ לטווח הסידור",
+                                   len(_un_out) if (_un_win is not None or _un_night) else 0,
+                                   "דיי ואפטר" if _un_night else "משמרת שעוד לא הגיעה", "--acc-rgb")
+                        + '</div>',
+                        unsafe_allow_html=True,
+                    )
+
                 if unassigned_view_df.empty:
                     st.info("אין כרגע עובדים לא משובצים להצגה.")
                 else:
-                    display_cols = [
-                        c for c in ["שם", "משמרת", "תפקיד", "תפקיד עיקרי", "הערה", "סיבה"]
-                        if c in unassigned_view_df.columns
-                    ]
-                    if display_cols:
-                        unassigned_view_df = unassigned_view_df[display_cols].copy()
-                    st.markdown(f"<p style='text-align:right;font-size:0.85em;color:gray;'>סה״כ עובדים לא משובצים: {len(unassigned_view_df)}</p>", unsafe_allow_html=True)
-                    col_width = f"{100 // max(len(unassigned_view_df.columns), 1)}%"
-                    header_html = "".join(
-                        f"<th style='text-align:center;padding:8px 12px;background:rgba(var(--ink-rgb),0.08);border:1px solid rgba(var(--ink-rgb),0.15);color:inherit;width:{col_width};'>{col}</th>"
-                        for col in unassigned_view_df.columns
-                    )
-                    rows_html = ""
-                    for _, row in unassigned_view_df.iterrows():
-                        cells = "".join(
-                            f"<td style='text-align:center;padding:6px 12px;border:1px solid rgba(var(--ink-rgb),0.08);'>{'' if pd.isna(v) else v}</td>"
-                            for v in row
-                        )
-                        rows_html += f"<tr>{cells}</tr>"
-                    st.markdown(
-                        f"<div style='overflow-x:auto'><table style='width:100%;border-collapse:collapse;direction:rtl;color:inherit;table-layout:fixed;'>"
-                        f"<thead><tr>{header_html}</tr></thead><tbody>{rows_html}</tbody></table></div>",
-                        unsafe_allow_html=True,
-                    )
+                    _un_html = ""
+                    for _role, _ico in (("ראש צוות", "👑 ראשי צוות"), ("דייל", "🧍 דיילים")):
+                        _grp = unassigned_view_df[unassigned_view_df["תפקיד"] == _role]
+                        if _grp.empty:
+                            continue
+                        _cards = ""
+                        for _, _ur in _grp.iterrows():
+                            _tone = "--r-tl" if _role == "ראש צוות" else "--r-guard"
+                            _tl = _un_term.get(clean_text(str(_ur["שם"])), "3")
+                            _t1cls = ""
+                            _tchip = ""
+                            if _tl != "3":
+                                _tone, _t1cls = "--t1-rgb", " wd-t1"
+                                _tchip = ('<span class="wd-chip wd-t1-chip">🏢 טרמינל 1</span>' if _tl == "1" else
+                                          f'<span class="wd-chip wd-t1-chip">🔀 מעבר {"ט3 ← ט1" if _tl == "3+1" else "ט1 ← ט3"}</span>')
+                            _out = ('<span class="wd-chip wd-wait">⏳ מחוץ לטווח</span>'
+                                    if _ur["שם"] in _un_out_names else "")
+                            _cards += (
+                                f'<div class="wd-card{_t1cls}" style="--cc-tone:var({_tone})">'
+                                f'<div class="wd-name">{safe_html(str(_ur["שם"]))}</div>'
+                                f'<span class="wd-hours">{safe_html(str(_ur["תחילת משמרת"]))}–{safe_html(str(_ur["סוף משמרת"]))}</span>'
+                                f'<div class="wd-chips"><span class="wd-chip">{safe_html(_role)}</span>{_tchip}{_out}</div></div>'
+                            )
+                        _un_html += (f'<div class="wd-sec"><span>{_ico}</span><b>{len(_grp)}</b></div>'
+                                     f'<div class="wd-grid">{_cards}</div>')
+                    st.markdown(_un_html, unsafe_allow_html=True)
 
                 st.stop()
 
@@ -8105,6 +8747,21 @@ if "schedule_df" in st.session_state:
                             else:
                                 reason = f"הפסקה {break_duration} דק' + {walk_time} דק' הליכה לפני הטיסה.{refresh_note}"
 
+                        # Only UPCOMING work counts as "must break before the flight": drop a
+                        # worker whose first task already started, whose shift is not running
+                        # now, or who already finished a break (user rule 2026-10-04 — the list
+                        # used to show 04:00 / 07:15 deadlines at 13:18).
+                        _now_dt = app_now()
+                        _now_m = _now_dt.hour * 60 + _now_dt.minute
+                        if first_start_min < _now_m:
+                            continue
+                        if shift_label and not bp_is_now_inside_shift(shift_label):
+                            continue
+                        _brk_i = st.session_state.get("break_log", {}).get(emp_name, {})
+                        if isinstance(_brk_i, dict) and (_brk_i.get("end") or _brk_i.get("end_dt") or _brk_i.get("end_ts")) \
+                                and not _brk_active(_brk_i):
+                            continue
+
                         task_start_fmt = f"{first_start_min // 60:02d}:{first_start_min % 60:02d}"
                         earliest_fmt   = f"{earliest_break_start // 60:02d}:{earliest_break_start % 60:02d}"
                         calc_text = (
@@ -8131,42 +8788,22 @@ if "schedule_df" in st.session_state:
             else:
                 valid_rows = [(idx, row) for idx, row in urgent_flight_break_df.iterrows() if clean_text(row.get("שם", ""))]
 
-                st.markdown("""
-                <style>
-                div[data-testid="stHorizontalBlock"]:has(> div[data-testid="column"]) .urgent-cell {
-                    border-bottom: 1px solid rgba(var(--ink-rgb),0.08);
-                    min-height: 42px; display:flex; align-items:center; justify-content:center;
-                    font-size: 0.88em; padding: 4px 6px;
-                }
-                </style>
-                """, unsafe_allow_html=True)
-
-                RATIOS  = [1.8, 1.2, 1.1, 1.0, 1.2]
-                HEADERS = ["שם", "משמרת", "טיסה", "דדליין", "פעולה"]
-                DKEYS   = ["שם", "משמרת", "טיסה קרובה", "דדליין"]
-
-                C_HDR = "background:rgba(var(--ink-rgb),0.11);text-align:center;font-weight:700;font-size:0.85em;padding:10px 6px;border-radius:3px;letter-spacing:0.02em;"
-                C_CELL = "text-align:center;"
-
-                # כותרת
-                hcols = st.columns(RATIOS)
-                for hc, ht in zip(hcols, HEADERS):
-                    hc.markdown(f"<div style='{C_HDR}'>{ht}</div>", unsafe_allow_html=True)
-
-                # שורות נתונים
                 for i, (idx, row) in enumerate(valid_rows):
-                    bg = "rgba(var(--ink-rgb),0.025)" if i % 2 == 0 else "rgba(var(--ink-rgb),0.06)"
                     emp_name = clean_text(row.get("שם", ""))
-                    dcols = st.columns(RATIOS)
-                    for dc, dk in zip(dcols[:-1], DKEYS):
-                        val = str(row.get(dk, ""))
-                        dc.markdown(
-                            f"<div style='background:{bg};{C_CELL}min-height:42px;display:flex;"
-                            f"align-items:center;justify-content:center;font-size:0.88em;"
-                            f"padding:4px 4px;border-bottom:1px solid rgba(var(--ink-rgb),0.07);'>{val}</div>",
-                            unsafe_allow_html=True
+                    _ci, _cb = st.columns([6, 1.3], vertical_alignment="center")
+                    with _ci:
+                        st.markdown(
+                            '<div class="bk-card" style="--cc-tone:var(--r-insp)">'
+                            '<div class="bk-main">'
+                            f'<span class="bk-name">{safe_html(emp_name)}</span>'
+                            f'<span class="bk-chip">🕒 משמרת <span dir="ltr" style="unicode-bidi:isolate">{safe_html(str(row.get("משמרת", "")))}</span></span>'
+                            f'<span class="bk-chip">✈️ {safe_html(str(row.get("טיסה קרובה", "")))}</span>'
+                            f'<span class="bk-chip bk-dead">⏰ דדליין <span dir="ltr" style="unicode-bidi:isolate">{safe_html(str(row.get("דדליין", "")))}</span></span>'
+                            '</div>'
+                            f'<div class="bk-reason">{safe_html(str(row.get("סיבה", "")))}</div></div>',
+                            unsafe_allow_html=True,
                         )
-                    with dcols[-1]:
+                    with _cb:
                         if st.button("הוצא להפסקה", key=f"urgent_break_start_{idx}_{emp_name}", width="stretch"):
                             _bp_start_break(emp_name, break_type="לפני טיסה", source="דדליין לפני טיסה")
                             st.rerun()
@@ -8531,6 +9168,11 @@ if "schedule_df" in st.session_state:
 
             combined_break_rows = []
 
+            _bk_seg = st.session_state.get("_view_segment") or st.session_state.get("_segment_current")
+            _bk_night_names = None
+            if _bk_seg == "night" and unassigned_df is not None and not unassigned_df.empty:
+                _bk_night_names = set(unassigned_for_night_segment(unassigned_df)[0]["שם"])
+
             if (
                 unassigned_df is not None
                 and not unassigned_df.empty
@@ -8545,6 +9187,14 @@ if "schedule_df" in st.session_state:
                     if emp_name in active_names:
                         continue
                     if emp_name in urgent_names_set:
+                        continue
+                    # Only people who are on shift RIGHT NOW can be sent on a break
+                    # (the list used to offer workers whose shift had not started or
+                    # had already ended), and a night-segment build lists night-defined
+                    # workers only — same definition as the "לא משובצים" screen.
+                    if not bp_is_now_inside_shift(shift_label):
+                        continue
+                    if _bk_night_names is not None and emp_name not in _bk_night_names:
                         continue
 
                     s_min, e_min = _bp_shift_to_minutes(shift_label)
@@ -8585,33 +9235,29 @@ if "schedule_df" in st.session_state:
                 shown = len(display_rows)
                 st.caption(f"מציג {shown} מתוך {total} עובדים")
 
-                if True:
-                    hcols = st.columns(CB_RATIOS)
-                    for hc, ht in zip(hcols, CB_HEADERS):
-                        hc.markdown(f"<div style='{C_HDR3}'>{ht}</div>", unsafe_allow_html=True)
-
-                    if unassigned_inner_view == INNER_BREAKS:
-                        for btn_i, row in enumerate(display_rows):
-                            emp_name = row["שם"]
-                            bg = "rgba(var(--ink-rgb),0.025)" if btn_i % 2 == 0 else "rgba(var(--ink-rgb),0.06)"
-                            C_CELL3 = f"background:{bg};text-align:center;font-size:0.82em;padding:5px 4px;border-bottom:1px solid rgba(var(--ink-rgb),0.06);"
-
-                            rcols = st.columns(CB_RATIOS)
-                            rcols[0].markdown(f"<div style='{C_CELL3}'>{emp_name}</div>", unsafe_allow_html=True)
-                            rcols[1].markdown(f"<div style='{C_CELL3}'>{row['משמרת']}</div>", unsafe_allow_html=True)
-                            rcols[2].markdown(f"<div style='{C_CELL3}'>{row['חלון מומלץ']}</div>", unsafe_allow_html=True)
-
-                            with rcols[3]:
-                                safe_key = str(emp_name).replace(" ", "_").replace("/", "_").replace("-", "_")
-                                _act_col1, _act_col2 = st.columns(2)
-                                with _act_col1:
-                                    if st.button("הוצא להפסקה", key=f"combined_break_{btn_i}_{safe_key}", width="stretch"):
-                                        _bp_start_break(emp_name, break_type="יזומה", source="הוצאה יזומה")
-                                        st.rerun()
-                                with _act_col2:
-                                    if st.button("הוצא לרענון", key=f"combined_refresh_{btn_i}_{safe_key}", width="stretch"):
-                                        _bp_start_break(emp_name, break_type="רענון יזום", source="רענון יזום")
-                                        st.rerun()
+                if unassigned_inner_view == INNER_BREAKS:
+                    for btn_i, row in enumerate(display_rows):
+                        emp_name = row["שם"]
+                        _ci, _c1, _c2 = st.columns([5, 1.3, 1.3], vertical_alignment="center")
+                        with _ci:
+                            st.markdown(
+                                '<div class="bk-card" style="--cc-tone:var(--r-guard)">'
+                                '<div class="bk-main">'
+                                f'<span class="bk-name">{safe_html(emp_name)}</span>'
+                                f'<span class="bk-chip">🕒 משמרת <span dir="ltr" style="unicode-bidi:isolate">{safe_html(str(row["משמרת"]))}</span></span>'
+                                f'<span class="bk-chip">☕ חלון מומלץ <span dir="ltr" style="unicode-bidi:isolate">{safe_html(str(row["חלון מומלץ"]))}</span></span>'
+                                '</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        safe_key = str(emp_name).replace(" ", "_").replace("/", "_").replace("-", "_")
+                        with _c1:
+                            if st.button("הוצא להפסקה", key=f"combined_break_{btn_i}_{safe_key}", width="stretch"):
+                                _bp_start_break(emp_name, break_type="יזומה", source="הוצאה יזומה")
+                                st.rerun()
+                        with _c2:
+                            if st.button("הוצא לרענון", key=f"combined_refresh_{btn_i}_{safe_key}", width="stretch"):
+                                _bp_start_break(emp_name, break_type="רענון יזום", source="רענון יזום")
+                                st.rerun()
     if active_main_tab == TAB_SCHEDULE:
         excel_data = to_excel_bytes(output_df, workload_df, labeled_df, continuity_df)
         # Respect the "תצוגת טרמינל" filter (הכל/טרמינל 3/טרמינל 1) shown on

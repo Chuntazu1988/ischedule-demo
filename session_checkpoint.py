@@ -47,7 +47,7 @@ CHECKPOINT_KEYS = [
     "_segments_built", "_segment_built_until", "show_segment_form",
     "_segment_snapshots", "_segment_current", "_view_segment",
     "_shift_editor_sticky", "_manual_emp_edits",
-    "special_tl_instructions", "_unmet_tl_instructions",
+    "special_tl_instructions", "_unmet_tl_instructions", "special_posts",
 ]
 
 # The three uploaded files, stored as plain (name, bytes) tuples under their
