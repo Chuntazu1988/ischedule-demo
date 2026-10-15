@@ -1,6 +1,5 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
-         sendPasswordResetEmail, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getAuth, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, collection,
          onSnapshot, setDoc, addDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { firebaseConfig } from "./firebase-config.js";
@@ -10,7 +9,7 @@ const LEAD = "ראש צוות";
 const TIERS = [[100, 1200], [50, 900], [25, 600]];   // מינימום טיסות בחודש → גמול בשקלים
 
 const S = { phase: "loading", uid: null, name: "", onlyLead: true, flights: [], view: "month",
-            cursor: startOfDay(new Date()), confirmId: null, msg: "", mode: "login", busy: false };
+            cursor: startOfDay(new Date()), confirmId: null, msg: "", busy: false };
 let auth, db, unsubProfile = null, unsubFlights = null;
 
 function startOfDay(d) { const x = new Date(d); x.setHours(0,0,0,0); return x; }
@@ -100,52 +99,23 @@ function render() {
 }
 
 function renderAuth(app) {
-  const reg = S.mode === "register";
-  app.innerHTML = `<div class="welcome"><h2>✈️ יומן טיסות</h2>
-    <p>${reg ? "יוצרים חשבון חדש. עם אותו אימייל וסיסמה אפשר להיכנס מכל טלפון." : "כניסה לחשבון שלך."}</p>
-    <form id="authForm">
-      <label for="email">אימייל</label>
-      <input id="email" type="email" autocomplete="email" required dir="ltr" style="text-align:right">
-      <label for="pass">סיסמה${reg ? " (לפחות 6 תווים)" : ""}</label>
-      <input id="pass" type="password" autocomplete="${reg ? "new-password" : "current-password"}" required minlength="6" dir="ltr" style="text-align:right">
-      <div class="err" id="authErr">${esc(S.msg)}</div>
-      <div class="actions"><button class="primary" type="submit" ${S.busy ? "disabled" : ""}>${reg ? "יצירת חשבון" : "כניסה"}</button></div>
-    </form>
-    <div class="links">
-      <button class="link" id="toggle">${reg ? "כבר יש לי חשבון" : "אין לי חשבון עדיין"}</button>
-      ${reg ? "" : `<button class="link" id="reset">שכחתי סיסמה</button>`}
-    </div></div>`;
-  $("authForm").onsubmit = async ev => {
-    ev.preventDefault();
-    const email = $("email").value.trim(), pass = $("pass").value;
-    S.busy = true; S.msg = ""; $("authErr").textContent = "";
-    try {
-      if (reg) await createUserWithEmailAndPassword(auth, email, pass);
-      else await signInWithEmailAndPassword(auth, email, pass);
-    } catch (e) { S.msg = authMsg(e); S.busy = false; renderAuth(app); $("email").value = email; }
-    S.busy = false;
+  app.innerHTML = `<div class="welcome" style="text-align:center"><h2>✈️ יומן טיסות</h2>
+    <p>תיעוד הטיסות והגמול החודשי שלך, שמור בענן ונגיש מכל טלפון.</p>
+    <div class="actions" style="margin-top:28px"><button class="primary" id="google" ${S.busy ? "disabled" : ""}>כניסה עם Google</button></div>
+    <div class="err" id="authErr">${esc(S.msg)}</div>
+    <p class="muted" style="margin-top:16px">אין צורך בסיסמה או בהרשמה. בטלפון חדש נכנסים עם אותו חשבון Google וכל הנתונים שם.</p></div>`;
+  $("google").onclick = async () => {
+    S.busy = true; S.msg = ""; renderAuth(app);
+    try { await signInWithPopup(auth, new GoogleAuthProvider()); }
+    catch (e) {
+      S.msg = e.code === "auth/popup-closed-by-user" || e.code === "auth/cancelled-popup-request" ? ""
+            : e.code === "auth/network-request-failed" ? "אין חיבור לאינטרנט"
+            : e.code === "auth/unauthorized-domain" ? "הכתובת הזו לא הוגדרה ב-Firebase (ראה README, שלב 4)"
+            : e.code === "auth/operation-not-allowed" ? "כניסה עם Google לא הופעלה ב-Firebase (ראה README)"
+            : "הכניסה נכשלה. נסה שוב.";
+    }
+    S.busy = false; if (S.phase === "auth") renderAuth(app);
   };
-  $("toggle").onclick = () => { S.mode = reg ? "login" : "register"; S.msg = ""; render(); };
-  if (!reg) $("reset").onclick = async () => {
-    const email = $("email").value.trim();
-    if (!email) { $("authErr").textContent = "כתוב קודם את האימייל שלך"; return; }
-    try { await sendPasswordResetEmail(auth, email); $("authErr").textContent = "שלחנו לך מייל לאיפוס הסיסמה"; }
-    catch (e) { $("authErr").textContent = authMsg(e); }
-  };
-}
-function authMsg(e) {
-  const m = {
-    "auth/invalid-email": "כתובת האימייל לא תקינה",
-    "auth/email-already-in-use": "כבר קיים חשבון עם האימייל הזה. נסה להיכנס.",
-    "auth/weak-password": "הסיסמה קצרה מדי (לפחות 6 תווים)",
-    "auth/invalid-credential": "אימייל או סיסמה שגויים",
-    "auth/wrong-password": "אימייל או סיסמה שגויים",
-    "auth/user-not-found": "אימייל או סיסמה שגויים",
-    "auth/too-many-requests": "יותר מדי ניסיונות. נסה שוב בעוד כמה דקות.",
-    "auth/network-request-failed": "אין חיבור לאינטרנט",
-    "auth/operation-not-allowed": "כניסה עם אימייל לא הופעלה ב-Firebase (ראה README)",
-  };
-  return m[e.code] || "משהו השתבש. נסה שוב.";
 }
 
 function shift(dir) {
