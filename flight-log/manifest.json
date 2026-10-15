@@ -1,0 +1,2 @@
+{ "name": "יומן טיסות", "short_name": "טיסות", "lang": "he", "dir": "rtl",
+  "start_url": ".", "display": "standalone", "background_color": "#eef1f6", "theme_color": "#14295c" }
