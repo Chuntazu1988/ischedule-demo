@@ -8,7 +8,7 @@ const ROLES = ["ראש צוות", "דייל", "מתאם תורים", "מפקח T
 const LEAD = "ראש צוות";
 const TIERS = [[100, 1200], [50, 900], [25, 600]];   // מינימום טיסות בחודש → גמול בשקלים
 
-const S = { phase: "loading", uid: null, name: "", onlyLead: true, flights: [], view: "month",
+const S = { phase: "loading", uid: null, name: "", onlyLead: true, /* קבוע: רק ראש צוות נספר */ flights: [], view: "month",
             cursor: startOfDay(new Date()), confirmId: null, msg: "", busy: false };
 let auth, db, unsubProfile = null, unsubFlights = null;
 
@@ -32,6 +32,7 @@ function title() {
   return fmt(a, { month: "long", year: "numeric" });
 }
 const inRange = (f, a, b) => f.date >= iso(a) && f.date <= iso(b);
+const showNum = n => /^\d+$/.test(n) ? "LY" + n : n;
 const bonusFor = n => (TIERS.find(([min]) => n >= min) || [0, 0])[1];
 
 // ---------- תצוגה ----------
@@ -52,8 +53,8 @@ function render() {
   }
 
   const [a, b] = range();
-  const counts = f => !S.onlyLead || f.role === LEAD;
-  const items = S.flights.filter(f => inRange(f, a, b)).sort((x, y) => x.date.localeCompare(y.date) || x.num.localeCompare(y.num));
+  const counts = f => f.role === LEAD;
+  const items = S.flights.filter(f => inRange(f, a, b)).sort((x, y) => x.date.localeCompare(y.date) || showNum(x.num).localeCompare(showNum(y.num)));
   const ms = new Date(S.cursor.getFullYear(), S.cursor.getMonth(), 1), me = new Date(S.cursor.getFullYear(), S.cursor.getMonth()+1, 0);
   const mc = S.flights.filter(f => inRange(f, ms, me) && counts(f)).length;
   const bonus = bonusFor(mc);
@@ -67,7 +68,7 @@ function render() {
     let last = "";
     for (const f of items) {
       if (S.view !== "day" && f.date !== last) { list += `<div class="day-head">${esc(fmt(fromIso(f.date), {weekday:"long", day:"numeric", month:"numeric"}))}</div>`; last = f.date; }
-      list += `<div class="flight"><div><b>${esc(f.num)}</b><span class="tag ${f.role === LEAD ? "" : "other"}">${esc(f.role)}</span></div>
+      list += `<div class="flight"><div><b>${esc(showNum(f.num))}</b><span class="tag ${f.role === LEAD ? "" : "other"}">${esc(f.role)}</span></div>
         <button class="del" data-id="${esc(f.id)}">${S.confirmId === f.id ? "למחוק? לחץ שוב" : "מחיקה"}</button></div>`;
     }
   }
@@ -84,7 +85,7 @@ function render() {
       <div class="steps"><span>0</span><span>25 · ₪600</span><span>50 · ₪900</span><span>100 · ₪1200</span></div>
     </div>
     <div class="card">${list}</div>
-    <div class="card"><label class="check"><input type="checkbox" id="onlyLead" ${S.onlyLead ? "checked" : ""}> רק טיסות בתפקיד ראש צוות נספרות לגמול</label>
+    <div class="card"><div class="muted">לגמול נספרות רק טיסות בתפקיד ראש צוות.</div>
       <button class="link" id="logout">התנתקות</button></div>
     <button class="fab" id="add" aria-label="הוספת טיסה">+</button>`;
 
@@ -93,7 +94,6 @@ function render() {
   $("next").onclick = () => shift(1);
   $("prev").onclick = () => shift(-1);
   $("add").onclick = openAdd;
-  $("onlyLead").onchange = e => { S.onlyLead = e.target.checked; saveProfile(); render(); };
   $("logout").onclick = () => signOut(auth);
   app.querySelectorAll(".del").forEach(btn => btn.onclick = () => deleteFlight(btn.dataset.id));
 }
@@ -158,7 +158,8 @@ function openAdd() {
   let lastRole = LEAD; try { lastRole = localStorage.getItem("lastRole") || LEAD; } catch {}
   dlg.innerHTML = `<form id="form"><h2>הוספת טיסה</h2>
     <label for="fNum">מספר טיסה</label>
-    <input id="fNum" required placeholder="לדוגמה LY001" autocapitalize="characters" autocomplete="off" dir="ltr" style="text-align:right">
+    <div class="numrow" dir="ltr"><span class="pre">LY</span>
+      <input id="fNum" required placeholder="001" inputmode="numeric" pattern="[0-9]{1,4}" maxlength="4" autocomplete="off"></div>
     <label for="fDate">תאריך</label>
     <input id="fDate" type="date" required value="${iso(S.cursor)}">
     <label for="fRole">תפקיד</label>
@@ -168,8 +169,8 @@ function openAdd() {
   $("cancel").onclick = () => dlg.close();
   $("form").onsubmit = ev => {
     ev.preventDefault();
-    const f = { num: $("fNum").value.trim().toUpperCase(), date: $("fDate").value, role: $("fRole").value, createdAt: Date.now() };
-    if (!f.num || !f.date) return;
+    const f = { num: "LY" + $("fNum").value.replace(/\D/g, ""), date: $("fDate").value, role: $("fRole").value, createdAt: Date.now() };
+    if (f.num === "LY" || !f.date) return;
     try { localStorage.setItem("lastRole", f.role); } catch {}
     dlg.close();
     S.cursor = fromIso(f.date);
@@ -193,7 +194,7 @@ function start() {
     S.uid = user.uid; S.phase = "loading"; render();
     unsubProfile = onSnapshot(profileRef(), snap => {
       const d = snap.exists() ? snap.data() : null;
-      if (d && d.name) { S.name = d.name; S.onlyLead = d.onlyLead !== false; if (S.phase === "loading" || S.phase === "auth") S.phase = "app"; }
+      if (d && d.name) { S.name = d.name; if (S.phase === "loading" || S.phase === "auth") S.phase = "app"; }
       else if (S.phase === "loading") S.phase = "name";
       render();
     });
